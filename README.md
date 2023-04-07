@@ -19,7 +19,9 @@ Usage
     git clone https://github.com/nijiinhell/4tail.git
     Make sure all the prerequisites are installed and available in your system.
     Open a terminal and navigate to the directory where the script is located.
-    Run the script using the following command: ./subdomain_fuzzing.sh <target_domain>. Replace <target_domain> with the domain you want to target.
+    Run the script using the following command:
+    1) chmod +x 4tails.sh 
+    2) ./4tails.sh <target_domain>
     The script will automatically perform subdomain enumeration, aliveness detection, fuzzing, and vulnerability scanning using the configured tools.
     The results will be saved in separate files for each step, including subdomains.txt (subdomain enumeration results), alive_subdomains.txt (alive subdomains), fuzzing_results_<subdomain_file>.txt (fuzzing results for each subdomain), and nuclei_results.txt (vulnerability scanning results).
     You can track the progress and view the results in the terminal as well.
