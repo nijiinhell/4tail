@@ -16,7 +16,7 @@ Prerequisites
 
 Usage
 
-    Clone or download the script to your local machine.
+    git clone https://github.com/nijiinhell/4tail.git
     Make sure all the prerequisites are installed and available in your system.
     Open a terminal and navigate to the directory where the script is located.
     Run the script using the following command: ./subdomain_fuzzing.sh <target_domain>. Replace <target_domain> with the domain you want to target.
