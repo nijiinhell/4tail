@@ -8,7 +8,7 @@ Features
     Vulnerability Scanning: The script uses Nuclei to perform vulnerability scanning on the alive subdomains, targeting specific tags (e.g., cves, osint, tech).
 
 Prerequisites
-
+    [Warning] After installing SUbFinder, don't forget to add your API Keys
     Go installed for Subfinder and Httpx: https://github.com/projectdiscovery/subfinder  https://github.com/projectdiscovery/httpx
     Ffuf installed: https://github.com/ffuf/ffuf#installation
     Nuclei installed: https://github.com/projectdiscovery/nuclei#install
