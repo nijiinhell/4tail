@@ -9,7 +9,7 @@ Features
 
 Prerequisites
 
-    Go installed for Subfinder and Httpx: https://golang.org/dl/
+    Go installed for Subfinder and Httpx: https://github.com/projectdiscovery/subfinder  https://github.com/projectdiscovery/httpx
     Ffuf installed: https://github.com/ffuf/ffuf#installation
     Nuclei installed: https://github.com/projectdiscovery/nuclei#install
     Wordlist for fuzzing (e.g., fuzz4bounty.txt): You can find various fuzzing wordlists online or create your own.
