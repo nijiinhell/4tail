@@ -77,6 +77,7 @@ NUCLEI_CONC="${NUCLEI_CONC:-40}"         # template concurrency (-c); higher = f
 NUCLEI_BULK="${NUCLEI_BULK:-25}"         # hosts scanned in parallel per template (-bulk-size)
 NUCLEI_DEDUPE="${NUCLEI_DEDUPE:-1}"      # 1 = scan one representative per origin+response signature
 NUCLEI_SKIP_CDN="${NUCLEI_SKIP_CDN:-0}"  # 1 = also drop CDN/WAF edges from nuclei (keeps takeover if 0)
+NUCLEI_MAX_HOSTS="${NUCLEI_MAX_HOSTS:-0}" # cap hosts scanned (0 = all). Hosts are always value-ranked first.
 HTTPX_THREADS="${HTTPX_THREADS:-50}"
 OUTDIR="${OUTDIR:-}"
 RESUME="${RESUME:-0}"      # 1 = continue a previous run (reuse finished stages)
@@ -1020,26 +1021,38 @@ fi
 # hours of scanning). Keep the most relevant N.
 nuclei_tags="$(printf '%s' "$nuclei_tags" | tr ',' '\n' | awk 'NF' | head -n "$MAX_TAGS" | paste -sd, -)"
 
-# Build the nuclei target list: dedupe to one host per (origin, response signature) so we
-# don't scan hundreds of CDN duplicates / dead edges (huge cut in errors and time).
+# Build the nuclei target list: dedupe by (origin, response signature), then VALUE-RANK
+# so the interesting hosts (admin/login/api/dev, auth-gated, notable tech) are scanned
+# first - with the time cap, the important stuff gets covered even if it doesn't finish.
 nuclei_targets_file="$OUTDIR/nuclei_targets.txt"
 if [ "$NUCLEI_DEDUPE" = 1 ] && [ -s "$httpx_json" ]; then
   jq -r '
       ((.cname // (.a[0]? // .host)) | tostring) as $o
       | [ .url,
           ((.tech // []) | map(ascii_downcase) | join(",")),
+          (.status_code|tostring),
+          (.title // ""),
           ($o + "|" + (.status_code|tostring) + "|" + ((.content_length//0)|tostring) + "|" + (.title//"")) ]
       | @tsv' "$httpx_json" 2>/dev/null \
-    | awk -F'\t' '!seen[$3]++ {print $1"\t"$2}' > "$OUTDIR/.nuclei_pick.tsv"
-  if [ "$NUCLEI_SKIP_CDN" = 1 ]; then
-    grep -viE "$CDN_RE" "$OUTDIR/.nuclei_pick.tsv" | cut -f1 > "$nuclei_targets_file"
-  else
-    cut -f1 "$OUTDIR/.nuclei_pick.tsv" > "$nuclei_targets_file"
-  fi
-  rm -f "$OUTDIR/.nuclei_pick.tsv"
+    | awk -F'\t' '!seen[$5]++' \
+    | { [ "$NUCLEI_SKIP_CDN" = 1 ] && grep -viE "$CDN_RE" || cat; } \
+    | awk -F'\t' '
+        { url=$1; tech=$2; st=$3; l=tolower($1" "$4" "$2); s=0;
+          if (l ~ /admin|login|portal|dashboard|dev|staging|test|internal|api|graphql|swagger|git|jenkins|grafana|kibana|vpn|auth|sso|jira|confluence|gitlab|panel|backend|secure|account|billing|payment|upload|debug|config/) s+=3;
+          if (st=="401"||st=="403") s+=2;
+          if (st=="500"||st=="503") s+=1;
+          if (tech ~ /wordpress|drupal|joomla|magento|jira|confluence|gitlab|jenkins|grafana|tomcat|spring|php/) s+=2;
+          if (tech ~ /cloudfront|cloudflare|akamai|fastly|imperva|incapsula|sucuri|edgecast/) s-=5;
+          printf "%d\t%s\n", s, url }' \
+    | sort -t"$(printf '\t')" -k1,1nr -s \
+    | cut -f2 > "$nuclei_targets_file"
   [ -s "$nuclei_targets_file" ] || cp "$alive_file" "$nuclei_targets_file"
 else
   cp "$alive_file" "$nuclei_targets_file"
+fi
+# optional hard cap on host count (targets are already value-ranked)
+if [ "$NUCLEI_MAX_HOSTS" -gt 0 ] 2>/dev/null; then
+  head -n "$NUCLEI_MAX_HOSTS" "$nuclei_targets_file" > "$nuclei_targets_file.tmp" && mv "$nuclei_targets_file.tmp" "$nuclei_targets_file"
 fi
 nuclei_target_count="$(wc -l <"$nuclei_targets_file" 2>/dev/null || echo 0)"
 if done_marker nuclei && [ -f "$nuclei_file" ]; then
