@@ -374,10 +374,16 @@ llm_ping() {
   code="$(printf '%s' "$resp" | tail -n1 | awk '{print $1}')"
   t="$(printf '%s'   "$resp" | tail -n1 | awk '{print $2}')"
   json="$(printf '%s' "$resp" | sed '$d')"
+  msg="$(printf '%s' "$json" | jq -r '.error.message // .error // empty' 2>/dev/null)"
   if [ "$code" = 200 ] && printf '%s' "$json" | jq -e '.choices[0].message' >/dev/null 2>&1; then
     dr_pass "model '$m' reachable (${t}s)"
+  elif [ -z "$code" ] || [ "$code" = 000 ]; then
+    dr_fail "cannot REACH endpoint for '$m' - network/DNS/egress problem (not an auth issue)"
+  elif [ "$code" = 401 ] || [ "$code" = 403 ]; then
+    dr_fail "endpoint reachable, but API KEY REJECTED for '$m' (http $code)${msg:+ - $msg}"
+  elif [ "$code" = 404 ]; then
+    dr_fail "endpoint reachable, key OK, but MODEL id '$m' not found (http 404)${msg:+ - $msg}"
   else
-    msg="$(printf '%s' "$json" | jq -r '.error.message // .error // empty' 2>/dev/null)"
     dr_fail "model '$m' NOT usable (http ${code:-?})${msg:+ - $msg}"
   fi
 }
@@ -424,6 +430,7 @@ run_doctor() {
     dr_fail "curl and jq are required for AI steps"
   else
     dr_pass "API key present (length ${#LLM_API_KEY}, ends …${LLM_API_KEY: -4}); endpoint: $LLM_BASE_URL"
+    [ "${#LLM_API_KEY}" -lt 40 ] && dr_warn "key looks SHORT (${#LLM_API_KEY} chars) - Together keys are ~64 hex chars; it may be truncated/incomplete"
     printf '  %sroutes%s plan=%s  triage=%s%s\n' "$c_dim" "$c_reset" \
       "$LLM_MODEL_PLAN" "$LLM_MODEL_TRIAGE" "${LLM_FALLBACK_MODELS:+  fallbacks=$LLM_FALLBACK_MODELS}"
     # Ping each unique configured model
