@@ -125,6 +125,27 @@ Both AI steps are **optional**. Without an API key (or without `curl`/`jq`), 4ta
 degrades gracefully: it uses sensible default tags and writes the raw findings to
 the report.
 
+### Crawl → gf → nuclei DAST (`-C`) — active bug hunting
+
+Path fuzzing guesses; crawling finds the *real* endpoints and parameters. With `-C`:
+
+1. **Collect URLs** — `gau`/`waybackurls` (historical) + `katana` (live crawl of alive
+   hosts, time-capped by `CRAWL_MAX_TIME`), merged, scoped to the target, deduped, capped
+   (`CRAWL_MAX_URLS`). → `urls.txt`
+2. **Bucket injection candidates** — `gf` sorts parametered URLs into `sqli`/`xss`/`ssrf`/
+   `lfi`/`redirect`/`rce`/`ssti`/`idor`. → `gf_hits.txt`
+3. **nuclei DAST** — `nuclei -dast` fuzzes the parametered URLs for actual XSS/SQLi/SSRF/
+   open-redirect (bounded by the same timeout/rate/mhe guards). → `dast_findings.txt`
+
+DAST findings + gf candidates flow into the report and the **AI triage**, which adds an
+"Injection candidates (DAST & params)" section (param → bug class → concrete test). This
+is the step that turns 4tail from recon into finding bugs. Needs `katana`/`gau`/
+`waybackurls`/`gf` installed (each optional; the stage uses whatever is present).
+
+```bash
+./4tail.sh -C -j -b 2 example.com     # full deep pass
+```
+
 ### Content-discovery results (ffuf) are now first-class
 
 Fuzzing hits are aggregated across all hosts into `fuzz_findings.txt`

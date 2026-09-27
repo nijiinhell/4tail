@@ -65,6 +65,11 @@ FETCH_FUZZTXT="${FETCH_FUZZTXT:-0}"      # 1 = download Bo0oM/fuzz.txt if no bas
 DEDUPE_ORIGINS="${DEDUPE_ORIGINS:-1}"    # 1 = one fuzz target per IP/CNAME + response cluster
 USE_DNSX="${USE_DNSX:-1}"                # 1 = use dnsx (if installed) to resolve + drop wildcards
 JSMINE="${JSMINE:-0}"                    # 1 = JS/secret mining + param discovery (-j)
+CRAWL="${CRAWL:-0}"                       # 1 = crawl (katana/gau/wayback) -> gf -> nuclei DAST (-C)
+CRAWL_MAX_URLS="${CRAWL_MAX_URLS:-8000}" # cap collected URLs
+CRAWL_MAX_TIME="${CRAWL_MAX_TIME:-1200}" # hard cap on crawling (s); 0 = unlimited
+DAST="${DAST:-1}"                        # within -C: run nuclei -dast on URLs with params
+DAST_MAX_URLS="${DAST_MAX_URLS:-1500}"   # cap parametered URLs sent to DAST
 DEFAULT_NUCLEI_TAGS="${DEFAULT_NUCLEI_TAGS:-cves,exposures,misconfiguration,tech,default-login,takeover}"
 MAX_TAGS="${MAX_TAGS:-15}"                # cap nuclei tags (more tags = far more templates = much slower)
 NUCLEI_SEVERITY="${NUCLEI_SEVERITY:-critical,high,medium,low}"
@@ -112,6 +117,7 @@ Options:
   -M <n>      Fuzz at most N hosts            (env MAX_FUZZ_HOSTS, 0=all)
   -p <n>      Fuzz N hosts in parallel        (env FUZZ_PARALLEL, default 1; auto-backoff)
   -j          JS/secret mining + param discovery (env JSMINE=1)
+  -C          Crawl (katana/gau/wayback) -> gf -> nuclei DAST (env CRAWL=1)
   -R          Resume: continue a previous run (env RESUME=1; use with -o <dir>)
   -b <usd>    LLM credit budget, e.g. 2      (env LLM_BUDGET_USD, 0=unlimited)
   -y          Skip the authorization prompt  (env ASSUME_YES=1)
@@ -136,7 +142,7 @@ EOF
 # `doctor` subcommand (before getopts, which doesn't parse bare words)
 if [ "${1:-}" = "doctor" ]; then DOCTOR=1; shift; fi
 
-while getopts ":w:o:t:S:m:M:p:b:RqjyPDh" opt; do
+while getopts ":w:o:t:S:m:M:p:b:RqjCyPDh" opt; do
   case "$opt" in
     w) WORDLIST="$OPTARG" ;;
     o) OUTDIR="$OPTARG" ;;
@@ -146,6 +152,7 @@ while getopts ":w:o:t:S:m:M:p:b:RqjyPDh" opt; do
     M) MAX_FUZZ_HOSTS="$OPTARG" ;;
     p) FUZZ_PARALLEL="$OPTARG" ;;
     j) JSMINE=1 ;;
+    C) CRAWL=1 ;;
     b) LLM_BUDGET_USD="$OPTARG" ;;
     R) RESUME=1 ;;
     q) SKIP_FUZZ=1 ;;
@@ -165,11 +172,15 @@ LLM_MODEL_TRIAGE="${LLM_MODEL_TRIAGE:-$LLM_MODEL}"
 LLM_MAX_TOKENS_TRIAGE="${LLM_MAX_TOKENS_TRIAGE:-8000}"
 
 domain="${1:-}"
+# Normalize: strip scheme, any path/port, whitespace, and lowercase - so a pasted URL
+# or stray character can't turn into a different/invalid target.
+domain="$(printf '%s' "$domain" | tr -d '[:space:]' | sed -E 's#^[a-zA-Z]+://##; s#[/:].*$##' | tr 'A-Z' 'a-z')"
 if [ "$DOCTOR" != 1 ]; then
   if [ -z "$domain" ]; then err "No target domain provided."; usage; exit 1; fi
-  if ! printf '%s' "$domain" | grep -qE '^[A-Za-z0-9._-]+\.[A-Za-z]{2,}$'; then
-    err "That doesn't look like a bare domain (got: '$domain'). Use e.g. example.com"; exit 1
+  if ! printf '%s' "$domain" | grep -qE '^[a-z0-9.-]+\.[a-z]{2,}$'; then
+    err "That doesn't look like a bare domain (got: '$1' -> '$domain'). Use e.g. example.com"; exit 1
   fi
+  [ "$ASSUME_YES" = 1 ] || log "Parsed target: $domain"
 fi
 
 # ---------------------------------------------------------------------------
@@ -230,6 +241,10 @@ if [ "$DOCTOR" != 1 ]; then
   nuclei_stats_file="$OUTDIR/nuclei_stats.jsonl"
   supervisor_log="$OUTDIR/supervisor.log"
   fuzz_findings_file="$OUTDIR/fuzz_findings.txt"   # aggregated ffuf hits: status<TAB>length<TAB>url
+  urls_file="$OUTDIR/urls.txt"                     # crawled + historical URLs (in-scope)
+  urls_params_file="$OUTDIR/urls_params.txt"       # URLs with query params (for gf/DAST)
+  gf_file="$OUTDIR/gf_hits.txt"                    # gf pattern -> url
+  dast_file="$OUTDIR/dast_findings.txt"            # nuclei -dast findings
   cost_ledger="${LLM_COST_LEDGER:-$OUTDIR/.llm_cost_usd}"
   [ -f "$cost_ledger" ] || printf '0\n' > "$cost_ledger"
 fi
@@ -292,10 +307,10 @@ fi
 if [ -t 1 ] && [ "$NO_TUI" != "1" ]; then TUI=1; else TUI=0; fi
 
 # Stages (named indices so the order is easy to change).
-S_SUBS=0 S_LIVE=1 S_PLAN=2 S_FUZZ=3 S_JS=4 S_NUCLEI=5 S_TRIAGE=6
-ST_LABEL=("Subdomains" "Live hosts" "AI scan plan" "Fuzzing" "JS & params" "Nuclei scan" "AI triage")
-ST_STATE=(pending pending pending pending pending pending pending)
-ST_DETAIL=("" "" "" "" "" "" "")
+S_SUBS=0 S_LIVE=1 S_PLAN=2 S_FUZZ=3 S_JS=4 S_CRAWL=5 S_NUCLEI=6 S_TRIAGE=7
+ST_LABEL=("Subdomains" "Live hosts" "AI scan plan" "Fuzzing" "JS & params" "Crawl & DAST" "Nuclei scan" "AI triage")
+ST_STATE=(pending pending pending pending pending pending pending pending)
+ST_DETAIL=("" "" "" "" "" "" "" "")
 SUP_NOTE=""                              # latest AI-supervisor status line
 PANEL_LINES=$(( ${#ST_LABEL[@]} + 4 ))  # top border + info + stages + supervisor + bottom border
 panel_drawn=0
@@ -1042,6 +1057,65 @@ else
   set_stage $S_JS done "$js_total JS, $sec_hits secret hits$([ -s "$params_file" ] && echo ', params')"
 fi
 
+# Step 4.7: Crawl (katana/gau/wayback) -> gf -> nuclei DAST  (opt-in with -C)
+# Real endpoints & parameters from crawling/history, then fuzz them for injection bugs.
+if [ "$CRAWL" != 1 ]; then
+  set_stage $S_CRAWL skip "off (-C to enable)"
+elif done_marker crawl && [ -f "$urls_file" ]; then
+  set_stage $S_CRAWL done "$(nlines "$urls_file") urls, $(nlines "$dast_file") dast (resumed)"
+else
+  set_stage $S_CRAWL running "collecting URLs"
+  esc_domain="$(printf '%s' "$domain" | sed 's/\./\\./g')"
+  : > "$urls_file"
+  # passive sources (historical URLs)
+  have gau         && { printf '%s\n' "$domain" | gau --subs 2>>"$llm_log" >> "$urls_file" || true; }
+  have waybackurls && { printf '%s\n' "$domain" | waybackurls 2>>"$llm_log" >> "$urls_file" || true; }
+  # active crawl of live hosts (katana), time-capped
+  if have katana; then
+    set_stage $S_CRAWL running "katana crawling…"
+    kcmd=(katana -silent -list "$alive_file" -d 2 -jc -kf all -c 15 -o "$OUTDIR/.katana.txt")
+    [ "$CRAWL_MAX_TIME" -gt 0 ] 2>/dev/null && have timeout && kcmd=(timeout "${CRAWL_MAX_TIME}s" "${kcmd[@]}")
+    "${kcmd[@]}" >/dev/null 2>>"$llm_log" & kpid=$!
+    kstart=$SECONDS
+    while kill -0 "$kpid" 2>/dev/null; do
+      ST_DETAIL[$S_CRAWL]="katana crawling… $(nlines "$OUTDIR/.katana.txt") urls · $((SECONDS-kstart))s"; render; sleep 1
+    done
+    wait "$kpid" 2>/dev/null || true
+    [ -f "$OUTDIR/.katana.txt" ] && cat "$OUTDIR/.katana.txt" >> "$urls_file" && rm -f "$OUTDIR/.katana.txt"
+  fi
+  # normalize: in-scope, deduped, capped
+  grep -iE "^https?://([a-z0-9._-]+\.)?${esc_domain}([:/]|$)" "$urls_file" 2>/dev/null \
+    | sort -u | head -n "$CRAWL_MAX_URLS" > "$urls_file.tmp" && mv "$urls_file.tmp" "$urls_file"
+  # URLs carrying query params (for gf + DAST)
+  grep -E '\?[^=]+=' "$urls_file" 2>/dev/null | sort -u > "$urls_params_file" || : > "$urls_params_file"
+  url_total="$(nlines "$urls_file")"; param_total="$(nlines "$urls_params_file")"
+  # gf pattern bucketing (candidate injection params)
+  : > "$gf_file"
+  if have gf && [ -s "$urls_params_file" ]; then
+    for pat in sqli xss ssrf lfi redirect rce ssti idor; do
+      gf "$pat" < "$urls_params_file" 2>/dev/null | sed "s/^/${pat}\t/" >> "$gf_file" || true
+    done
+  fi
+  # nuclei DAST on parametered URLs (bounded like the main nuclei stage)
+  : > "$dast_file"
+  if [ "$DAST" = 1 ] && have nuclei && [ -s "$urls_params_file" ]; then
+    set_stage $S_CRAWL running "nuclei DAST ($param_total param-urls)…"
+    head -n "$DAST_MAX_URLS" "$urls_params_file" > "$OUTDIR/.dast_targets.txt"
+    dcmd=(nuclei -silent -dast -l "$OUTDIR/.dast_targets.txt" -rate-limit "$NUCLEI_RATELIMIT"
+          -timeout "$NUCLEI_TIMEOUT" -retries "$NUCLEI_RETRIES" -mhe "$NUCLEI_MHE" -o "$dast_file")
+    [ "$NUCLEI_MAX_TIME" -gt 0 ] 2>/dev/null && have timeout && dcmd=(timeout "${NUCLEI_MAX_TIME}s" "${dcmd[@]}")
+    "${dcmd[@]}" >/dev/null 2>>"$llm_log" & dpid=$!
+    dstart=$SECONDS
+    while kill -0 "$dpid" 2>/dev/null; do
+      ST_DETAIL[$S_CRAWL]="nuclei DAST… $(nlines "$dast_file") hits · $((SECONDS-dstart))s"; render; sleep 2
+    done
+    wait "$dpid" 2>/dev/null || true
+    rm -f "$OUTDIR/.dast_targets.txt"
+  fi
+  touch "$OUTDIR/.done_crawl"
+  set_stage $S_CRAWL done "$url_total urls, $param_total params, $(nlines "$gf_file") gf, $(nlines "$dast_file") dast"
+fi
+
 # Step 5: Nuclei
 # Cap the tag count (the AI sometimes returns 30+ tags -> thousands of templates ->
 # hours of scanning). Keep the most relevant N.
@@ -1154,6 +1228,7 @@ set_stage $S_NUCLEI done "$find_count findings$(done_marker nuclei && echo ' (re
   echo "- **Generated:** $(date -u '+%Y-%m-%d %H:%M UTC')"
   echo "- **Subdomains:** $sub_count | **Live:** $alive_count | **Nuclei findings:** $find_count | **Fuzz hits:** ${fuzz_hits:-0}"
   [ "$JSMINE" = 1 ] && echo "- **JS mined:** $(nlines "$js_urls_file") files, $(nlines "$js_secrets_file") secret hits, $(nlines "$params_file") params"
+  [ "$CRAWL" = 1 ] && echo "- **Crawl:** $(nlines "$urls_file") urls, $(nlines "$urls_params_file") with params, $(nlines "$gf_file") gf candidates, **$(nlines "$dast_file") DAST findings**"
   echo "- **Nuclei:** ${nuclei_target_count:-$alive_count} hosts scanned (deduped from $alive_count) | tags \`$nuclei_tags\` | severity \`$NUCLEI_SEVERITY\`"
   echo "- **AI models:** $([ "$AI_ENABLED" = 1 ] && echo "plan=$LLM_MODEL_PLAN, triage=$LLM_MODEL_TRIAGE" || echo "disabled")"
   [ "$AI_ENABLED" = 1 ] && echo "- **Estimated AI spend:** $(cost_fmt)$([ "${LLM_BUDGET_USD:-0}" != 0 ] && echo " (budget \$$LLM_BUDGET_USD)")"
@@ -1168,10 +1243,13 @@ set_stage $S_NUCLEI done "$find_count findings$(done_marker nuclei && echo ' (re
     done
     echo
   fi
+  if [ -s "$dast_file" ]; then
+    echo "## DAST findings (nuclei -dast)"; echo; echo '```'; head -n 100 "$dast_file"; echo '```'; echo
+  fi
 } > "$report_file"
 
-# Step 6: AI triage  (analyses nuclei + content-discovery hits + JS secrets + params)
-have_extra=0; { [ -s "$js_secrets_file" ] || [ -s "$params_file" ] || [ -s "$fuzz_findings_file" ]; } && have_extra=1
+# Step 6: AI triage  (analyses nuclei + content-discovery + JS + crawl/DAST)
+have_extra=0; { [ -s "$js_secrets_file" ] || [ -s "$params_file" ] || [ -s "$fuzz_findings_file" ] || [ -s "$dast_file" ] || [ -s "$gf_file" ]; } && have_extra=1
 if [ "$AI_ENABLED" = "1" ] && { [ "$find_count" -gt 0 ] || [ "$have_extra" = 1 ]; } && ! budget_ok; then
   { echo "## Findings (budget reached, no AI triage)"; echo '```'; cat "$nuclei_file" 2>/dev/null
     [ -s "$js_secrets_file" ] && { echo; echo "# JS secret candidates:"; cat "$js_secrets_file"; }; echo '```'; } >> "$report_file"
@@ -1191,6 +1269,9 @@ GitHub-flavored Markdown with:
 "## Notable discovered paths" (from the content-discovery hits, call out the juicy ones:
 backups/.git/.env/config/admin/api/upload/debug endpoints; ignore generic assets; note
 which 401/403 are worth auth testing),
+"## Injection candidates (DAST & params)" (from nuclei -dast findings and gf-bucketed
+parametered URLs: name the parameter, the suspected class (SQLi/XSS/SSRF/LFI/redirect),
+and a concrete safe test),
 "## Secrets & sensitive exposure" (assess each JS secret candidate: likely real vs false
 positive, impact, safe verification - flag private keys / cloud creds as critical),
 "## Interesting parameters to test" (map discovered params to bug classes: IDOR, SSRF,
@@ -1210,6 +1291,12 @@ $(printf '%s\n' "$sorted_findings" | head -n 400 | head -c 30000)
 
 === content-discovery hits (status  length  url) ===
 $(head -n 150 "$fuzz_findings_file" 2>/dev/null | head -c 12000)
+
+=== nuclei DAST findings ===
+$(head -c 8000 "$dast_file" 2>/dev/null)
+
+=== gf injection-candidate URLs (pattern <TAB> url) ===
+$(head -n 120 "$gf_file" 2>/dev/null | head -c 8000)
 
 === JS secret candidates (url <TAB> match) ===
 $(head -c 8000 "$js_secrets_file" 2>/dev/null)
@@ -1240,7 +1327,7 @@ fi
 
 # Final summary
 spend_note=""; [ "$AI_ENABLED" = 1 ] && spend_note="  ·  AI spend ~$(cost_fmt)"
-tally="nuclei:$find_count  fuzz-hits:${fuzz_hits:-0}$([ "$JSMINE" = 1 ] && echo "  js-secrets:$(nlines "$js_secrets_file")  params:$(nlines "$params_file")")"
+tally="nuclei:$find_count  fuzz-hits:${fuzz_hits:-0}$([ "$JSMINE" = 1 ] && echo "  js-secrets:$(nlines "$js_secrets_file")  params:$(nlines "$params_file")")$([ "$CRAWL" = 1 ] && echo "  urls:$(nlines "$urls_file")  dast:$(nlines "$dast_file")")"
 if [ "$TUI" = 1 ]; then
   render
   printf '\n %s✔ done in %ss%s%s\n   %s%s%s\n   report → %s%s%s\n' \
