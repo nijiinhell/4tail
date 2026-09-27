@@ -213,6 +213,41 @@ TOGETHER_API_KEY=... ./4tail.sh -y -o run1 -S critical,high example.com
 ./4tail.sh -P example.com | tee run.log
 ```
 
+### Resume an interrupted run
+
+If you Ctrl-C or a run dies partway, continue it without redoing finished stages:
+
+```bash
+./4tail.sh -R wolt.com                       # resume newest run for the domain
+./4tail.sh -R -o 4tail_wolt.com_20260927_101500 wolt.com   # or a specific dir
+```
+
+Resume reuses completed stages (subdomains, live hosts, the AI plan, nuclei) and, for
+fuzzing, **skips hosts already done** and continues with the rest. Progress is tracked
+with per-stage markers and per-host output files inside the run directory.
+
+### Credit budget (cap AI spend)
+
+Put a ceiling on LLM spend so a run (or a series of resumed runs) can't run away:
+
+```bash
+./4tail.sh -b 2 wolt.com          # stop calling the AI once ~$2 is estimated spent
+```
+
+Cost is estimated from each response's token usage × price. **Set the prices to your
+model's real Together rate** for an accurate cap:
+
+```bash
+export LLM_PRICE_IN=0.30 LLM_PRICE_OUT=0.30   # USD per 1M tokens (in / out)
+./4tail.sh -b 2 wolt.com
+```
+
+It's a **soft cap**: 4tail checks the running total before each AI call and stops
+starting new ones once the budget is reached (falling back to default tags / raw
+findings). The running total persists across resumed runs (ledger in the run dir, or
+set `LLM_COST_LEDGER` to a global file), and the live dashboard + report show spend.
+Typical real spend per run is a few cents (two small calls).
+
 ### Big targets (many subdomains)
 
 A target with hundreds of live hosts makes exhaustive fuzzing impractical (hosts ×
@@ -283,7 +318,10 @@ and (each ping uses `max_tokens: 16`) costs almost nothing.
 - `LLM_BASE_URL` — API base (default `https://api.together.xyz/v1`). Point this at any
   OpenAI-compatible provider (e.g. Zhipu, OpenRouter, a local server) to switch backends.
 - `LLM_MODEL` — base model id used for every role unless overridden (default `zai-org/GLM-5.3`).
-- `LLM_MAX_TOKENS` — default output cap (default `1200`, kept low for cost).
+- `LLM_MAX_TOKENS` — default output cap (default `2000`).
+- `LLM_BUDGET_USD` — cap estimated AI spend (`-b`, 0 = unlimited).
+- `LLM_PRICE_IN` / `LLM_PRICE_OUT` — USD per 1M tokens, for the budget estimate.
+- `LLM_COST_LEDGER` — path to a persistent cost tally (default: per-run in the output dir).
 - `LLM_TEMPERATURE`, `LLM_TIMEOUT`, `LLM_RETRIES` — request tuning.
 
 ### Smart model routing ("swarm"-style switching)

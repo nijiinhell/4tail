@@ -22,21 +22,28 @@ LLM_API_KEY="${TOGETHER_API_KEY:-${LLM_API_KEY:-}}"
 LLM_API_KEY="$(printf '%s' "$LLM_API_KEY" | tr -d '[:space:]')"
 LLM_BASE_URL="${LLM_BASE_URL:-https://api.together.xyz/v1}"
 LLM_MODEL="${LLM_MODEL:-zai-org/GLM-5.3}"   # base default for every role
-LLM_MAX_TOKENS="${LLM_MAX_TOKENS:-1200}"
+LLM_MAX_TOKENS="${LLM_MAX_TOKENS:-2000}"    # generous default (see budget below)
 LLM_TEMPERATURE="${LLM_TEMPERATURE:-0.2}"
-LLM_TIMEOUT="${LLM_TIMEOUT:-90}"
+LLM_TIMEOUT="${LLM_TIMEOUT:-120}"
 LLM_RETRIES="${LLM_RETRIES:-2}"
 
 # --- Smart model routing (per-task "swarm"-style switching) -----------------
-# Each AI step can use a different model + token budget. Defaults route both to
-# LLM_MODEL so a single key just works; override to run a cheap planner + a
-# stronger analyst. See README for recommended Together AI ids.
-LLM_MODEL_PLAN="${LLM_MODEL_PLAN:-}"        # scan planner (structured, light); default = LLM_MODEL
-LLM_MODEL_TRIAGE="${LLM_MODEL_TRIAGE:-}"    # findings analyst (reasoning-heavy); default = LLM_MODEL
-LLM_MAX_TOKENS_PLAN="${LLM_MAX_TOKENS_PLAN:-1500}"   # headroom for reasoning models (GLM/DeepSeek think first)
+LLM_MODEL_PLAN="${LLM_MODEL_PLAN:-}"        # scan planner; default = LLM_MODEL
+LLM_MODEL_TRIAGE="${LLM_MODEL_TRIAGE:-}"    # findings analyst; default = LLM_MODEL
+LLM_MAX_TOKENS_PLAN="${LLM_MAX_TOKENS_PLAN:-2000}"   # headroom for reasoning models (GLM/DeepSeek think first)
 LLM_MAX_TOKENS_TRIAGE="${LLM_MAX_TOKENS_TRIAGE:-}"  # default = LLM_MAX_TOKENS
-# Comma-separated models tried, in order, if the primary model call fails.
-LLM_FALLBACK_MODELS="${LLM_FALLBACK_MODELS:-}"
+LLM_FALLBACK_MODELS="${LLM_FALLBACK_MODELS:-}"       # tried in order if primary fails
+
+# --- Cost / credit budget ---------------------------------------------------
+# Stop calling the AI once estimated spend reaches LLM_BUDGET_USD (0 = unlimited).
+# Cost is estimated from each response's token usage x the prices below (USD per
+# 1M tokens). Prices are approximate - set them to your model's real Together price
+# for an accurate cap. The running total persists across resumed runs.
+LLM_BUDGET_USD="${LLM_BUDGET_USD:-0}"
+LLM_PRICE_IN="${LLM_PRICE_IN:-0.30}"
+LLM_PRICE_OUT="${LLM_PRICE_OUT:-0.30}"
+LLM_COST_LEDGER="${LLM_COST_LEDGER:-}"      # cost tally file; default = per-run in OUTDIR
+cost_ledger=""                               # resolved after OUTDIR is known
 
 # ---------------------------------------------------------------------------
 # Scan configuration
@@ -56,6 +63,7 @@ NUCLEI_SEVERITY="${NUCLEI_SEVERITY:-critical,high,medium,low}"
 NUCLEI_RATELIMIT="${NUCLEI_RATELIMIT:-150}"
 HTTPX_THREADS="${HTTPX_THREADS:-50}"
 OUTDIR="${OUTDIR:-}"
+RESUME="${RESUME:-0}"      # 1 = continue a previous run (reuse finished stages)
 ASSUME_YES="${ASSUME_YES:-0}"
 NO_TUI="${NO_TUI:-0}"
 DOCTOR="${DOCTOR:-0}"      # 1 = run health checks and exit (see -D / `doctor`)
@@ -85,6 +93,8 @@ Options:
   -m <model>  LLM model id                   (env LLM_MODEL, default $LLM_MODEL)
   -q          Quick: skip fuzzing (nuclei-only) (env SKIP_FUZZ=1)
   -M <n>      Fuzz at most N hosts            (env MAX_FUZZ_HOSTS, 0=all)
+  -R          Resume: continue a previous run (env RESUME=1; use with -o <dir>)
+  -b <usd>    LLM credit budget, e.g. 2      (env LLM_BUDGET_USD, 0=unlimited)
   -y          Skip the authorization prompt  (env ASSUME_YES=1)
   -P          Plain output, no live dashboard(env NO_TUI=1)
   -D          Run health checks and exit     (same as: $0 doctor)
@@ -107,7 +117,7 @@ EOF
 # `doctor` subcommand (before getopts, which doesn't parse bare words)
 if [ "${1:-}" = "doctor" ]; then DOCTOR=1; shift; fi
 
-while getopts ":w:o:t:S:m:M:qyPDh" opt; do
+while getopts ":w:o:t:S:m:M:b:RqyPDh" opt; do
   case "$opt" in
     w) WORDLIST="$OPTARG" ;;
     o) OUTDIR="$OPTARG" ;;
@@ -115,6 +125,8 @@ while getopts ":w:o:t:S:m:M:qyPDh" opt; do
     S) NUCLEI_SEVERITY="$OPTARG" ;;
     m) LLM_MODEL="$OPTARG" ;;
     M) MAX_FUZZ_HOSTS="$OPTARG" ;;
+    b) LLM_BUDGET_USD="$OPTARG" ;;
+    R) RESUME=1 ;;
     q) SKIP_FUZZ=1 ;;
     y) ASSUME_YES=1 ;;
     P) NO_TUI=1 ;;
@@ -174,8 +186,15 @@ fi
 # ---------------------------------------------------------------------------
 llm_log="/dev/null"   # overridden below for a real run
 if [ "$DOCTOR" != 1 ]; then
-  ts="$(date +%Y%m%d_%H%M%S)"
-  OUTDIR="${OUTDIR:-4tail_${domain}_${ts}}"
+  if [ "$RESUME" = 1 ] && [ -z "$OUTDIR" ]; then
+    # resume the newest matching run dir for this domain
+    OUTDIR="$(ls -1dt "4tail_${domain}_"* 2>/dev/null | head -1)"
+    [ -n "$OUTDIR" ] && log "Resuming previous run: $OUTDIR"
+  fi
+  if [ -z "$OUTDIR" ]; then
+    ts="$(date +%Y%m%d_%H%M%S)"; OUTDIR="4tail_${domain}_${ts}"
+    [ "$RESUME" = 1 ] && warn "No previous run found for $domain - starting fresh."
+  fi
   mkdir -p "$OUTDIR"
   subdomains_file="$OUTDIR/subdomains.txt"
   httpx_json="$OUTDIR/httpx.jsonl"
@@ -187,6 +206,8 @@ if [ "$DOCTOR" != 1 ]; then
   llm_log="$OUTDIR/llm.log"
   tech_map_file="$OUTDIR/tech_wordlists.tsv"   # tech <TAB> seclists-relative-path
   fuzz_plan_file="$OUTDIR/fuzz_plan.txt"        # host <TAB> wordlists used
+  cost_ledger="${LLM_COST_LEDGER:-$OUTDIR/.llm_cost_usd}"
+  [ -f "$cost_ledger" ] || printf '0\n' > "$cost_ledger"
 fi
 
 # Auto-detect a SecLists installation so fuzzing can pick tech-specific lists.
@@ -275,8 +296,12 @@ render() {
     if [ "$LLM_MODEL_PLAN" = "$LLM_MODEL_TRIAGE" ]; then model_line="${LLM_MODEL_PLAN##*/}"
     else model_line="plan:${LLM_MODEL_PLAN##*/} triage:${LLM_MODEL_TRIAGE##*/}"; fi
   fi
+  local cost_seg=""
+  if [ "$AI_ENABLED" = 1 ] && [ -n "$cost_ledger" ]; then
+    cost_seg="  spent=$(cost_fmt)"; [ "${LLM_BUDGET_USD:-0}" != 0 ] && cost_seg="$cost_seg/\$$LLM_BUDGET_USD"
+  fi
   printf ' %s╭─ 4tail ───────────────────────────────────────%s\033[K\n' "$c_cyan" "$c_reset"
-  printf ' %s│%s target=%s  ai=%s  elapsed=%ss\033[K\n' "$c_cyan" "$c_reset" "$domain" "$model_line" "$((SECONDS-started))"
+  printf ' %s│%s target=%s  ai=%s  elapsed=%ss%s\033[K\n' "$c_cyan" "$c_reset" "$domain" "$model_line" "$((SECONDS-started))" "$cost_seg"
   local i
   for i in "${!ST_LABEL[@]}"; do
     printf ' %s│%s  %s  %-13s %s%s%s\033[K\n' \
@@ -288,6 +313,18 @@ render() {
 }
 
 set_stage() { ST_STATE[$1]="$2"; [ -n "${3+x}" ] && ST_DETAIL[$1]="$3"; render; }
+
+# --- Cost ledger (estimated USD spent on the LLM) ---------------------------
+cost_now() { [ -n "$cost_ledger" ] && cat "$cost_ledger" 2>/dev/null || echo 0; }
+add_cost() { # $1 = usd to add
+  [ -n "$cost_ledger" ] || return 0
+  awk -v c="$(cost_now)" -v a="$1" 'BEGIN{printf "%.6f\n", c+a}' > "$cost_ledger"
+}
+budget_ok() { # 0 (true) if under budget or unlimited
+  [ "${LLM_BUDGET_USD:-0}" = 0 ] && return 0
+  awk -v c="$(cost_now)" -v b="$LLM_BUDGET_USD" 'BEGIN{exit !(c<b)}'
+}
+cost_fmt() { awk -v c="$(cost_now)" 'BEGIN{printf "$%.4f", c}'; }
 
 cleanup() { [ "$TUI" = 1 ] && printf '\033[?25h\n'; }   # restore cursor
 trap cleanup EXIT
@@ -335,7 +372,17 @@ ai_call() {
         -d "$payload" 2>/dev/null)"
       if [ -n "$response" ] && ! echo "$response" | jq -e '.error' >/dev/null 2>&1; then
         text="$(echo "$response" | jq -r '.choices[0].message.content // empty' 2>/dev/null)"
-        if [ -n "$text" ]; then echo "[ok] model=$m" >>"$llm_log"; printf '%s' "$text"; return 0; fi
+        if [ -n "$text" ]; then
+          # accrue estimated cost from token usage
+          local uin uout ucost
+          uin="$(echo "$response"  | jq -r '.usage.prompt_tokens // 0' 2>/dev/null)"
+          uout="$(echo "$response" | jq -r '.usage.completion_tokens // 0' 2>/dev/null)"
+          ucost="$(awk -v i="$uin" -v o="$uout" -v pi="$LLM_PRICE_IN" -v po="$LLM_PRICE_OUT" \
+                   'BEGIN{printf "%.6f",(i*pi+o*po)/1000000}')"
+          add_cost "$ucost"
+          echo "[ok] model=$m tokens_in=$uin tokens_out=$uout cost=\$$ucost total=$(cost_now)" >>"$llm_log"
+          printf '%s' "$text"; return 0
+        fi
       fi
       if [ "$attempt" -gt "$LLM_RETRIES" ]; then
         echo "[fail] model=$m: $(echo "$response" | jq -r '.error.message // .error // "empty response"' 2>/dev/null)" >>"$llm_log"
@@ -440,6 +487,11 @@ run_doctor() {
     [ "${#LLM_API_KEY}" -lt 40 ] && dr_warn "key looks SHORT (${#LLM_API_KEY} chars) - Together keys are ~64 hex chars; it may be truncated/incomplete"
     printf '  %sroutes%s plan=%s  triage=%s%s\n' "$c_dim" "$c_reset" \
       "$LLM_MODEL_PLAN" "$LLM_MODEL_TRIAGE" "${LLM_FALLBACK_MODELS:+  fallbacks=$LLM_FALLBACK_MODELS}"
+    if [ "${LLM_BUDGET_USD:-0}" != 0 ]; then
+      dr_pass "credit budget: \$$LLM_BUDGET_USD (prices \$$LLM_PRICE_IN in / \$$LLM_PRICE_OUT out per 1M tok - set to your model's real price)"
+    else
+      dr_warn "no credit budget set (LLM_BUDGET_USD=0 = unlimited); use -b 2 to cap spend"
+    fi
     # Ping each unique configured model
     local seen="" m
     for m in "$LLM_MODEL_PLAN" "$LLM_MODEL_TRIAGE" ${LLM_FALLBACK_MODELS//,/ }; do
@@ -471,24 +523,37 @@ if [ "$DOCTOR" = 1 ]; then run_doctor; exit $?; fi
 # PIPELINE
 # ===========================================================================
 
+# resume helper: was this stage already completed?
+done_marker() { [ "$RESUME" = 1 ] && [ -f "$OUTDIR/.done_$1" ]; }
+
 # Step 1: Subdomains
-run_stage 0 "$subdomains_file" " subs" subfinder -silent -d "$domain" -o "$subdomains_file"
+if done_marker subs && [ -s "$subdomains_file" ]; then
+  set_stage 0 done "$(wc -l <"$subdomains_file") subs (resumed)"
+else
+  run_stage 0 "$subdomains_file" " subs" subfinder -silent -d "$domain" -o "$subdomains_file"
+  touch "$OUTDIR/.done_subs"
+fi
 sub_count=$(wc -l < "$subdomains_file" 2>/dev/null || echo 0)
 if [ "$sub_count" -eq 0 ]; then
   set_stage 0 warn "none found"; [ "$TUI" = 1 ] || warn "No subdomains; stopping."; exit 0
 fi
-set_stage 0 done "$sub_count subs"
+set_stage 0 done "$sub_count subs$(done_marker subs && echo ' (resumed)')"
 
 # Step 2: Live hosts + tech detection
-run_stage 1 "$httpx_json" " live" \
-  httpx -silent -json -tech-detect -status-code -title -web-server \
-        -threads "$HTTPX_THREADS" -l "$subdomains_file" -o "$httpx_json"
+if done_marker httpx && [ -s "$httpx_json" ]; then
+  set_stage 1 done "resumed"
+else
+  run_stage 1 "$httpx_json" " live" \
+    httpx -silent -json -tech-detect -status-code -title -web-server \
+          -threads "$HTTPX_THREADS" -l "$subdomains_file" -o "$httpx_json"
+  touch "$OUTDIR/.done_httpx"
+fi
 if [ -s "$httpx_json" ]; then jq -r '.url' "$httpx_json" 2>/dev/null | sort -u > "$alive_file"; else : > "$alive_file"; fi
 alive_count=$(wc -l < "$alive_file" 2>/dev/null || echo 0)
 if [ "$alive_count" -eq 0 ]; then
   set_stage 1 warn "none live"; [ "$TUI" = 1 ] || warn "No live hosts; stopping."; exit 0
 fi
-set_stage 1 done "$alive_count live"
+set_stage 1 done "$alive_count live$(done_marker httpx && echo ' (resumed)')"
 
 # Aggregated, cost-frugal brief for the AI
 {
@@ -592,10 +657,18 @@ sap	Discovery/Web-Content/CMS/SAP.fuzz.txt
 sap	Discovery/Web-Content/SAP-NetWeaver.txt
 STATIC
 }
-[ -n "$SECLISTS_DIR" ] && seed_static_tech_map || : > "$tech_map_file"
+# Seed the static map, but on resume keep a prior map (it may hold AI additions).
+if [ "$RESUME" = 1 ] && [ -s "$tech_map_file" ]; then :
+elif [ -n "$SECLISTS_DIR" ]; then seed_static_tech_map
+else : > "$tech_map_file"; fi
 
 nuclei_tags="$DEFAULT_NUCLEI_TAGS"
-if [ "$AI_ENABLED" = "1" ] && [ -s "$tech_brief" ]; then
+if [ "$RESUME" = 1 ] && [ -s "$OUTDIR/ai_scan_plan.txt" ]; then
+  nuclei_tags="$(cat "$OUTDIR/ai_scan_plan.txt")"
+  set_stage 2 done "$nuclei_tags (resumed)"
+elif [ "$AI_ENABLED" = "1" ] && ! budget_ok; then
+  set_stage 2 skip "budget reached ($(cost_fmt)), using defaults"
+elif [ "$AI_ENABLED" = "1" ] && [ -s "$tech_brief" ]; then
   sys_plan='You assist AUTHORIZED bug-bounty recon. Given an aggregated brief of the
 technologies, servers and notable paths on live hosts, produce a scan plan.
 Reply with ONLY a JSON object (no prose, no code fences) with exactly two keys:
@@ -612,7 +685,7 @@ Reply with ONLY a JSON object (no prose, no code fences) with exactly two keys:
 Live hosts: $alive_count
 SecLists root: ${SECLISTS_DIR:-<not installed>}
 
-$(head -c 6000 "$tech_brief")" "$plan_out"
+$(head -c 12000 "$tech_brief")" "$plan_out"
 
   # Reasoning models (GLM/DeepSeek) often wrap JSON in ``` fences or prepend
   # "thinking". Extract the first {...} object so jq gets clean JSON.
@@ -716,9 +789,11 @@ elif ! have ffuf; then
   set_stage 3 skip "ffuf not installed"
 elif [ "$fuzz_possible" != 1 ]; then
   set_stage 3 skip "no wordlist / SecLists"
+elif [ "$RESUME" = 1 ] && [ -f "$OUTDIR/.done_fuzz" ]; then
+  set_stage 3 done "$(grep -c . "$fuzz_plan_file" 2>/dev/null || echo 0) hosts (resumed)"
 else
   set_stage 3 running "0 hosts"
-  : > "$fuzz_plan_file"
+  [ "$RESUME" = 1 ] || : > "$fuzz_plan_file"   # keep prior progress when resuming
   # host \t comma-tech  (dedup by url)
   hosts_tsv="$(jq -r '[.url, ((.tech // []) | map(ascii_downcase) | join(","))] | @tsv' \
                  "$httpx_json" 2>/dev/null | sort -u)"
@@ -726,10 +801,12 @@ else
   total=$(printf '%s\n' "$hosts_tsv" | grep -c .)
   cap="$total"
   [ "$MAX_FUZZ_HOSTS" -gt 0 ] 2>/dev/null && cap="$MAX_FUZZ_HOSTS"
-  idx=0; fuzzed=0; skipped_cdn=0
+  fuzzed=0; skipped_cdn=0; resumed=0
   while IFS=$'\t' read -r url techs; do
     [ -z "$url" ] && continue
-    idx=$((idx + 1))
+    safe="$(printf '%s' "$url" | tr -c 'A-Za-z0-9._-' '_')"
+    # resume: skip hosts already fuzzed in a previous run
+    if [ "$RESUME" = 1 ] && [ -f "$fuzz_dir/${safe}.json" ]; then resumed=$((resumed + 1)); continue; fi
     # skip CDN/WAF edges - fuzzing shared infrastructure is noise
     if [ "$SKIP_CDN_FUZZ" = 1 ] && printf '%s' "$techs" | grep -qiE "$CDN_RE"; then
       skipped_cdn=$((skipped_cdn + 1)); continue
@@ -737,31 +814,37 @@ else
     # stop once the host cap is reached
     if [ "$MAX_FUZZ_HOSTS" -gt 0 ] 2>/dev/null && [ "$fuzzed" -ge "$MAX_FUZZ_HOSTS" ]; then break; fi
     fuzzed=$((fuzzed + 1))
-    safe="$(printf '%s' "$url" | tr -c 'A-Za-z0-9._-' '_')"
     mapfile -t wls < <(host_wordlists "$techs" | awk 'NF' | awk '!seen[$0]++')
     [ "${#wls[@]}" -eq 0 ] && { fuzzed=$((fuzzed - 1)); continue; }
-    combined="$fuzz_dir/wl_${fuzzed}.txt"
+    combined="$fuzz_dir/.wl_tmp.txt"
     cat "${wls[@]}" 2>/dev/null | sort -u | head -n "$MAX_FUZZ_WORDS" > "$combined"
     names="$(printf '%s\n' "${wls[@]}" | sed 's#.*/##' | paste -sd+ -)"
     ext_flag="$(build_ext_flag "$techs")"
     printf '%s\t%s\t(%s words) exts:[%s]\n' "$url" "$names" "$(wc -l < "$combined")" "$ext_flag" >> "$fuzz_plan_file"
-    ST_DETAIL[3]="host $fuzzed/$cap  [${techs:-generic}]${skipped_cdn:+  (cdn skipped: $skipped_cdn)}"; render
+    ST_DETAIL[3]="host $fuzzed/$cap  [${techs:-generic}]${skipped_cdn:+  (cdn:$skipped_cdn)}${resumed:+ (done:$resumed)}"; render
     ffuf_args=(-u "$url/FUZZ" -w "$combined" -mc 200,204,301,302,307,401,403
-               -of json -o "$fuzz_dir/${fuzzed}_${safe}.json" -s)
+               -of json -o "$fuzz_dir/${safe}.json" -s)
     [ -n "$ext_flag" ] && ffuf_args+=(-e "$ext_flag")
     [ "$FFUF_RATE" -gt 0 ] 2>/dev/null && ffuf_args+=(-rate "$FFUF_RATE")
     ffuf "${ffuf_args[@]}" >/dev/null 2>>"$llm_log" || true
     rm -f "$combined"
   done <<< "$hosts_tsv"
-  set_stage 3 done "$fuzzed fuzzed$([ "$skipped_cdn" -gt 0 ] && echo ", $skipped_cdn CDN skipped")"
+  # mark complete only if we weren't cut short by the cap
+  [ "$MAX_FUZZ_HOSTS" -gt 0 ] 2>/dev/null || touch "$OUTDIR/.done_fuzz"
+  set_stage 3 done "$fuzzed fuzzed$([ "$resumed" -gt 0 ] && echo ", $resumed resumed")$([ "$skipped_cdn" -gt 0 ] && echo ", $skipped_cdn CDN skipped")"
 fi
 
 # Step 5: Nuclei
-run_stage 4 "$nuclei_file" " hits" \
-  nuclei -silent -tags "$nuclei_tags" -severity "$NUCLEI_SEVERITY" \
-         -rate-limit "$NUCLEI_RATELIMIT" -l "$alive_file" -o "$nuclei_file"
+if done_marker nuclei && [ -f "$nuclei_file" ]; then
+  set_stage 4 done "$(wc -l <"$nuclei_file") findings (resumed)"
+else
+  run_stage 4 "$nuclei_file" " hits" \
+    nuclei -silent -tags "$nuclei_tags" -severity "$NUCLEI_SEVERITY" \
+           -rate-limit "$NUCLEI_RATELIMIT" -l "$alive_file" -o "$nuclei_file"
+  touch "$OUTDIR/.done_nuclei"
+fi
 find_count=$(wc -l < "$nuclei_file" 2>/dev/null || echo 0)
-set_stage 4 done "$find_count findings"
+set_stage 4 done "$find_count findings$(done_marker nuclei && echo ' (resumed)')"
 
 # Report header
 {
@@ -771,6 +854,7 @@ set_stage 4 done "$find_count findings"
   echo "- **Subdomains:** $sub_count | **Live:** $alive_count | **Findings:** $find_count"
   echo "- **Nuclei tags:** \`$nuclei_tags\` | **Severity:** \`$NUCLEI_SEVERITY\`"
   echo "- **AI models:** $([ "$AI_ENABLED" = 1 ] && echo "plan=$LLM_MODEL_PLAN, triage=$LLM_MODEL_TRIAGE" || echo "disabled")"
+  [ "$AI_ENABLED" = 1 ] && echo "- **Estimated AI spend:** $(cost_fmt)$([ "${LLM_BUDGET_USD:-0}" != 0 ] && echo " (budget \$$LLM_BUDGET_USD)")"
   echo "- **SecLists:** ${SECLISTS_DIR:-not found} | **Base wordlist:** \`$WORDLIST\`"; echo
   if [ -s "$fuzz_plan_file" ]; then
     echo "## Fuzzing strategy (tech-aware wordlists)"
@@ -787,27 +871,31 @@ set_stage 4 done "$find_count findings"
 } > "$report_file"
 
 # Step 6: AI triage
-if [ "$AI_ENABLED" = "1" ] && [ "$find_count" -gt 0 ]; then
+if [ "$AI_ENABLED" = "1" ] && [ "$find_count" -gt 0 ] && ! budget_ok; then
+  { echo "## Findings (budget reached, no AI triage)"; echo '```'; cat "$nuclei_file"; echo '```'; } >> "$report_file"
+  set_stage 5 skip "budget reached ($(cost_fmt))"
+elif [ "$AI_ENABLED" = "1" ] && [ "$find_count" -gt 0 ]; then
   sorted_findings="$(
     for sev in critical high medium low info; do grep -iE "\[$sev\]" "$nuclei_file"; done
     grep -viE '\[(critical|high|medium|low|info)\]' "$nuclei_file"
   )"
   [ -z "$sorted_findings" ] && sorted_findings="$(cat "$nuclei_file")"
   sys_triage='You are a senior security analyst on an AUTHORIZED bug-bounty engagement.
-Given a technology brief and severity-sorted nuclei output, produce a concise report in
+Given a technology brief and severity-sorted nuclei output, produce a thorough report in
 GitHub-flavored Markdown with exactly these sections:
-"## Executive summary" (2-4 sentences),
+"## Executive summary" (3-5 sentences),
 "## Prioritised findings" (a table: Severity | Host | Issue | Why it matters | Next step),
-"## Recommended manual follow-ups" (short bullet list).
+"## Attack surface notes" (grouped observations by technology/host cluster),
+"## Recommended manual follow-ups" (bullet list, concrete and specific).
 Use ONLY the provided data - do not invent findings.'
   triage_out="$(mktemp)"
   run_ai_stage 5 "$LLM_MODEL_TRIAGE" "$LLM_MAX_TOKENS_TRIAGE" "$sys_triage" "Target: $domain
 
 === technology brief ===
-$(head -c 4000 "$tech_brief")
+$(head -c 8000 "$tech_brief")
 
 === findings (severity-sorted) ===
-$(printf '%s\n' "$sorted_findings" | head -n 120 | head -c 14000)" "$triage_out"
+$(printf '%s\n' "$sorted_findings" | head -n 400 | head -c 40000)" "$triage_out"
   if [ -s "$triage_out" ]; then
     cat "$triage_out" >> "$report_file"; set_stage 5 done "report.md written"
   else
@@ -824,9 +912,10 @@ else
 fi
 
 # Final summary
+spend_note=""; [ "$AI_ENABLED" = 1 ] && spend_note="  ·  AI spend ~$(cost_fmt)"
 if [ "$TUI" = 1 ]; then
   render
-  printf '\n %s✔ done in %ss%s  →  %s%s%s\n' "$c_green" "$((SECONDS-started))" "$c_reset" "$c_cyan" "$report_file" "$c_reset"
+  printf '\n %s✔ done in %ss%s%s  →  %s%s%s\n' "$c_green" "$((SECONDS-started))" "$c_reset" "$spend_note" "$c_cyan" "$report_file" "$c_reset"
 else
-  ok "Done in $((SECONDS-started))s. Report: $report_file"
+  ok "Done in $((SECONDS-started))s.$spend_note Report: $report_file"
 fi
