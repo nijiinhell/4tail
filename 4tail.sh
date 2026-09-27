@@ -146,11 +146,22 @@ tech_map_file="$OUTDIR/tech_wordlists.tsv"   # tech <TAB> seclists-relative-path
 fuzz_plan_file="$OUTDIR/fuzz_plan.txt"        # host <TAB> wordlists used
 
 # Auto-detect a SecLists installation so fuzzing can pick tech-specific lists.
+# `apt install seclists` (Debian/Ubuntu/Kali) puts it in /usr/share/seclists.
 if [ -z "$SECLISTS_DIR" ]; then
   for d in /usr/share/seclists /usr/share/wordlists/seclists /usr/share/SecLists \
-           "$HOME/SecLists" "$HOME/seclists" /opt/SecLists; do
+           /usr/share/wordlists/SecLists "$HOME/SecLists" "$HOME/seclists" /opt/SecLists; do
     [ -d "$d" ] && { SECLISTS_DIR="$d"; break; }
   done
+fi
+# If no base wordlist was given / found, fall back to SecLists' common.txt.
+if [ ! -f "$WORDLIST" ] && [ -n "$SECLISTS_DIR" ] && [ -f "$SECLISTS_DIR/Discovery/Web-Content/common.txt" ]; then
+  WORDLIST="$SECLISTS_DIR/Discovery/Web-Content/common.txt"
+fi
+if [ -n "$SECLISTS_DIR" ]; then
+  log "SecLists: $SECLISTS_DIR (tech-aware fuzzing enabled)"
+else
+  warn "SecLists not found - fuzzing will use only the base wordlist."
+  warn "Install it (apt install seclists) or set SECLISTS_DIR=/path/to/SecLists."
 fi
 
 # ===========================================================================
@@ -312,9 +323,34 @@ sanitize_tags() {
         case ",${NUCLEI_TAG_ALLOWLIST//[[:space:]]/}," in *",$t,"*) echo "$t";; esac
       done | awk '!seen[$0]++' | paste -sd, -
 }
-# Seed a built-in tech -> SecLists wordlist map. Paths are existence-checked at
-# fuzz time, so entries that don't exist in this SecLists version are harmless.
-# This makes fuzzing tech-aware even with no API key.
+# Seed a built-in tech -> SecLists wordlist map. Every path below was verified to
+# exist in SecLists (github.com/danielmiessler/SecLists). Paths are still
+# existence-checked at fuzz time, so any that are absent in a given SecLists
+# version are simply skipped. This makes fuzzing tech-aware even with no API key.
+#
+# What each list is FOR (per detected technology):
+#   WordPress  wordpress.fuzz.txt  -> core WP paths (wp-login, wp-admin, xmlrpc…)
+#              wp-plugins.fuzz.txt -> ~14k plugin dirs (vuln plugin discovery)
+#              wp-themes.fuzz.txt  -> theme dirs (theme-specific bugs / LFI)
+#   Joomla     joomla-plugins/themes.fuzz.txt -> extensions & templates
+#   Drupal     Drupal.txt / drupal-themes.fuzz.txt -> modules, admin, changelog
+#   Magento    sitemap-magento.txt -> admin, downloader, RCE-prone endpoints
+#   Umbraco    CMS/Umbraco.fuzz.txt -> .NET CMS admin/config surface
+#   ColdFusion coldfusion.txt + CMS/ColdFusion.fuzz.txt -> CFIDE, admin, AdminAPI
+#   PHP        raft-large-files.txt -> huge file list rich in .php config/backup
+#   Java/JSP   JavaServlets-Common.fuzz.txt -> servlets, invoker, struts actions
+#   (Tomcat/   vulnerability-scan_j2ee-websites_WEB-INF.txt -> WEB-INF, web.xml,
+#    Spring/    class/jar leakage (source & credential disclosure)
+#    Struts)
+#   IIS/ASP    Microsoft-Frontpage.txt -> FrontPage/IIS extensions & _vti_ dirs
+#   API/REST   api/api-endpoints.txt, api/objects.txt, api/actions.txt,
+#   /Swagger   api/api-seen-in-wild.txt, common-api-endpoints-mazen160.txt
+#              -> REST resources, verbs, versioned routes, doc endpoints
+#   GraphQL    graphql.txt -> /graphql, /graphiql, playground, introspection
+#   OAuth/OIDC oauth-oidc-scopes.txt -> auth endpoints, well-known, scopes
+#   git/svn    versioning_metafiles.txt -> .git/.svn/.hg metadata (source leak)
+#   Vault      hashicorp-vault.txt / hashicorp-consul-api.txt -> secrets APIs
+#   SAP        CMS/SAP.fuzz.txt / SAP-NetWeaver.txt -> SAP web surface
 seed_static_tech_map() {
   : > "$tech_map_file"
   while IFS= read -r line; do
@@ -325,27 +361,40 @@ wordpress	Discovery/Web-Content/CMS/wordpress.fuzz.txt
 wordpress	Discovery/Web-Content/CMS/wp-plugins.fuzz.txt
 wordpress	Discovery/Web-Content/CMS/wp-themes.fuzz.txt
 joomla	Discovery/Web-Content/CMS/joomla-plugins.fuzz.txt
-joomla	Discovery/Web-Content/CMS/Joomla.txt
+joomla	Discovery/Web-Content/CMS/joomla-themes.fuzz.txt
 drupal	Discovery/Web-Content/CMS/Drupal.txt
-magento	Discovery/Web-Content/CMS/Magento.txt
-php	Discovery/Web-Content/Common-PHP-Filenames.txt
-php	Discovery/Web-Content/PHP.fuzz.txt
-laravel	Discovery/Web-Content/Laravel.fuzz.txt
-apache	Discovery/Web-Content/Apache.fuzz.txt
-tomcat	Discovery/Web-Content/Apache-Tomcat.txt
-tomcat	Discovery/Web-Content/tomcat.txt
-nginx	Discovery/Web-Content/nginx.txt
-iis	Discovery/Web-Content/IIS.fuzz.txt
-asp	Discovery/Web-Content/IIS.fuzz.txt
-aspnet	Discovery/Web-Content/IIS.fuzz.txt
-spring	Discovery/Web-Content/spring-boot.txt
-java	Discovery/Web-Content/tomcat.txt
-jenkins	Discovery/Web-Content/jenkins-plugins.txt
-git	Discovery/Web-Content/versioning_metafiles.txt
+drupal	Discovery/Web-Content/CMS/drupal-themes.fuzz.txt
+magento	Discovery/Web-Content/CMS/sitemap-magento.txt
+umbraco	Discovery/Web-Content/CMS/Umbraco.fuzz.txt
+coldfusion	Discovery/Web-Content/coldfusion.txt
+coldfusion	Discovery/Web-Content/CMS/ColdFusion.fuzz.txt
+php	Discovery/Web-Content/raft-large-files.txt
+java	Discovery/Web-Content/JavaServlets-Common.fuzz.txt
+java	Discovery/Web-Content/vulnerability-scan_j2ee-websites_WEB-INF.txt
+tomcat	Discovery/Web-Content/JavaServlets-Common.fuzz.txt
+tomcat	Discovery/Web-Content/vulnerability-scan_j2ee-websites_WEB-INF.txt
+spring	Discovery/Web-Content/JavaServlets-Common.fuzz.txt
+struts	Discovery/Web-Content/JavaServlets-Common.fuzz.txt
+iis	Discovery/Web-Content/Microsoft-Frontpage.txt
+asp	Discovery/Web-Content/Microsoft-Frontpage.txt
+frontpage	Discovery/Web-Content/Microsoft-Frontpage.txt
 api	Discovery/Web-Content/api/api-endpoints.txt
 api	Discovery/Web-Content/api/objects.txt
+api	Discovery/Web-Content/api/actions.txt
+api	Discovery/Web-Content/common-api-endpoints-mazen160.txt
+swagger	Discovery/Web-Content/api/api-endpoints.txt
+swagger	Discovery/Web-Content/api/api-seen-in-wild.txt
+openapi	Discovery/Web-Content/api/api-endpoints.txt
+rest	Discovery/Web-Content/api/api-endpoints.txt
 graphql	Discovery/Web-Content/graphql.txt
-swagger	Discovery/Web-Content/swagger.txt
+oauth	Discovery/Web-Content/oauth-oidc-scopes.txt
+oidc	Discovery/Web-Content/oauth-oidc-scopes.txt
+git	Discovery/Web-Content/versioning_metafiles.txt
+svn	Discovery/Web-Content/versioning_metafiles.txt
+vault	Discovery/Web-Content/hashicorp-vault.txt
+consul	Discovery/Web-Content/hashicorp-consul-api.txt
+sap	Discovery/Web-Content/CMS/SAP.fuzz.txt
+sap	Discovery/Web-Content/SAP-NetWeaver.txt
 STATIC
 }
 [ -n "$SECLISTS_DIR" ] && seed_static_tech_map || : > "$tech_map_file"
@@ -460,7 +509,8 @@ set_stage 4 done "$find_count findings"
   echo "- **Generated:** $(date -u '+%Y-%m-%d %H:%M UTC')"
   echo "- **Subdomains:** $sub_count | **Live:** $alive_count | **Findings:** $find_count"
   echo "- **Nuclei tags:** \`$nuclei_tags\` | **Severity:** \`$NUCLEI_SEVERITY\`"
-  echo "- **AI model:** $([ "$AI_ENABLED" = 1 ] && echo "$LLM_MODEL" || echo "disabled")"; echo
+  echo "- **AI model:** $([ "$AI_ENABLED" = 1 ] && echo "$LLM_MODEL" || echo "disabled")"
+  echo "- **SecLists:** ${SECLISTS_DIR:-not found} | **Base wordlist:** \`$WORDLIST\`"; echo
   if [ -s "$fuzz_plan_file" ]; then
     echo "## Fuzzing strategy (tech-aware wordlists)"
     echo

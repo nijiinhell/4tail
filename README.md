@@ -42,6 +42,33 @@ tech-aware even with no API key. SecLists is auto-detected (`SECLISTS_DIR`), and
 path is existence-checked — lists missing in your SecLists version are simply skipped.
 Which lists each host received is recorded in `fuzz_plan.txt` and in the report.
 
+> **`apt install seclists`** installs to `/usr/share/seclists`, which 4tail auto-detects.
+> If yours is elsewhere, set `SECLISTS_DIR=/path/to/SecLists`. When no base wordlist is
+> given, 4tail falls back to `…/Discovery/Web-Content/common.txt`.
+
+#### Built-in tech → SecLists wordlist map (paths verified against SecLists)
+
+| Detected tech | Wordlist(s) | What it's for |
+|---|---|---|
+| WordPress | `CMS/wordpress.fuzz.txt`, `wp-plugins.fuzz.txt`, `wp-themes.fuzz.txt` | Core WP paths, ~14k plugin dirs, theme dirs (vuln plugin/theme discovery) |
+| Joomla | `CMS/joomla-plugins.fuzz.txt`, `joomla-themes.fuzz.txt` | Extensions & templates |
+| Drupal | `CMS/Drupal.txt`, `drupal-themes.fuzz.txt` | Modules, admin, CHANGELOG |
+| Magento | `CMS/sitemap-magento.txt` | Admin, downloader, RCE-prone endpoints |
+| Umbraco | `CMS/Umbraco.fuzz.txt` | .NET CMS admin/config surface |
+| ColdFusion | `coldfusion.txt`, `CMS/ColdFusion.fuzz.txt` | CFIDE, Administrator, AdminAPI |
+| PHP | `raft-large-files.txt` | Large file list rich in `.php` config/backup files |
+| Java / Tomcat / Spring / Struts | `JavaServlets-Common.fuzz.txt`, `vulnerability-scan_j2ee-websites_WEB-INF.txt` | Servlets/invoker/Struts actions; `WEB-INF`, `web.xml`, class/jar leakage |
+| IIS / ASP / ASP.NET | `Microsoft-Frontpage.txt` | FrontPage/IIS extensions & `_vti_` dirs |
+| API / REST / Swagger / OpenAPI | `api/api-endpoints.txt`, `api/objects.txt`, `api/actions.txt`, `api/api-seen-in-wild.txt`, `common-api-endpoints-mazen160.txt` | REST resources, verbs, versioned routes, doc endpoints |
+| GraphQL | `graphql.txt` | `/graphql`, `/graphiql`, playground, introspection |
+| OAuth / OIDC | `oauth-oidc-scopes.txt` | Auth endpoints, `.well-known`, scopes |
+| git / svn | `versioning_metafiles.txt` | `.git` / `.svn` / `.hg` metadata (source-code leak) |
+| Vault / Consul | `hashicorp-vault.txt`, `hashicorp-consul-api.txt` | Secrets-management APIs |
+| SAP | `CMS/SAP.fuzz.txt`, `SAP-NetWeaver.txt` | SAP web surface |
+
+The AI planner can add more mappings on top of this (also existence-checked). All are
+relative to `SECLISTS_DIR` and unioned with your base list per host.
+
 ### Cost-control techniques
 
 The AI steps are engineered to stay cheap regardless of target size:
