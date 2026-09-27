@@ -33,7 +33,7 @@ LLM_RETRIES="${LLM_RETRIES:-2}"
 # stronger analyst. See README for recommended Together AI ids.
 LLM_MODEL_PLAN="${LLM_MODEL_PLAN:-}"        # scan planner (structured, light); default = LLM_MODEL
 LLM_MODEL_TRIAGE="${LLM_MODEL_TRIAGE:-}"    # findings analyst (reasoning-heavy); default = LLM_MODEL
-LLM_MAX_TOKENS_PLAN="${LLM_MAX_TOKENS_PLAN:-700}"    # planner needs little output
+LLM_MAX_TOKENS_PLAN="${LLM_MAX_TOKENS_PLAN:-1500}"   # headroom for reasoning models (GLM/DeepSeek think first)
 LLM_MAX_TOKENS_TRIAGE="${LLM_MAX_TOKENS_TRIAGE:-}"  # default = LLM_MAX_TOKENS
 # Comma-separated models tried, in order, if the primary model call fails.
 LLM_FALLBACK_MODELS="${LLM_FALLBACK_MODELS:-}"
@@ -44,6 +44,9 @@ LLM_FALLBACK_MODELS="${LLM_FALLBACK_MODELS:-}"
 WORDLIST="${WORDLIST:-}"                   # base "juicy" list; auto-resolved below (Bo0oM/fuzz.txt preferred)
 SECLISTS_DIR="${SECLISTS_DIR:-}"          # auto-detected below if empty
 MAX_FUZZ_WORDS="${MAX_FUZZ_WORDS:-60000}" # cap per-host combined wordlist size
+MAX_FUZZ_HOSTS="${MAX_FUZZ_HOSTS:-0}"     # cap number of hosts to fuzz (0 = all)
+SKIP_FUZZ="${SKIP_FUZZ:-0}"               # 1 = skip content discovery entirely (nuclei-only)
+SKIP_CDN_FUZZ="${SKIP_CDN_FUZZ:-1}"       # 1 = don't fuzz CDN/WAF edges (cloudfront, cloudflare, …)
 EXTENSIONS="${EXTENSIONS:-}"              # explicit ffuf -e list (overrides tech-aware exts)
 MAX_EXTS="${MAX_EXTS:-10}"                # cap on per-host extensions (each multiplies requests)
 FFUF_RATE="${FFUF_RATE:-0}"              # ffuf requests/sec (0 = unlimited)
@@ -80,6 +83,8 @@ Options:
   -t <tags>   Fallback nuclei tags           (env DEFAULT_NUCLEI_TAGS)
   -S <sev>    Nuclei severities              (env NUCLEI_SEVERITY, default $NUCLEI_SEVERITY)
   -m <model>  LLM model id                   (env LLM_MODEL, default $LLM_MODEL)
+  -q          Quick: skip fuzzing (nuclei-only) (env SKIP_FUZZ=1)
+  -M <n>      Fuzz at most N hosts            (env MAX_FUZZ_HOSTS, 0=all)
   -y          Skip the authorization prompt  (env ASSUME_YES=1)
   -P          Plain output, no live dashboard(env NO_TUI=1)
   -D          Run health checks and exit     (same as: $0 doctor)
@@ -102,13 +107,15 @@ EOF
 # `doctor` subcommand (before getopts, which doesn't parse bare words)
 if [ "${1:-}" = "doctor" ]; then DOCTOR=1; shift; fi
 
-while getopts ":w:o:t:S:m:yPDh" opt; do
+while getopts ":w:o:t:S:m:M:qyPDh" opt; do
   case "$opt" in
     w) WORDLIST="$OPTARG" ;;
     o) OUTDIR="$OPTARG" ;;
     t) DEFAULT_NUCLEI_TAGS="$OPTARG" ;;
     S) NUCLEI_SEVERITY="$OPTARG" ;;
     m) LLM_MODEL="$OPTARG" ;;
+    M) MAX_FUZZ_HOSTS="$OPTARG" ;;
+    q) SKIP_FUZZ=1 ;;
     y) ASSUME_YES=1 ;;
     P) NO_TUI=1 ;;
     D) DOCTOR=1 ;;
@@ -607,16 +614,21 @@ SecLists root: ${SECLISTS_DIR:-<not installed>}
 
 $(head -c 6000 "$tech_brief")" "$plan_out"
 
+  # Reasoning models (GLM/DeepSeek) often wrap JSON in ``` fences or prepend
+  # "thinking". Extract the first {...} object so jq gets clean JSON.
+  plan_json="$(tr -d '\r' < "$plan_out" | tr '\n' ' ' | grep -oE '\{.*\}' | head -1)"
+  [ -z "$plan_json" ] && plan_json="$(cat "$plan_out")"
+
   # --- parse nuclei tags (JSON first, then salvage raw text) ---
-  ai_tags="$(jq -r '.nuclei_tags[]?' "$plan_out" 2>/dev/null | paste -sd, -)"
+  ai_tags="$(printf '%s' "$plan_json" | jq -r '.nuclei_tags[]?' 2>/dev/null | paste -sd, -)"
   [ -z "$ai_tags" ] && ai_tags="$(cat "$plan_out")"
   clean_plan="$(printf '%s' "$ai_tags" | sanitize_tags)"
 
   # --- parse wordlist map (append to tech map; heavy generic lists filtered out,
   #     existence checked at fuzz time) ---
   if [ -n "$SECLISTS_DIR" ]; then
-    jq -r '.wordlists // {} | to_entries[]? | (.key|ascii_downcase) as $k | .value[]? | "\($k)\t\(.)"' \
-       "$plan_out" 2>/dev/null \
+    printf '%s' "$plan_json" \
+       | jq -r '.wordlists // {} | to_entries[]? | (.key|ascii_downcase) as $k | .value[]? | "\($k)\t\(.)"' 2>/dev/null \
        | grep -viE 'raft-|big\.txt|directory-list|combined_|dirbuster|/all\.txt' \
        >> "$tech_map_file" || true
   fi
@@ -697,39 +709,51 @@ build_ext_flag() {
 fuzz_possible=0
 { [ -f "$WORDLIST" ] || { [ -n "$SECLISTS_DIR" ] && [ -s "$tech_map_file" ]; }; } && fuzz_possible=1
 
-if have ffuf && [ "$fuzz_possible" = 1 ]; then
-  set_stage 3 running "0/$alive_count hosts"
+CDN_RE='cloudfront|cloudflare|akamai|fastly|imperva|incapsula|sucuri|edgecast|stackpath|azure front door'
+if [ "$SKIP_FUZZ" = 1 ]; then
+  set_stage 3 skip "disabled (-q / SKIP_FUZZ)"
+elif ! have ffuf; then
+  set_stage 3 skip "ffuf not installed"
+elif [ "$fuzz_possible" != 1 ]; then
+  set_stage 3 skip "no wordlist / SecLists"
+else
+  set_stage 3 running "0 hosts"
   : > "$fuzz_plan_file"
   # host \t comma-tech  (dedup by url)
   hosts_tsv="$(jq -r '[.url, ((.tech // []) | map(ascii_downcase) | join(","))] | @tsv' \
                  "$httpx_json" 2>/dev/null | sort -u)"
   [ -n "$hosts_tsv" ] || hosts_tsv="$(sed 's/$/\t/' "$alive_file")"
-  idx=0; total=$(printf '%s\n' "$hosts_tsv" | grep -c .)
+  total=$(printf '%s\n' "$hosts_tsv" | grep -c .)
+  cap="$total"
+  [ "$MAX_FUZZ_HOSTS" -gt 0 ] 2>/dev/null && cap="$MAX_FUZZ_HOSTS"
+  idx=0; fuzzed=0; skipped_cdn=0
   while IFS=$'\t' read -r url techs; do
     [ -z "$url" ] && continue
     idx=$((idx + 1))
+    # skip CDN/WAF edges - fuzzing shared infrastructure is noise
+    if [ "$SKIP_CDN_FUZZ" = 1 ] && printf '%s' "$techs" | grep -qiE "$CDN_RE"; then
+      skipped_cdn=$((skipped_cdn + 1)); continue
+    fi
+    # stop once the host cap is reached
+    if [ "$MAX_FUZZ_HOSTS" -gt 0 ] 2>/dev/null && [ "$fuzzed" -ge "$MAX_FUZZ_HOSTS" ]; then break; fi
+    fuzzed=$((fuzzed + 1))
     safe="$(printf '%s' "$url" | tr -c 'A-Za-z0-9._-' '_')"
-    # assemble this host's combined wordlist
     mapfile -t wls < <(host_wordlists "$techs" | awk 'NF' | awk '!seen[$0]++')
-    [ "${#wls[@]}" -eq 0 ] && continue
-    combined="$fuzz_dir/wl_${idx}.txt"
+    [ "${#wls[@]}" -eq 0 ] && { fuzzed=$((fuzzed - 1)); continue; }
+    combined="$fuzz_dir/wl_${fuzzed}.txt"
     cat "${wls[@]}" 2>/dev/null | sort -u | head -n "$MAX_FUZZ_WORDS" > "$combined"
     names="$(printf '%s\n' "${wls[@]}" | sed 's#.*/##' | paste -sd+ -)"
     ext_flag="$(build_ext_flag "$techs")"
     printf '%s\t%s\t(%s words) exts:[%s]\n' "$url" "$names" "$(wc -l < "$combined")" "$ext_flag" >> "$fuzz_plan_file"
-    ST_DETAIL[3]="host $idx/$total  [${techs:-generic}]"; render
+    ST_DETAIL[3]="host $fuzzed/$cap  [${techs:-generic}]${skipped_cdn:+  (cdn skipped: $skipped_cdn)}"; render
     ffuf_args=(-u "$url/FUZZ" -w "$combined" -mc 200,204,301,302,307,401,403
-               -of json -o "$fuzz_dir/${idx}_${safe}.json" -s)
+               -of json -o "$fuzz_dir/${fuzzed}_${safe}.json" -s)
     [ -n "$ext_flag" ] && ffuf_args+=(-e "$ext_flag")
     [ "$FFUF_RATE" -gt 0 ] 2>/dev/null && ffuf_args+=(-rate "$FFUF_RATE")
     ffuf "${ffuf_args[@]}" >/dev/null 2>>"$llm_log" || true
-    rm -f "$combined"   # keep the run dir small; fuzz_plan.txt records what was used
+    rm -f "$combined"
   done <<< "$hosts_tsv"
-  set_stage 3 done "$idx hosts (tech-aware)"
-elif ! have ffuf; then
-  set_stage 3 skip "ffuf not installed"
-else
-  set_stage 3 skip "no wordlist / SecLists"
+  set_stage 3 done "$fuzzed fuzzed$([ "$skipped_cdn" -gt 0 ] && echo ", $skipped_cdn CDN skipped")"
 fi
 
 # Step 5: Nuclei

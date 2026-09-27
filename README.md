@@ -213,6 +213,25 @@ TOGETHER_API_KEY=... ./4tail.sh -y -o run1 -S critical,high example.com
 ./4tail.sh -P example.com | tee run.log
 ```
 
+### Big targets (many subdomains)
+
+A target with hundreds of live hosts makes exhaustive fuzzing impractical (hosts ×
+wordlist × extensions = millions of requests), and most hosts are often shared CDN
+edges. 4tail handles this:
+
+- **CDN/WAF edges are skipped for fuzzing by default** (`SKIP_CDN_FUZZ=1`) — no point
+  brute-forcing CloudFront/Cloudflare.
+- **Quick pass** (nuclei-only, no fuzzing): `./4tail.sh -q wolt.com`
+- **Cap fuzzed hosts**: `./4tail.sh -M 25 wolt.com` (fuzz the 25 most relevant)
+- Combine with `FFUF_RATE`, `MAX_EXTS`, `MAX_FUZZ_WORDS` to bound request volume.
+
+```bash
+# Fast, polite first pass on a large scope:
+./4tail.sh -y -q -S critical,high wolt.com          # recon + nuclei, no fuzz
+# Then a bounded fuzz run on the interesting hosts:
+FFUF_RATE=40 MAX_EXTS=6 ./4tail.sh -y -M 25 wolt.com
+```
+
 When it finishes, open the report:
 
 ```bash
@@ -304,6 +323,9 @@ export LLM_FALLBACK_MODELS="zai-org/GLM-5.3"                # used if either fai
 - `FETCH_FUZZTXT=1` — download Bo0oM/fuzz.txt to `~/.4tail/` if no base list is found.
 - `SECLISTS_DIR` — SecLists root (auto-detected if unset) used for tech-specific lists.
 - `MAX_FUZZ_WORDS` — cap on each host's combined wordlist size (default 60000).
+- `MAX_FUZZ_HOSTS` — fuzz at most N hosts (`-M`, default 0 = all). Essential on big targets.
+- `SKIP_FUZZ=1` — skip content discovery entirely (`-q`, nuclei-only quick pass).
+- `SKIP_CDN_FUZZ` — skip fuzzing CDN/WAF edges (default 1; cloudfront, cloudflare, akamai, …).
 - `EXTENSIONS` — explicit ffuf `-e` list, overrides tech-aware extensions.
 - `MAX_EXTS` — cap on per-host extensions (default 10).
 - `FFUF_RATE` — ffuf requests/sec (0 = unlimited).
