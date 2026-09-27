@@ -551,7 +551,13 @@ run_doctor() {
 
 if [ "$DOCTOR" = 1 ]; then run_doctor; exit $?; fi
 
-[ "$TUI" = 1 ] && { printf '\033[?25l'; render; }   # hide cursor + first paint
+# hide cursor + reserve the panel's rows so the in-place redraw never scroll-duplicates
+if [ "$TUI" = 1 ]; then
+  printf '\033[?25l'
+  for _i in $(seq "$PANEL_LINES"); do printf '\n'; done
+  printf '\033[%dA' "$PANEL_LINES"
+  render
+fi
 
 # ===========================================================================
 # PIPELINE
@@ -961,12 +967,27 @@ else
       | sort -u | sed "s#^#${j}\t#" >> "$js_secrets_file"
   done < "$js_urls_file"
   sort -u -o "$js_secrets_file" "$js_secrets_file"
-  # 3) param discovery (arjun/x8 if available) on the deduped targets
+  # 3) param discovery (arjun if available) - arjun is slow, so background each host
+  #    and keep the dashboard ticking instead of freezing.
   : > "$params_file"
   if have arjun; then
-    printf '%s\n' "$scan_targets" | head -n 20 | while read -r u; do
-      arjun -u "$u" -q -oT /dev/stdout 2>/dev/null | sed "s#^#${u}\t#"
-    done >> "$params_file" 2>/dev/null || true
+    PARAM_HOSTS="${PARAM_HOSTS:-20}"
+    ptotal="$(printf '%s\n' "$scan_targets" | head -n "$PARAM_HOSTS" | grep -c .)"
+    pi=0
+    while read -r u; do
+      [ -z "$u" ] && continue
+      pi=$((pi + 1)); [ "$pi" -gt "$PARAM_HOSTS" ] && break
+      ptmp="$(mktemp)"
+      ( arjun -u "$u" -q -oT "$ptmp" 2>/dev/null ) & apid=$!
+      ps=$SECONDS
+      while kill -0 "$apid" 2>/dev/null; do
+        ST_DETAIL[$S_JS]="param discovery $pi/$ptotal  $((SECONDS-ps))s"
+        [ "$TUI" = 1 ] && render; sleep 0.3
+      done
+      wait "$apid" 2>/dev/null || true
+      [ -s "$ptmp" ] && sed "s#^#${u}\t#" "$ptmp" >> "$params_file"
+      rm -f "$ptmp"
+    done <<< "$(printf '%s\n' "$scan_targets" | head -n "$PARAM_HOSTS")"
   fi
   touch "$OUTDIR/.done_js"
   sec_hits="$(grep -c . "$js_secrets_file" 2>/dev/null || echo 0)"
