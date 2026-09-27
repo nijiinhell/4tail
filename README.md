@@ -248,6 +248,42 @@ findings). The running total persists across resumed runs (ledger in the run dir
 set `LLM_COST_LEDGER` to a global file), and the live dashboard + report show spend.
 Typical real spend per run is a few cents (two small calls).
 
+### Origin dedupe & response clustering
+
+On big targets most "hosts" are the same origin behind a CDN or share an identical
+default page. 4tail resolves IP/CNAME (via httpx, and drops wildcard DNS with `dnsx`
+when installed) and fuzzes **one representative per (origin, response signature)** —
+signature = status + content-length + title. This kills the 80% of fuzzing that would
+just re-hit the same thing. Disable with `DEDUPE_ORIGINS=0`; disable dnsx with `USE_DNSX=0`.
+
+### Parallel fuzzing with auto-backoff
+
+Fuzz several hosts at once (off by default):
+
+```bash
+./4tail.sh -p 5 wolt.com     # 5 hosts in parallel
+```
+
+It watches ffuf results for HTTP 429 and, once a few hosts get rate-limited, **auto-backs
+off** to serial with spacing between hosts (so a WAF doesn't ban you). Tune with
+`FUZZ_BACKOFF_TRIGGER` (default 3 hosts) and `FUZZ_BACKOFF_SLEEP` (default 15s), and keep
+`FFUF_RATE` modest so total load = parallel × rate stays sane.
+
+### JS & secret mining + param discovery
+
+```bash
+./4tail.sh -j wolt.com       # collect JS, grep for leaked secrets, discover params
+```
+
+Collects JS (via `subjs`/`getJS` if installed, else scrapes page roots), greps for leaked
+secrets (AWS/Google/Slack/GitHub keys, JWTs, private keys, S3 buckets, `api_key=`/`secret=`
+assignments), and — if `arjun` is installed — discovers hidden request parameters. Results
+go to `js_urls.txt`, `js_secrets.txt`, `params.txt`.
+
+**The AI then analyses this real content** (not just tags): the triage report gains a
+"Secrets & sensitive exposure" section (real vs false-positive, impact, how to verify) and
+an "Interesting parameters to test" section (mapping params to IDOR/SSRF/LFI/SQLi ideas).
+
 ### Big targets (many subdomains)
 
 A target with hundreds of live hosts makes exhaustive fuzzing impractical (hosts ×

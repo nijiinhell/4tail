@@ -56,8 +56,12 @@ SKIP_FUZZ="${SKIP_FUZZ:-0}"               # 1 = skip content discovery entirely 
 SKIP_CDN_FUZZ="${SKIP_CDN_FUZZ:-1}"       # 1 = don't fuzz CDN/WAF edges (cloudfront, cloudflare, …)
 EXTENSIONS="${EXTENSIONS:-}"              # explicit ffuf -e list (overrides tech-aware exts)
 MAX_EXTS="${MAX_EXTS:-10}"                # cap on per-host extensions (each multiplies requests)
-FFUF_RATE="${FFUF_RATE:-0}"              # ffuf requests/sec (0 = unlimited)
+FFUF_RATE="${FFUF_RATE:-0}"              # ffuf requests/sec per host (0 = unlimited)
+FUZZ_PARALLEL="${FUZZ_PARALLEL:-1}"      # fuzz N hosts at once (-p); auto-backoff on WAF blocks
 FETCH_FUZZTXT="${FETCH_FUZZTXT:-0}"      # 1 = download Bo0oM/fuzz.txt if no base list found
+DEDUPE_ORIGINS="${DEDUPE_ORIGINS:-1}"    # 1 = one fuzz target per IP/CNAME + response cluster
+USE_DNSX="${USE_DNSX:-1}"                # 1 = use dnsx (if installed) to resolve + drop wildcards
+JSMINE="${JSMINE:-0}"                    # 1 = JS/secret mining + param discovery (-j)
 DEFAULT_NUCLEI_TAGS="${DEFAULT_NUCLEI_TAGS:-cves,exposures,misconfiguration,tech,default-login,takeover}"
 NUCLEI_SEVERITY="${NUCLEI_SEVERITY:-critical,high,medium,low}"
 NUCLEI_RATELIMIT="${NUCLEI_RATELIMIT:-150}"
@@ -93,6 +97,8 @@ Options:
   -m <model>  LLM model id                   (env LLM_MODEL, default $LLM_MODEL)
   -q          Quick: skip fuzzing (nuclei-only) (env SKIP_FUZZ=1)
   -M <n>      Fuzz at most N hosts            (env MAX_FUZZ_HOSTS, 0=all)
+  -p <n>      Fuzz N hosts in parallel        (env FUZZ_PARALLEL, default 1; auto-backoff)
+  -j          JS/secret mining + param discovery (env JSMINE=1)
   -R          Resume: continue a previous run (env RESUME=1; use with -o <dir>)
   -b <usd>    LLM credit budget, e.g. 2      (env LLM_BUDGET_USD, 0=unlimited)
   -y          Skip the authorization prompt  (env ASSUME_YES=1)
@@ -117,7 +123,7 @@ EOF
 # `doctor` subcommand (before getopts, which doesn't parse bare words)
 if [ "${1:-}" = "doctor" ]; then DOCTOR=1; shift; fi
 
-while getopts ":w:o:t:S:m:M:b:RqyPDh" opt; do
+while getopts ":w:o:t:S:m:M:p:b:RqjyPDh" opt; do
   case "$opt" in
     w) WORDLIST="$OPTARG" ;;
     o) OUTDIR="$OPTARG" ;;
@@ -125,6 +131,8 @@ while getopts ":w:o:t:S:m:M:b:RqyPDh" opt; do
     S) NUCLEI_SEVERITY="$OPTARG" ;;
     m) LLM_MODEL="$OPTARG" ;;
     M) MAX_FUZZ_HOSTS="$OPTARG" ;;
+    p) FUZZ_PARALLEL="$OPTARG" ;;
+    j) JSMINE=1 ;;
     b) LLM_BUDGET_USD="$OPTARG" ;;
     R) RESUME=1 ;;
     q) SKIP_FUZZ=1 ;;
@@ -267,10 +275,11 @@ fi
 # ===========================================================================
 if [ -t 1 ] && [ "$NO_TUI" != "1" ]; then TUI=1; else TUI=0; fi
 
-# Stages: label + state + detail. States: pending|running|done|warn|skip
-ST_LABEL=("Subdomains" "Live hosts" "AI scan plan" "Fuzzing" "Nuclei scan" "AI triage")
-ST_STATE=(pending pending pending pending pending pending)
-ST_DETAIL=("" "" "" "" "" "")
+# Stages (named indices so the order is easy to change).
+S_SUBS=0 S_LIVE=1 S_PLAN=2 S_FUZZ=3 S_JS=4 S_NUCLEI=5 S_TRIAGE=6
+ST_LABEL=("Subdomains" "Live hosts" "AI scan plan" "Fuzzing" "JS & params" "Nuclei scan" "AI triage")
+ST_STATE=(pending pending pending pending pending pending pending)
+ST_DETAIL=("" "" "" "" "" "" "")
 PANEL_LINES=$(( ${#ST_LABEL[@]} + 3 ))   # top border + info + stages + bottom border
 panel_drawn=0
 SPIN='|/-\'; spin_i=0
@@ -318,7 +327,11 @@ render() {
   panel_drawn=1
 }
 
-set_stage() { ST_STATE[$1]="$2"; [ -n "${3+x}" ] && ST_DETAIL[$1]="$3"; render; }
+set_stage() {
+  ST_STATE[$1]="$2"; [ -n "${3+x}" ] && ST_DETAIL[$1]="$3"
+  if [ "$TUI" = 1 ]; then render
+  else case "$2" in done|warn|skip) log "${ST_LABEL[$1]}: ${ST_DETAIL[$1]:-$2}";; esac; fi
+}
 
 # --- Cost ledger (estimated USD spent on the LLM) ---------------------------
 cost_now() { [ -n "$cost_ledger" ] && cat "$cost_ledger" 2>/dev/null || echo 0; }
@@ -549,32 +562,41 @@ done_marker() { [ "$RESUME" = 1 ] && [ -f "$OUTDIR/.done_$1" ]; }
 
 # Step 1: Subdomains
 if done_marker subs && [ -s "$subdomains_file" ]; then
-  set_stage 0 done "$(wc -l <"$subdomains_file") subs (resumed)"
+  set_stage $S_SUBS done "$(wc -l <"$subdomains_file") subs (resumed)"
 else
-  run_stage 0 "$subdomains_file" " subs" subfinder -silent -d "$domain" -o "$subdomains_file"
+  run_stage $S_SUBS "$subdomains_file" " subs" subfinder -silent -d "$domain" -o "$subdomains_file"
   touch "$OUTDIR/.done_subs"
 fi
 sub_count=$(wc -l < "$subdomains_file" 2>/dev/null || echo 0)
 if [ "$sub_count" -eq 0 ]; then
-  set_stage 0 warn "none found"; [ "$TUI" = 1 ] || warn "No subdomains; stopping."; exit 0
+  set_stage $S_SUBS warn "none found"; [ "$TUI" = 1 ] || warn "No subdomains; stopping."; exit 0
 fi
-set_stage 0 done "$sub_count subs$(done_marker subs && echo ' (resumed)')"
+set_stage $S_SUBS done "$sub_count subs$(done_marker subs && echo ' (resumed)')"
 
 # Step 2: Live hosts + tech detection
 if done_marker httpx && [ -s "$httpx_json" ]; then
-  set_stage 1 done "resumed"
+  set_stage $S_LIVE done "resumed"
 else
-  run_stage 1 "$httpx_json" " live" \
-    httpx -silent -json -tech-detect -status-code -title -web-server \
-          -threads "$HTTPX_THREADS" -l "$subdomains_file" -o "$httpx_json"
+  # Optional: resolve + drop wildcard DNS with dnsx (removes bogus subdomains that
+  # all resolve to a catch-all record - a huge source of wasted work on big targets).
+  probe_input="$subdomains_file"
+  if [ "$USE_DNSX" = 1 ] && have dnsx; then
+    resolved_file="$OUTDIR/resolved.txt"
+    set_stage $S_LIVE running "resolving (dnsx, wildcard filter)"
+    dnsx -silent -l "$subdomains_file" -wd "$domain" -o "$resolved_file" 2>>"$llm_log" || true
+    [ -s "$resolved_file" ] && probe_input="$resolved_file"
+  fi
+  run_stage $S_LIVE "$httpx_json" " live" \
+    httpx -silent -json -tech-detect -status-code -title -web-server -ip -cname \
+          -threads "$HTTPX_THREADS" -l "$probe_input" -o "$httpx_json"
   touch "$OUTDIR/.done_httpx"
 fi
 if [ -s "$httpx_json" ]; then jq -r '.url' "$httpx_json" 2>/dev/null | sort -u > "$alive_file"; else : > "$alive_file"; fi
 alive_count=$(wc -l < "$alive_file" 2>/dev/null || echo 0)
 if [ "$alive_count" -eq 0 ]; then
-  set_stage 1 warn "none live"; [ "$TUI" = 1 ] || warn "No live hosts; stopping."; exit 0
+  set_stage $S_LIVE warn "none live"; [ "$TUI" = 1 ] || warn "No live hosts; stopping."; exit 0
 fi
-set_stage 1 done "$alive_count live$(done_marker httpx && echo ' (resumed)')"
+set_stage $S_LIVE done "$alive_count live$(done_marker httpx && echo ' (resumed)')"
 
 # Aggregated, cost-frugal brief for the AI
 {
@@ -686,9 +708,9 @@ else : > "$tech_map_file"; fi
 nuclei_tags="$DEFAULT_NUCLEI_TAGS"
 if [ "$RESUME" = 1 ] && [ -s "$OUTDIR/ai_scan_plan.txt" ]; then
   nuclei_tags="$(cat "$OUTDIR/ai_scan_plan.txt")"
-  set_stage 2 done "$nuclei_tags (resumed)"
+  set_stage $S_PLAN done "$nuclei_tags (resumed)"
 elif [ "$AI_ENABLED" = "1" ] && ! budget_ok; then
-  set_stage 2 skip "budget reached ($(cost_fmt)), using defaults"
+  set_stage $S_PLAN skip "budget reached ($(cost_fmt)), using defaults"
 elif [ "$AI_ENABLED" = "1" ] && [ -s "$tech_brief" ]; then
   sys_plan='You assist AUTHORIZED bug-bounty recon. Given an aggregated brief of the
 technologies, servers and notable paths on live hosts, produce a scan plan.
@@ -702,7 +724,7 @@ Reply with ONLY a JSON object (no prose, no code fences) with exactly two keys:
      Prefer small, tech-SPECIFIC lists (CMS/*, api/*, *.fuzz.txt). Do NOT use big generic
      lists (raft-*, big.txt, directory-list-*, combined_*, dirbuster) - those are excluded.'
   plan_out="$(mktemp)"
-  run_ai_stage 2 "$LLM_MODEL_PLAN" "$LLM_MAX_TOKENS_PLAN" "$sys_plan" "Target: $domain
+  run_ai_stage $S_PLAN "$LLM_MODEL_PLAN" "$LLM_MAX_TOKENS_PLAN" "$sys_plan" "Target: $domain
 Live hosts: $alive_count
 SecLists root: ${SECLISTS_DIR:-<not installed>}
 
@@ -730,12 +752,12 @@ $(head -c 12000 "$tech_brief")" "$plan_out"
 
   if [ -n "$clean_plan" ] && [ "$(printf '%s' "$clean_plan" | tr ',' '\n' | grep -c .)" -ge 2 ]; then
     nuclei_tags="$clean_plan"; printf '%s\n' "$nuclei_tags" > "$OUTDIR/ai_scan_plan.txt"
-    set_stage 2 done "$nuclei_tags"
+    set_stage $S_PLAN done "$nuclei_tags"
   else
-    set_stage 2 warn "unusable, using defaults"
+    set_stage $S_PLAN warn "unusable, using defaults"
   fi
 else
-  set_stage 2 skip "AI off (defaults)"
+  set_stage $S_PLAN skip "AI off (defaults)"
 fi
 
 # Step 4: Fuzzing (tech-aware, per host)
@@ -805,39 +827,79 @@ fuzz_possible=0
 
 CDN_RE='cloudfront|cloudflare|akamai|fastly|imperva|incapsula|sucuri|edgecast|stackpath|azure front door'
 if [ "$SKIP_FUZZ" = 1 ]; then
-  set_stage 3 skip "disabled (-q / SKIP_FUZZ)"
+  set_stage $S_FUZZ skip "disabled (-q / SKIP_FUZZ)"
 elif ! have ffuf; then
-  set_stage 3 skip "ffuf not installed"
+  set_stage $S_FUZZ skip "ffuf not installed"
 elif [ "$fuzz_possible" != 1 ]; then
-  set_stage 3 skip "no wordlist / SecLists"
+  set_stage $S_FUZZ skip "no wordlist / SecLists"
 elif [ "$RESUME" = 1 ] && [ -f "$OUTDIR/.done_fuzz" ]; then
-  set_stage 3 done "$(grep -c . "$fuzz_plan_file" 2>/dev/null || echo 0) hosts (resumed)"
+  set_stage $S_FUZZ done "$(grep -c . "$fuzz_plan_file" 2>/dev/null || echo 0) hosts (resumed)"
 else
-  set_stage 3 running "0 hosts"
+  set_stage $S_FUZZ running "0 hosts"
   [ "$RESUME" = 1 ] || : > "$fuzz_plan_file"   # keep prior progress when resuming
-  # host \t comma-tech  (dedup by url)
-  hosts_tsv="$(jq -r '[.url, ((.tech // []) | map(ascii_downcase) | join(","))] | @tsv' \
-                 "$httpx_json" 2>/dev/null | sort -u)"
+  if [ "$DEDUPE_ORIGINS" = 1 ] && [ -s "$httpx_json" ]; then
+    # One representative per (origin, response signature): origin = cname or first IP;
+    # signature = status|content_length|title. Kills near-identical pages and shared
+    # origins so we don't fuzz the same thing hundreds of times.
+    hosts_tsv="$(jq -r '
+        ((.cname // (.a[0]? // .host)) | tostring) as $origin
+        | [ (.url),
+            ((.tech // []) | map(ascii_downcase) | join(",")),
+            ($origin + "|" + (.status_code|tostring) + "|" + ((.content_length//0)|tostring) + "|" + (.title//"")) ]
+        | @tsv' "$httpx_json" 2>/dev/null \
+      | awk -F'\t' '!seen[$3]++ {print $1"\t"$2}' | sort -u)"
+  else
+    hosts_tsv="$(jq -r '[.url, ((.tech // []) | map(ascii_downcase) | join(","))] | @tsv' \
+                   "$httpx_json" 2>/dev/null | sort -u)"
+  fi
   [ -n "$hosts_tsv" ] || hosts_tsv="$(sed 's/$/\t/' "$alive_file")"
   total=$(printf '%s\n' "$hosts_tsv" | grep -c .)
   cap="$total"
   [ "$MAX_FUZZ_HOSTS" -gt 0 ] 2>/dev/null && cap="$MAX_FUZZ_HOSTS"
-  fuzzed=0; skipped_cdn=0; resumed=0
+
+  # concurrency (sanitize) + auto-backoff state
+  P="$FUZZ_PARALLEL"; case "$P" in ''|*[!0-9]*) P=1;; esac; [ "$P" -lt 1 ] && P=1
+  p_eff="$P"; block_hits=0; backoff=0
+  BACKOFF_TRIGGER="${FUZZ_BACKOFF_TRIGGER:-3}"; BACKOFF_SLEEP="${FUZZ_BACKOFF_SLEEP:-15}"
+  declare -A JOB=()
+  fuzzed=0; skipped_cdn=0; resumed=0; done_count=0
+
+  fuzz_running() { local p n=0; for p in "${!JOB[@]}"; do kill -0 "$p" 2>/dev/null && n=$((n+1)); done; echo "$n"; }
+  fuzz_reap() {
+    local p sf jf r429
+    for p in "${!JOB[@]}"; do
+      kill -0 "$p" 2>/dev/null && continue
+      wait "$p" 2>/dev/null || true
+      sf="${JOB[$p]}"; jf="$fuzz_dir/${sf}.json"
+      r429="$(jq '[.results[]?|select(.status==429)]|length' "$jf" 2>/dev/null || echo 0)"
+      [ "${r429:-0}" -gt 0 ] 2>/dev/null && block_hits=$((block_hits + 1))
+      rm -f "$fuzz_dir/.wl_${sf}.txt"; unset 'JOB[$p]'; done_count=$((done_count + 1))
+    done
+  }
+  fuzz_status() {
+    ST_DETAIL[$S_FUZZ]="run:$(fuzz_running)/$p_eff done:$done_count/$cap${skipped_cdn:+ cdn:$skipped_cdn}${resumed:+ res:$resumed}$([ "$backoff" = 1 ] && echo ' ⚠backoff')"
+  }
+
   while IFS=$'\t' read -r url techs; do
     [ -z "$url" ] && continue
     safe="$(printf '%s' "$url" | tr -c 'A-Za-z0-9._-' '_')"
-    # resume: skip hosts already fuzzed in a previous run
     if [ "$RESUME" = 1 ] && [ -f "$fuzz_dir/${safe}.json" ]; then resumed=$((resumed + 1)); continue; fi
-    # skip CDN/WAF edges - fuzzing shared infrastructure is noise
     if [ "$SKIP_CDN_FUZZ" = 1 ] && printf '%s' "$techs" | grep -qiE "$CDN_RE"; then
       skipped_cdn=$((skipped_cdn + 1)); continue
     fi
-    # stop once the host cap is reached
     if [ "$MAX_FUZZ_HOSTS" -gt 0 ] 2>/dev/null && [ "$fuzzed" -ge "$MAX_FUZZ_HOSTS" ]; then break; fi
-    fuzzed=$((fuzzed + 1))
     mapfile -t wls < <(host_wordlists "$techs" | awk 'NF' | awk '!seen[$0]++')
-    [ "${#wls[@]}" -eq 0 ] && { fuzzed=$((fuzzed - 1)); continue; }
-    combined="$fuzz_dir/.wl_tmp.txt"
+    [ "${#wls[@]}" -eq 0 ] && continue
+    fuzz_reap   # process any finished jobs so block_hits is current
+    # auto-backoff: too many 429s -> drop to serial + space out requests
+    if [ "$backoff" = 0 ] && [ "$block_hits" -ge "$BACKOFF_TRIGGER" ]; then
+      backoff=1; p_eff=1
+      [ "$TUI" = 1 ] || warn "WAF rate-limiting detected ($block_hits hosts hit 429) - backing off (serial + ${BACKOFF_SLEEP}s spacing)"
+    fi
+    # wait for a free slot
+    while [ "$(fuzz_running)" -ge "$p_eff" ]; do fuzz_reap; fuzz_status; render; sleep 0.25; done
+    fuzzed=$((fuzzed + 1))
+    combined="$fuzz_dir/.wl_${safe}.txt"
     cat "${wls[@]}" 2>/dev/null | sort -u | head -n "$MAX_FUZZ_WORDS" > "$combined"
     names="$(printf '%s\n' "${wls[@]}" | sed 's#.*/##' | paste -sd+ -)"
     ext_flag="$(build_ext_flag "$techs")"
@@ -846,37 +908,82 @@ else
                -of json -o "$fuzz_dir/${safe}.json" -s)
     [ -n "$ext_flag" ] && ffuf_args+=(-e "$ext_flag")
     [ "$FFUF_RATE" -gt 0 ] 2>/dev/null && ffuf_args+=(-rate "$FFUF_RATE")
-    if [ "$TUI" = 1 ]; then
-      # background ffuf so the dashboard keeps ticking while a host is fuzzed
-      ffuf "${ffuf_args[@]}" >/dev/null 2>>"$llm_log" & fpid=$!
-      fs=$SECONDS
-      while kill -0 "$fpid" 2>/dev/null; do
-        ST_DETAIL[3]="host $fuzzed/$cap [${techs:-generic}] $((SECONDS-fs))s${skipped_cdn:+ cdn:$skipped_cdn}${resumed:+ done:$resumed}"
-        render; sleep 0.25
-      done
-      wait "$fpid" 2>/dev/null || true
-    else
-      log "Fuzzing $fuzzed/$cap: $url"
-      ffuf "${ffuf_args[@]}" >/dev/null 2>>"$llm_log" || true
-    fi
-    rm -f "$combined"
+    [ "$TUI" = 1 ] || log "Fuzzing $fuzzed/$cap: $url"
+    ffuf "${ffuf_args[@]}" >/dev/null 2>>"$llm_log" & JOB[$!]="$safe"
+    fuzz_status; render
+    [ "$backoff" = 1 ] && sleep "$BACKOFF_SLEEP"
   done <<< "$hosts_tsv"
-  # mark complete only if we weren't cut short by the cap
+  # drain remaining jobs
+  while [ "$(fuzz_running)" -gt 0 ]; do fuzz_reap; fuzz_status; render; sleep 0.25; done
+  fuzz_reap
   [ "$MAX_FUZZ_HOSTS" -gt 0 ] 2>/dev/null || touch "$OUTDIR/.done_fuzz"
-  set_stage 3 done "$fuzzed fuzzed$([ "$resumed" -gt 0 ] && echo ", $resumed resumed")$([ "$skipped_cdn" -gt 0 ] && echo ", $skipped_cdn CDN skipped")"
+  set_stage $S_FUZZ done "$fuzzed fuzzed$([ "$resumed" -gt 0 ] && echo ", $resumed resumed")$([ "$skipped_cdn" -gt 0 ] && echo ", $skipped_cdn CDN skipped")$([ "$backoff" = 1 ] && echo ", backoff")"
+fi
+
+# Step 4.5: JS & secret mining + param discovery (opt-in with -j)
+js_urls_file="$OUTDIR/js_urls.txt"
+js_secrets_file="$OUTDIR/js_secrets.txt"
+params_file="$OUTDIR/params.txt"
+# Regex for common leaked secrets (no single-quote chars, so it stays shell-safe).
+SECRET_RE='AKIA[0-9A-Z]{16}|AIza[0-9A-Za-z_-]{35}|xox[baprs]-[0-9A-Za-z-]{10,}|ghp_[0-9A-Za-z]{36}|eyJ[A-Za-z0-9_-]{10,}\.[A-Za-z0-9_-]{10,}\.[A-Za-z0-9_-]{10,}|-----BEGIN [A-Z ]*PRIVATE KEY-----|[a-z0-9.-]+\.s3\.amazonaws\.com|(api[_-]?key|secret|access[_-]?token|client[_-]?secret|aws_secret|password)["[:space:]:=]{1,4}[0-9A-Za-z._+/-]{12,}'
+
+if [ "$JSMINE" != 1 ]; then
+  set_stage $S_JS skip "off (-j to enable)"
+elif ! have curl; then
+  set_stage $S_JS skip "curl required"
+elif done_marker js && [ -f "$js_secrets_file" ]; then
+  set_stage $S_JS done "$(wc -l <"$js_secrets_file" 2>/dev/null||echo 0) secret hits (resumed)"
+else
+  set_stage $S_JS running "collecting JS"
+  JS_HOSTS="${JS_HOSTS:-60}"; JS_MAX="${JS_MAX:-200}"
+  # 1) gather JS URLs (subjs/getJS if present, else scrape roots)
+  : > "$js_urls_file"
+  scan_targets="$(sort -u "$alive_file" | head -n "$JS_HOSTS")"
+  if have subjs; then
+    printf '%s\n' "$scan_targets" | subjs 2>/dev/null | sort -u > "$js_urls_file"
+  elif have getJS; then
+    printf '%s\n' "$scan_targets" | while read -r u; do getJS --url "$u" 2>/dev/null; done | sort -u > "$js_urls_file"
+  else
+    printf '%s\n' "$scan_targets" | while read -r u; do
+      curl -s -L --max-time 15 "$u" 2>/dev/null \
+        | grep -oiE 'src="[^"]+\.js' | sed -E 's/^src="//' \
+        | while read -r j; do case "$j" in http*) echo "$j";; /*) echo "${u%/}$j";; *) echo "${u%/}/$j";; esac; done
+    done | sort -u > "$js_urls_file"
+  fi
+  js_total="$(grep -c . "$js_urls_file" 2>/dev/null || echo 0)"
+  # 2) fetch each JS and scan for secrets
+  : > "$js_secrets_file"; ji=0
+  while read -r j; do
+    [ -z "$j" ] && continue
+    ji=$((ji + 1)); [ "$ji" -gt "$JS_MAX" ] && break
+    ST_DETAIL[$S_JS]="scanning JS $ji/$js_total  hits:$(grep -c . "$js_secrets_file" 2>/dev/null||echo 0)"; render
+    curl -s -L --max-time 15 "$j" 2>/dev/null | grep -aoE "$SECRET_RE" 2>/dev/null \
+      | sort -u | sed "s#^#${j}\t#" >> "$js_secrets_file"
+  done < "$js_urls_file"
+  sort -u -o "$js_secrets_file" "$js_secrets_file"
+  # 3) param discovery (arjun/x8 if available) on the deduped targets
+  : > "$params_file"
+  if have arjun; then
+    printf '%s\n' "$scan_targets" | head -n 20 | while read -r u; do
+      arjun -u "$u" -q -oT /dev/stdout 2>/dev/null | sed "s#^#${u}\t#"
+    done >> "$params_file" 2>/dev/null || true
+  fi
+  touch "$OUTDIR/.done_js"
+  sec_hits="$(grep -c . "$js_secrets_file" 2>/dev/null || echo 0)"
+  set_stage $S_JS done "$js_total JS, $sec_hits secret hits$([ -s "$params_file" ] && echo ', params')"
 fi
 
 # Step 5: Nuclei
 if done_marker nuclei && [ -f "$nuclei_file" ]; then
-  set_stage 4 done "$(wc -l <"$nuclei_file") findings (resumed)"
+  set_stage $S_NUCLEI done "$(wc -l <"$nuclei_file") findings (resumed)"
 else
-  run_stage 4 "$nuclei_file" " hits" \
+  run_stage $S_NUCLEI "$nuclei_file" " hits" \
     nuclei -silent -tags "$nuclei_tags" -severity "$NUCLEI_SEVERITY" \
            -rate-limit "$NUCLEI_RATELIMIT" -l "$alive_file" -o "$nuclei_file"
   touch "$OUTDIR/.done_nuclei"
 fi
 find_count=$(wc -l < "$nuclei_file" 2>/dev/null || echo 0)
-set_stage 4 done "$find_count findings$(done_marker nuclei && echo ' (resumed)')"
+set_stage $S_NUCLEI done "$find_count findings$(done_marker nuclei && echo ' (resumed)')"
 
 # Report header
 {
@@ -884,6 +991,7 @@ set_stage 4 done "$find_count findings$(done_marker nuclei && echo ' (resumed)')
   echo "- **Target:** \`$domain\`"
   echo "- **Generated:** $(date -u '+%Y-%m-%d %H:%M UTC')"
   echo "- **Subdomains:** $sub_count | **Live:** $alive_count | **Findings:** $find_count"
+  [ "$JSMINE" = 1 ] && echo "- **JS mined:** $(grep -c . "$js_urls_file" 2>/dev/null||echo 0) files, $(grep -c . "$js_secrets_file" 2>/dev/null||echo 0) secret hits, $(grep -c . "$params_file" 2>/dev/null||echo 0) params"
   echo "- **Nuclei tags:** \`$nuclei_tags\` | **Severity:** \`$NUCLEI_SEVERITY\`"
   echo "- **AI models:** $([ "$AI_ENABLED" = 1 ] && echo "plan=$LLM_MODEL_PLAN, triage=$LLM_MODEL_TRIAGE" || echo "disabled")"
   [ "$AI_ENABLED" = 1 ] && echo "- **Estimated AI spend:** $(cost_fmt)$([ "${LLM_BUDGET_USD:-0}" != 0 ] && echo " (budget \$$LLM_BUDGET_USD)")"
@@ -902,45 +1010,58 @@ set_stage 4 done "$find_count findings$(done_marker nuclei && echo ' (resumed)')
   fi
 } > "$report_file"
 
-# Step 6: AI triage
-if [ "$AI_ENABLED" = "1" ] && [ "$find_count" -gt 0 ] && ! budget_ok; then
-  { echo "## Findings (budget reached, no AI triage)"; echo '```'; cat "$nuclei_file"; echo '```'; } >> "$report_file"
-  set_stage 5 skip "budget reached ($(cost_fmt))"
-elif [ "$AI_ENABLED" = "1" ] && [ "$find_count" -gt 0 ]; then
+# Step 6: AI triage  (also analyses mined JS secrets + discovered params, not just nuclei)
+have_extra=0; { [ -s "$js_secrets_file" ] || [ -s "$params_file" ]; } && have_extra=1
+if [ "$AI_ENABLED" = "1" ] && { [ "$find_count" -gt 0 ] || [ "$have_extra" = 1 ]; } && ! budget_ok; then
+  { echo "## Findings (budget reached, no AI triage)"; echo '```'; cat "$nuclei_file" 2>/dev/null
+    [ -s "$js_secrets_file" ] && { echo; echo "# JS secret candidates:"; cat "$js_secrets_file"; }; echo '```'; } >> "$report_file"
+  set_stage $S_TRIAGE skip "budget reached ($(cost_fmt))"
+elif [ "$AI_ENABLED" = "1" ] && { [ "$find_count" -gt 0 ] || [ "$have_extra" = 1 ]; }; then
   sorted_findings="$(
-    for sev in critical high medium low info; do grep -iE "\[$sev\]" "$nuclei_file"; done
-    grep -viE '\[(critical|high|medium|low|info)\]' "$nuclei_file"
+    for sev in critical high medium low info; do grep -iE "\[$sev\]" "$nuclei_file" 2>/dev/null; done
+    grep -viE '\[(critical|high|medium|low|info)\]' "$nuclei_file" 2>/dev/null
   )"
-  [ -z "$sorted_findings" ] && sorted_findings="$(cat "$nuclei_file")"
+  [ -z "$sorted_findings" ] && sorted_findings="$(cat "$nuclei_file" 2>/dev/null)"
   sys_triage='You are a senior security analyst on an AUTHORIZED bug-bounty engagement.
-Given a technology brief and severity-sorted nuclei output, produce a thorough report in
-GitHub-flavored Markdown with exactly these sections:
+Given a technology brief, severity-sorted nuclei output, JS secret candidates and
+discovered request parameters, produce a thorough report in GitHub-flavored Markdown with:
 "## Executive summary" (3-5 sentences),
-"## Prioritised findings" (a table: Severity | Host | Issue | Why it matters | Next step),
-"## Attack surface notes" (grouped observations by technology/host cluster),
-"## Recommended manual follow-ups" (bullet list, concrete and specific).
+"## Prioritised findings" (table: Severity | Host | Issue | Why it matters | Next step),
+"## Secrets & sensitive exposure" (assess each JS secret candidate: likely real vs false
+positive, impact, and how to verify safely - flag private keys / cloud creds as critical),
+"## Interesting parameters to test" (map discovered params to likely bug classes: IDOR,
+SSRF, LFI, SQLi, open-redirect - with a concrete test idea each),
+"## Attack surface notes" and "## Recommended manual follow-ups".
 Use ONLY the provided data - do not invent findings.'
   triage_out="$(mktemp)"
-  run_ai_stage 5 "$LLM_MODEL_TRIAGE" "$LLM_MAX_TOKENS_TRIAGE" "$sys_triage" "Target: $domain
+  run_ai_stage $S_TRIAGE "$LLM_MODEL_TRIAGE" "$LLM_MAX_TOKENS_TRIAGE" "$sys_triage" "Target: $domain
 
 === technology brief ===
 $(head -c 8000 "$tech_brief")
 
-=== findings (severity-sorted) ===
-$(printf '%s\n' "$sorted_findings" | head -n 400 | head -c 40000)" "$triage_out"
+=== nuclei findings (severity-sorted) ===
+$(printf '%s\n' "$sorted_findings" | head -n 400 | head -c 30000)
+
+=== JS secret candidates (url <TAB> match) ===
+$(head -c 8000 "$js_secrets_file" 2>/dev/null)
+
+=== discovered parameters (url <TAB> param) ===
+$(head -c 4000 "$params_file" 2>/dev/null)" "$triage_out"
   if [ -s "$triage_out" ]; then
-    cat "$triage_out" >> "$report_file"; set_stage 5 done "report.md written"
+    cat "$triage_out" >> "$report_file"; set_stage $S_TRIAGE done "report.md written"
   else
-    { echo "## Raw findings"; echo '```'; cat "$nuclei_file"; echo '```'; } >> "$report_file"
-    set_stage 5 warn "AI failed, raw findings saved"
+    { echo "## Raw findings"; echo '```'; cat "$nuclei_file" 2>/dev/null; echo '```'; } >> "$report_file"
+    set_stage $S_TRIAGE warn "AI failed, raw findings saved"
   fi
   rm -f "$triage_out"
 else
   {
     echo "## Findings"
     if [ "$find_count" -gt 0 ]; then echo '```'; cat "$nuclei_file"; echo '```'; else echo "_No nuclei findings._"; fi
+    if [ -s "$js_secrets_file" ]; then echo; echo "## JS secret candidates"; echo '```'; cat "$js_secrets_file"; echo '```'; fi
+    if [ -s "$params_file" ]; then echo; echo "## Discovered parameters"; echo '```'; cat "$params_file"; echo '```'; fi
   } >> "$report_file"
-  set_stage 5 skip "$([ "$AI_ENABLED" = 1 ] && echo "no findings" || echo "AI off")"
+  set_stage $S_TRIAGE skip "$([ "$AI_ENABLED" = 1 ] && echo "nothing to triage" || echo "AI off")"
 fi
 
 # Final summary
