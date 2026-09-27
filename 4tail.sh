@@ -300,13 +300,19 @@ render() {
   if [ "$AI_ENABLED" = 1 ] && [ -n "$cost_ledger" ]; then
     cost_seg="  spent=$(cost_fmt)"; [ "${LLM_BUDGET_USD:-0}" != 0 ] && cost_seg="$cost_seg/\$$LLM_BUDGET_USD"
   fi
+  # Keep every line within one terminal row - a wrapped line desyncs the redraw.
+  local width; width="${COLUMNS:-0}"; [ "$width" -gt 0 ] 2>/dev/null || width="$(tput cols 2>/dev/null || echo 100)"
+  local info="target=$domain  ai=$model_line  elapsed=$((SECONDS-started))s$cost_seg"
+  local iw=$((width - 4)); [ "${#info}" -gt "$iw" ] && info="${info:0:iw}"
   printf ' %s╭─ 4tail ───────────────────────────────────────%s\033[K\n' "$c_cyan" "$c_reset"
-  printf ' %s│%s target=%s  ai=%s  elapsed=%ss%s\033[K\n' "$c_cyan" "$c_reset" "$domain" "$model_line" "$((SECONDS-started))" "$cost_seg"
-  local i
+  printf ' %s│%s %s\033[K\n' "$c_cyan" "$c_reset" "$info"
+  local i d dw=$((width - 24))
   for i in "${!ST_LABEL[@]}"; do
+    d="${ST_DETAIL[$i]:-}"
+    [ "$dw" -gt 4 ] && [ "${#d}" -gt "$dw" ] && d="${d:0:dw}…"
     printf ' %s│%s  %s  %-13s %s%s%s\033[K\n' \
       "$c_cyan" "$c_reset" "$(icon "${ST_STATE[$i]}")" "${ST_LABEL[$i]}" \
-      "$c_dim" "${ST_DETAIL[$i]:-}" "$c_reset"
+      "$c_dim" "$d" "$c_reset"
   done
   printf ' %s╰──────────────────────────────────────────────%s\033[K\n' "$c_cyan" "$c_reset"
   panel_drawn=1
@@ -836,12 +842,23 @@ else
     names="$(printf '%s\n' "${wls[@]}" | sed 's#.*/##' | paste -sd+ -)"
     ext_flag="$(build_ext_flag "$techs")"
     printf '%s\t%s\t(%s words) exts:[%s]\n' "$url" "$names" "$(wc -l < "$combined")" "$ext_flag" >> "$fuzz_plan_file"
-    ST_DETAIL[3]="host $fuzzed/$cap  [${techs:-generic}]${skipped_cdn:+  (cdn:$skipped_cdn)}${resumed:+ (done:$resumed)}"; render
     ffuf_args=(-u "$url/FUZZ" -w "$combined" -mc 200,204,301,302,307,401,403
                -of json -o "$fuzz_dir/${safe}.json" -s)
     [ -n "$ext_flag" ] && ffuf_args+=(-e "$ext_flag")
     [ "$FFUF_RATE" -gt 0 ] 2>/dev/null && ffuf_args+=(-rate "$FFUF_RATE")
-    ffuf "${ffuf_args[@]}" >/dev/null 2>>"$llm_log" || true
+    if [ "$TUI" = 1 ]; then
+      # background ffuf so the dashboard keeps ticking while a host is fuzzed
+      ffuf "${ffuf_args[@]}" >/dev/null 2>>"$llm_log" & fpid=$!
+      fs=$SECONDS
+      while kill -0 "$fpid" 2>/dev/null; do
+        ST_DETAIL[3]="host $fuzzed/$cap [${techs:-generic}] $((SECONDS-fs))s${skipped_cdn:+ cdn:$skipped_cdn}${resumed:+ done:$resumed}"
+        render; sleep 0.25
+      done
+      wait "$fpid" 2>/dev/null || true
+    else
+      log "Fuzzing $fuzzed/$cap: $url"
+      ffuf "${ffuf_args[@]}" >/dev/null 2>>"$llm_log" || true
+    fi
     rm -f "$combined"
   done <<< "$hosts_tsv"
   # mark complete only if we weren't cut short by the cap
