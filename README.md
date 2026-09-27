@@ -231,11 +231,40 @@ cat 4tail_example.com_*/report.md
 - `TOGETHER_API_KEY` (or `LLM_API_KEY`) — enables the AI decision + triage steps.
 - `LLM_BASE_URL` — API base (default `https://api.together.xyz/v1`). Point this at any
   OpenAI-compatible provider (e.g. Zhipu, OpenRouter, a local server) to switch backends.
-- `LLM_MODEL` — model id (default `zai-org/GLM-4.6`). For even lower cost try a smaller
-  GLM variant such as `zai-org/GLM-4.5-Air-FP8`; browse ids at
-  [together.ai/models](https://www.together.ai/models).
-- `LLM_MAX_TOKENS` — output cap (default `1200`, kept low for cost).
+- `LLM_MODEL` — base model id used for every role unless overridden (default `zai-org/GLM-4.6`).
+- `LLM_MAX_TOKENS` — default output cap (default `1200`, kept low for cost).
 - `LLM_TEMPERATURE`, `LLM_TIMEOUT`, `LLM_RETRIES` — request tuning.
+
+### Smart model routing ("swarm"-style switching)
+
+**With only a key set, both AI steps use `zai-org/GLM-4.6`.** But 4tail routes each task
+to its own model + token budget, so you can run a **cheap planner + a stronger analyst**:
+
+| Role | What it does | Env var | Default |
+|------|--------------|---------|---------|
+| Planner | Pick nuclei tags + wordlist map (structured, light) | `LLM_MODEL_PLAN` | `LLM_MODEL` |
+| Analyst | Triage & prioritise findings (reasoning-heavy) | `LLM_MODEL_TRIAGE` | `LLM_MODEL` |
+
+Token budgets are per-role too: `LLM_MAX_TOKENS_PLAN` (default 700) and
+`LLM_MAX_TOKENS_TRIAGE` (default `LLM_MAX_TOKENS`). And `LLM_FALLBACK_MODELS` (comma list)
+is tried, in order, if a role's model call fails — automatic model switching for
+reliability.
+
+Example: cheap/fast planner, strong reasoning analyst, GLM as the safety net:
+
+```bash
+export TOGETHER_API_KEY=...
+export LLM_MODEL_PLAN="Qwen/Qwen2.5-7B-Instruct-Turbo"      # fast + cheap for the plan
+export LLM_MODEL_TRIAGE="deepseek-ai/DeepSeek-V3"           # stronger for analysis
+export LLM_FALLBACK_MODELS="zai-org/GLM-4.6"                # used if either fails
+./4tail.sh example.com
+```
+
+> Model ids drift — verify the exact strings on [together.ai/models](https://www.together.ai/models)
+> before use. Good cheap planners: `Qwen/Qwen2.5-7B-Instruct-Turbo`,
+> `meta-llama/Meta-Llama-3.1-8B-Instruct-Turbo`. Good analysts: `deepseek-ai/DeepSeek-V3`,
+> `Qwen/Qwen2.5-72B-Instruct-Turbo`, `zai-org/GLM-4.6`. The startup line and `report.md`
+> both show which models were routed.
 
 ### Scan tuning env vars
 

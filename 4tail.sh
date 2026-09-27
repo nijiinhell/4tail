@@ -19,11 +19,22 @@ set -o pipefail
 # ---------------------------------------------------------------------------
 LLM_API_KEY="${TOGETHER_API_KEY:-${LLM_API_KEY:-}}"
 LLM_BASE_URL="${LLM_BASE_URL:-https://api.together.xyz/v1}"
-LLM_MODEL="${LLM_MODEL:-zai-org/GLM-4.6}"
+LLM_MODEL="${LLM_MODEL:-zai-org/GLM-4.6}"   # base default for every role
 LLM_MAX_TOKENS="${LLM_MAX_TOKENS:-1200}"
 LLM_TEMPERATURE="${LLM_TEMPERATURE:-0.2}"
 LLM_TIMEOUT="${LLM_TIMEOUT:-90}"
 LLM_RETRIES="${LLM_RETRIES:-2}"
+
+# --- Smart model routing (per-task "swarm"-style switching) -----------------
+# Each AI step can use a different model + token budget. Defaults route both to
+# LLM_MODEL so a single key just works; override to run a cheap planner + a
+# stronger analyst. See README for recommended Together AI ids.
+LLM_MODEL_PLAN="${LLM_MODEL_PLAN:-$LLM_MODEL}"        # scan planner (structured, light)
+LLM_MODEL_TRIAGE="${LLM_MODEL_TRIAGE:-$LLM_MODEL}"   # findings analyst (reasoning-heavy)
+LLM_MAX_TOKENS_PLAN="${LLM_MAX_TOKENS_PLAN:-700}"    # planner needs little output
+LLM_MAX_TOKENS_TRIAGE="${LLM_MAX_TOKENS_TRIAGE:-$LLM_MAX_TOKENS}"
+# Comma-separated models tried, in order, if the primary model call fails.
+LLM_FALLBACK_MODELS="${LLM_FALLBACK_MODELS:-}"
 
 # ---------------------------------------------------------------------------
 # Scan configuration
@@ -121,6 +132,9 @@ if [ -z "$LLM_API_KEY" ]; then
   warn "No API key (TOGETHER_API_KEY) - AI steps disabled, using static defaults."; AI_ENABLED=0
 elif ! have curl || ! have jq; then
   warn "curl and jq are required for AI steps - disabling AI, using defaults."; AI_ENABLED=0
+fi
+if [ "$AI_ENABLED" = 1 ]; then
+  log "AI routing -> plan: $LLM_MODEL_PLAN | triage: $LLM_MODEL_TRIAGE${LLM_FALLBACK_MODELS:+ | fallbacks: $LLM_FALLBACK_MODELS}"
 fi
 
 # ---------------------------------------------------------------------------
@@ -228,7 +242,11 @@ render() {
   [ "$TUI" = 1 ] || return 0
   spin_i=$(( (spin_i + 1) & 3 ))
   [ "$panel_drawn" = 1 ] && printf '\033[%dA' "$PANEL_LINES"
-  local model_line="off"; [ "$AI_ENABLED" = 1 ] && model_line="$LLM_MODEL"
+  local model_line="off"
+  if [ "$AI_ENABLED" = 1 ]; then
+    if [ "$LLM_MODEL_PLAN" = "$LLM_MODEL_TRIAGE" ]; then model_line="${LLM_MODEL_PLAN##*/}"
+    else model_line="plan:${LLM_MODEL_PLAN##*/} triage:${LLM_MODEL_TRIAGE##*/}"; fi
+  fi
   printf ' %s╭─ 4tail ───────────────────────────────────────%s\033[K\n' "$c_cyan" "$c_reset"
   printf ' %s│%s target=%s  ai=%s  elapsed=%ss\033[K\n' "$c_cyan" "$c_reset" "$domain" "$model_line" "$((SECONDS-started))"
   local i
@@ -266,39 +284,50 @@ run_stage() {
 }
 
 # ---------------------------------------------------------------------------
-# LLM helper: ai_call <system> <user> -> prints text; retry+backoff; frugal.
+# LLM helper: ai_call <model> <max_tokens> <system> <user> -> prints text.
+# Retry+backoff per model; if the primary model keeps failing, fall through to
+# LLM_FALLBACK_MODELS in order (smart model switching for reliability).
 # ---------------------------------------------------------------------------
 ai_call() {
-  local system="$1" user="$2" payload response text attempt=0 delay=2
-  payload="$(jq -n --arg model "$LLM_MODEL" --arg sys "$system" --arg usr "$user" \
-    --argjson max "$LLM_MAX_TOKENS" --argjson temp "$LLM_TEMPERATURE" \
-    '{model:$model, max_tokens:$max, temperature:$temp,
-      messages:[{role:"system",content:$sys},{role:"user",content:$usr}]}')" || return 1
-  while :; do
-    attempt=$((attempt + 1))
-    response="$(curl -sS --max-time "$LLM_TIMEOUT" "$LLM_BASE_URL/chat/completions" \
-      -H "content-type: application/json" -H "authorization: Bearer $LLM_API_KEY" \
-      -d "$payload" 2>/dev/null)"
-    if [ -n "$response" ] && ! echo "$response" | jq -e '.error' >/dev/null 2>&1; then
-      text="$(echo "$response" | jq -r '.choices[0].message.content // empty' 2>/dev/null)"
-      if [ -n "$text" ]; then printf '%s' "$text"; return 0; fi
-    fi
-    if [ "$attempt" -gt "$LLM_RETRIES" ]; then
-      echo "LLM error: $(echo "$response" | jq -r '.error.message // .error // "empty response"' 2>/dev/null)" >>"$llm_log"
-      return 1
-    fi
-    sleep "$delay"; delay=$((delay * 2))
+  local model="$1" maxtok="$2" system="$3" user="$4"
+  local candidates m payload response text attempt delay
+  candidates="$model"; [ -n "$LLM_FALLBACK_MODELS" ] && candidates="$model,$LLM_FALLBACK_MODELS"
+  IFS=',' read -ra _models <<< "$candidates"
+  for m in "${_models[@]}"; do
+    m="$(printf '%s' "$m" | tr -d '[:space:]')"; [ -z "$m" ] && continue
+    payload="$(jq -n --arg model "$m" --arg sys "$system" --arg usr "$user" \
+      --argjson max "$maxtok" --argjson temp "$LLM_TEMPERATURE" \
+      '{model:$model, max_tokens:$max, temperature:$temp,
+        messages:[{role:"system",content:$sys},{role:"user",content:$usr}]}')" || continue
+    attempt=0; delay=2
+    while :; do
+      attempt=$((attempt + 1))
+      response="$(curl -sS --max-time "$LLM_TIMEOUT" "$LLM_BASE_URL/chat/completions" \
+        -H "content-type: application/json" -H "authorization: Bearer $LLM_API_KEY" \
+        -d "$payload" 2>/dev/null)"
+      if [ -n "$response" ] && ! echo "$response" | jq -e '.error' >/dev/null 2>&1; then
+        text="$(echo "$response" | jq -r '.choices[0].message.content // empty' 2>/dev/null)"
+        if [ -n "$text" ]; then echo "[ok] model=$m" >>"$llm_log"; printf '%s' "$text"; return 0; fi
+      fi
+      if [ "$attempt" -gt "$LLM_RETRIES" ]; then
+        echo "[fail] model=$m: $(echo "$response" | jq -r '.error.message // .error // "empty response"' 2>/dev/null)" >>"$llm_log"
+        break   # give up on this model, try the next candidate
+      fi
+      sleep "$delay"; delay=$((delay * 2))
+    done
   done
+  return 1
 }
 
 # Background an AI call while spinning the given stage; result -> outfile.
+#   run_ai_stage <idx> <model> <max_tokens> <system> <user> <outfile>
 run_ai_stage() {
-  local idx="$1" sys="$2" usr="$3" outfile="$4"
-  set_stage "$idx" running "querying ${LLM_MODEL##*/} · 0s"
-  ( ai_call "$sys" "$usr" >"$outfile" 2>>"$llm_log" ) & local pid=$!
+  local idx="$1" model="$2" maxtok="$3" sys="$4" usr="$5" outfile="$6"
+  set_stage "$idx" running "querying ${model##*/} · 0s"
+  ( ai_call "$model" "$maxtok" "$sys" "$usr" >"$outfile" 2>>"$llm_log" ) & local pid=$!
   local s=$SECONDS
   while kill -0 "$pid" 2>/dev/null; do
-    ST_DETAIL[$idx]="querying ${LLM_MODEL##*/} · $((SECONDS-s))s"
+    ST_DETAIL[$idx]="querying ${model##*/} · $((SECONDS-s))s"
     [ "$TUI" = 1 ] && render; sleep 0.25
   done
   wait "$pid"; return $?
@@ -446,7 +475,7 @@ Reply with ONLY a JSON object (no prose, no code fences) with exactly two keys:
      (e.g. "Discovery/Web-Content/CMS/wordpress.fuzz.txt"). Use only real, well-known
      SecLists paths; keep 1-3 paths per technology; omit technologies you are unsure of.'
   plan_out="$(mktemp)"
-  run_ai_stage 2 "$sys_plan" "Target: $domain
+  run_ai_stage 2 "$LLM_MODEL_PLAN" "$LLM_MAX_TOKENS_PLAN" "$sys_plan" "Target: $domain
 Live hosts: $alive_count
 SecLists root: ${SECLISTS_DIR:-<not installed>}
 
@@ -586,7 +615,7 @@ set_stage 4 done "$find_count findings"
   echo "- **Generated:** $(date -u '+%Y-%m-%d %H:%M UTC')"
   echo "- **Subdomains:** $sub_count | **Live:** $alive_count | **Findings:** $find_count"
   echo "- **Nuclei tags:** \`$nuclei_tags\` | **Severity:** \`$NUCLEI_SEVERITY\`"
-  echo "- **AI model:** $([ "$AI_ENABLED" = 1 ] && echo "$LLM_MODEL" || echo "disabled")"
+  echo "- **AI models:** $([ "$AI_ENABLED" = 1 ] && echo "plan=$LLM_MODEL_PLAN, triage=$LLM_MODEL_TRIAGE" || echo "disabled")"
   echo "- **SecLists:** ${SECLISTS_DIR:-not found} | **Base wordlist:** \`$WORDLIST\`"; echo
   if [ -s "$fuzz_plan_file" ]; then
     echo "## Fuzzing strategy (tech-aware wordlists)"
@@ -617,7 +646,7 @@ GitHub-flavored Markdown with exactly these sections:
 "## Recommended manual follow-ups" (short bullet list).
 Use ONLY the provided data - do not invent findings.'
   triage_out="$(mktemp)"
-  run_ai_stage 5 "$sys_triage" "Target: $domain
+  run_ai_stage 5 "$LLM_MODEL_TRIAGE" "$LLM_MAX_TOKENS_TRIAGE" "$sys_triage" "Target: $domain
 
 === technology brief ===
 $(head -c 4000 "$tech_brief")
