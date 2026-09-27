@@ -77,7 +77,7 @@ NUCLEI_CONC="${NUCLEI_CONC:-40}"         # template concurrency (-c); higher = f
 NUCLEI_BULK="${NUCLEI_BULK:-25}"         # hosts scanned in parallel per template (-bulk-size)
 NUCLEI_DEDUPE="${NUCLEI_DEDUPE:-1}"      # 1 = scan one representative per origin+response signature
 NUCLEI_SKIP_CDN="${NUCLEI_SKIP_CDN:-0}"  # 1 = also drop CDN/WAF edges from nuclei (keeps takeover if 0)
-NUCLEI_MAX_HOSTS="${NUCLEI_MAX_HOSTS:-0}" # cap hosts scanned (0 = all). Hosts are always value-ranked first.
+NUCLEI_MAX_HOSTS="${NUCLEI_MAX_HOSTS:-100}" # cap hosts scanned (0 = all). Hosts are value-ranked, so this keeps the top-N most interesting.
 HTTPX_THREADS="${HTTPX_THREADS:-50}"
 OUTDIR="${OUTDIR:-}"
 RESUME="${RESUME:-0}"      # 1 = continue a previous run (reuse finished stages)
@@ -1093,7 +1093,7 @@ else
     if [ "$SUPERVISOR" = 1 ] && [ "$AI_ENABLED" = 1 ] && budget_ok; then
       if [ -n "$sup_pid" ] && ! kill -0 "$sup_pid" 2>/dev/null; then
         wait "$sup_pid" 2>/dev/null || true
-        [ -s "$sup_out" ] && { SUP_NOTE="$(tr -d '\n' <"$sup_out" | head -c 400)"; printf '[%s] %s\n' "$(date +%H:%M:%S)" "$SUP_NOTE" >>"$supervisor_log"; }
+        [ -s "$sup_out" ] && { SUP_NOTE="$(grep -v '^[[:space:]]*$' "$sup_out" | tail -1 | head -c 400)"; printf '[%s] %s\n' "$(date +%H:%M:%S)" "$SUP_NOTE" >>"$supervisor_log"; }
         rm -f "$sup_out"; sup_pid=""
       fi
       if [ -z "$sup_pid" ] && [ $((SECONDS - last_sup)) -ge "$SUPERVISOR_INTERVAL" ] && [ -n "$st" ]; then
@@ -1103,7 +1103,7 @@ else
 hosts: $alive_count  elapsed: $((SECONDS-ns))s
 recent stats: $(grep '^{' "$nuclei_stats_file" | tail -3)
 error sample: $(grep -iv '^{' "$nuclei_stats_file" | grep -iE 'error|timeout|refused|denied|429' | tail -5 | head -c 1500)"
-        ( ai_call "$LLM_MODEL_PLAN" 600 "$sup_sys" "$sup_usr" >"$sup_out" 2>>"$llm_log" ) & sup_pid=$!
+        ( ai_call "$LLM_MODEL_PLAN" 1200 "$sup_sys" "$sup_usr" >"$sup_out" 2>>"$llm_log" ) & sup_pid=$!
       fi
     fi
     render; sleep 3
@@ -1111,7 +1111,7 @@ error sample: $(grep -iv '^{' "$nuclei_stats_file" | grep -iE 'error|timeout|ref
   wait "$npid" 2>/dev/null; nrc=$?
   if [ -n "$sup_pid" ]; then
     wait "$sup_pid" 2>/dev/null || true
-    [ -s "$sup_out" ] && { SUP_NOTE="$(tr -d '\n' <"$sup_out" | head -c 400)"; printf '[%s] %s\n' "$(date +%H:%M:%S)" "$SUP_NOTE" >>"$supervisor_log"; }
+    [ -s "$sup_out" ] && { SUP_NOTE="$(grep -v '^[[:space:]]*$' "$sup_out" | tail -1 | head -c 400)"; printf '[%s] %s\n' "$(date +%H:%M:%S)" "$SUP_NOTE" >>"$supervisor_log"; }
     rm -f "$sup_out"
   fi
   [ "$nrc" = 124 ] && SUP_NOTE="nuclei hit the ${NUCLEI_MAX_TIME}s time cap - partial results kept"
