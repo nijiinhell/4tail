@@ -162,7 +162,7 @@ shift $((OPTIND - 1))
 # Resolve per-role models/token budgets now that -m / env are applied.
 LLM_MODEL_PLAN="${LLM_MODEL_PLAN:-$LLM_MODEL}"
 LLM_MODEL_TRIAGE="${LLM_MODEL_TRIAGE:-$LLM_MODEL}"
-LLM_MAX_TOKENS_TRIAGE="${LLM_MAX_TOKENS_TRIAGE:-$LLM_MAX_TOKENS}"
+LLM_MAX_TOKENS_TRIAGE="${LLM_MAX_TOKENS_TRIAGE:-8000}"
 
 domain="${1:-}"
 if [ "$DOCTOR" != 1 ]; then
@@ -363,6 +363,7 @@ budget_ok() { # 0 (true) if under budget or unlimited
   awk -v c="$(cost_now)" -v b="$LLM_BUDGET_USD" 'BEGIN{exit !(c<b)}'
 }
 cost_fmt() { awk -v c="$(cost_now)" 'BEGIN{printf "$%.4f", c}'; }
+nlines() { [ -f "$1" ] && wc -l < "$1" 2>/dev/null | tr -d ' ' || echo 0; }
 
 # kill background children (nuclei/ffuf/arjun/supervisor) so nothing lingers after
 # a Ctrl-C and pollutes a later resumed run's stats.
@@ -978,13 +979,13 @@ else
         | while read -r j; do case "$j" in http*) echo "$j";; /*) echo "${u%/}$j";; *) echo "${u%/}/$j";; esac; done
     done | sort -u > "$js_urls_file"
   fi
-  js_total="$(grep -c . "$js_urls_file" 2>/dev/null || echo 0)"
+  js_total="$(nlines "$js_urls_file")"
   # 2) fetch each JS and scan for secrets
   : > "$js_secrets_file"; ji=0
   while read -r j; do
     [ -z "$j" ] && continue
     ji=$((ji + 1)); [ "$ji" -gt "$JS_MAX" ] && break
-    ST_DETAIL[$S_JS]="scanning JS $ji/$js_total  hits:$(grep -c . "$js_secrets_file" 2>/dev/null||echo 0)"; render
+    ST_DETAIL[$S_JS]="scanning JS $ji/$js_total  hits:$(nlines "$js_secrets_file")"; render
     curl -s -L --max-time 15 "$j" 2>/dev/null | grep -aoE "$SECRET_RE" 2>/dev/null \
       | sort -u | sed "s#^#${j}\t#" >> "$js_secrets_file"
   done < "$js_urls_file"
@@ -1012,7 +1013,7 @@ else
     done <<< "$(printf '%s\n' "$scan_targets" | head -n "$PARAM_HOSTS")"
   fi
   touch "$OUTDIR/.done_js"
-  sec_hits="$(grep -c . "$js_secrets_file" 2>/dev/null || echo 0)"
+  sec_hits="$(nlines "$js_secrets_file")"
   set_stage $S_JS done "$js_total JS, $sec_hits secret hits$([ -s "$params_file" ] && echo ', params')"
 fi
 
@@ -1127,7 +1128,7 @@ set_stage $S_NUCLEI done "$find_count findings$(done_marker nuclei && echo ' (re
   echo "- **Target:** \`$domain\`"
   echo "- **Generated:** $(date -u '+%Y-%m-%d %H:%M UTC')"
   echo "- **Subdomains:** $sub_count | **Live:** $alive_count | **Findings:** $find_count"
-  [ "$JSMINE" = 1 ] && echo "- **JS mined:** $(grep -c . "$js_urls_file" 2>/dev/null||echo 0) files, $(grep -c . "$js_secrets_file" 2>/dev/null||echo 0) secret hits, $(grep -c . "$params_file" 2>/dev/null||echo 0) params"
+  [ "$JSMINE" = 1 ] && echo "- **JS mined:** $(nlines "$js_urls_file") files, $(nlines "$js_secrets_file") secret hits, $(nlines "$params_file") params"
   echo "- **Nuclei:** ${nuclei_target_count:-$alive_count} hosts scanned (deduped from $alive_count) | tags \`$nuclei_tags\` | severity \`$NUCLEI_SEVERITY\`"
   echo "- **AI models:** $([ "$AI_ENABLED" = 1 ] && echo "plan=$LLM_MODEL_PLAN, triage=$LLM_MODEL_TRIAGE" || echo "disabled")"
   [ "$AI_ENABLED" = 1 ] && echo "- **Estimated AI spend:** $(cost_fmt)$([ "${LLM_BUDGET_USD:-0}" != 0 ] && echo " (budget \$$LLM_BUDGET_USD)")"
@@ -1168,7 +1169,9 @@ positive, impact, and how to verify safely - flag private keys / cloud creds as 
 "## Interesting parameters to test" (map discovered params to likely bug classes: IDOR,
 SSRF, LFI, SQLi, open-redirect - with a concrete test idea each),
 "## Attack surface notes" and "## Recommended manual follow-ups".
-Use ONLY the provided data - do not invent findings.'
+Use ONLY the provided data - do not invent findings.
+Output ONLY the final report starting exactly with the line "## Executive summary".
+Do NOT include any reasoning, planning, or preamble before it.'
   triage_out="$(mktemp)"
   run_ai_stage $S_TRIAGE "$LLM_MODEL_TRIAGE" "$LLM_MAX_TOKENS_TRIAGE" "$sys_triage" "Target: $domain
 
@@ -1184,7 +1187,12 @@ $(head -c 8000 "$js_secrets_file" 2>/dev/null)
 === discovered parameters (url <TAB> param) ===
 $(head -c 4000 "$params_file" 2>/dev/null)" "$triage_out"
   if [ -s "$triage_out" ]; then
-    cat "$triage_out" >> "$report_file"; set_stage $S_TRIAGE done "report.md written"
+    # Drop any leading reasoning: keep from the LAST "## Executive summary" to the end
+    # (reasoning models may restate the section names earlier while thinking).
+    ln="$(grep -n '## Executive summary' "$triage_out" | tail -1 | cut -d: -f1)"
+    if [ -n "$ln" ]; then sed -n "${ln},\$p" "$triage_out" >> "$report_file"
+    else cat "$triage_out" >> "$report_file"; fi
+    set_stage $S_TRIAGE done "report.md written"
   else
     { echo "## Raw findings"; echo '```'; cat "$nuclei_file" 2>/dev/null; echo '```'; } >> "$report_file"
     set_stage $S_TRIAGE warn "AI failed, raw findings saved"
