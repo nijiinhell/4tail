@@ -363,9 +363,12 @@ budget_ok() { # 0 (true) if under budget or unlimited
 }
 cost_fmt() { awk -v c="$(cost_now)" 'BEGIN{printf "$%.4f", c}'; }
 
+# kill background children (nuclei/ffuf/arjun/supervisor) so nothing lingers after
+# a Ctrl-C and pollutes a later resumed run's stats.
+kill_children() { local p; for p in $(jobs -p 2>/dev/null); do kill "$p" 2>/dev/null; pkill -P "$p" 2>/dev/null; done; }
 cleanup() { [ "$TUI" = 1 ] && printf '\033[?25h\n'; }   # restore cursor
 trap cleanup EXIT
-trap 'cleanup; err "interrupted"; exit 130' INT TERM
+trap 'kill_children; cleanup; err "interrupted"; exit 130' INT TERM
 
 # Run a command in the background, live-updating a stage from a growing file.
 #   run_stage <idx> <count_file|""> <suffix> <cmd...>
@@ -1055,7 +1058,8 @@ else
     nuclei_cmd=(timeout "${NUCLEI_MAX_TIME}s" "${nuclei_cmd[@]}")
   fi
   set_stage $S_NUCLEI running "starting… ($nuclei_target_count hosts)"
-  ( "${nuclei_cmd[@]}" >/dev/null 2>>"$nuclei_stats_file" ) & npid=$!
+  # no wrapping subshell, so $npid is timeout/nuclei directly and a kill reaches it
+  "${nuclei_cmd[@]}" >/dev/null 2>>"$nuclei_stats_file" & npid=$!
   ns=$SECONDS; last_sup=0; sup_pid=""; sup_out=""
   while kill -0 "$npid" 2>/dev/null; do
     st="$(grep '^{' "$nuclei_stats_file" 2>/dev/null | tail -1)"
