@@ -33,6 +33,9 @@ LLM_MODEL_TRIAGE="${LLM_MODEL_TRIAGE:-}"    # findings analyst; default = LLM_MO
 LLM_MAX_TOKENS_PLAN="${LLM_MAX_TOKENS_PLAN:-4000}"   # headroom for reasoning models (GLM/DeepSeek think first)
 LLM_MAX_TOKENS_TRIAGE="${LLM_MAX_TOKENS_TRIAGE:-}"  # default = LLM_MAX_TOKENS
 LLM_FALLBACK_MODELS="${LLM_FALLBACK_MODELS:-}"       # tried in order if primary fails
+# AI supervisor: periodic plain-language status during the long nuclei stage.
+SUPERVISOR="${SUPERVISOR:-1}"                        # 1 = on (needs API key); report-only
+SUPERVISOR_INTERVAL="${SUPERVISOR_INTERVAL:-120}"   # seconds between supervisor notes
 
 # --- Cost / credit budget ---------------------------------------------------
 # Stop calling the AI once estimated spend reaches LLM_BUDGET_USD (0 = unlimited).
@@ -219,6 +222,8 @@ if [ "$DOCTOR" != 1 ]; then
   llm_log="$OUTDIR/llm.log"
   tech_map_file="$OUTDIR/tech_wordlists.tsv"   # tech <TAB> seclists-relative-path
   fuzz_plan_file="$OUTDIR/fuzz_plan.txt"        # host <TAB> wordlists used
+  nuclei_stats_file="$OUTDIR/nuclei_stats.jsonl"
+  supervisor_log="$OUTDIR/supervisor.log"
   cost_ledger="${LLM_COST_LEDGER:-$OUTDIR/.llm_cost_usd}"
   [ -f "$cost_ledger" ] || printf '0\n' > "$cost_ledger"
 fi
@@ -285,7 +290,8 @@ S_SUBS=0 S_LIVE=1 S_PLAN=2 S_FUZZ=3 S_JS=4 S_NUCLEI=5 S_TRIAGE=6
 ST_LABEL=("Subdomains" "Live hosts" "AI scan plan" "Fuzzing" "JS & params" "Nuclei scan" "AI triage")
 ST_STATE=(pending pending pending pending pending pending pending)
 ST_DETAIL=("" "" "" "" "" "" "")
-PANEL_LINES=$(( ${#ST_LABEL[@]} + 3 ))   # top border + info + stages + bottom border
+SUP_NOTE=""                              # latest AI-supervisor status line
+PANEL_LINES=$(( ${#ST_LABEL[@]} + 4 ))  # top border + info + stages + supervisor + bottom border
 panel_drawn=0
 SPIN='|/-\'; spin_i=0
 started=$SECONDS
@@ -328,6 +334,9 @@ render() {
       "$c_cyan" "$c_reset" "$(icon "${ST_STATE[$i]}")" "${ST_LABEL[$i]}" \
       "$c_dim" "$d" "$c_reset"
   done
+  local sup="${SUP_NOTE:-}"; [ -z "$sup" ] && [ "${SUPERVISOR:-0}" = 1 ] && [ "$AI_ENABLED" = 1 ] && sup="(supervisor idle)"
+  local sw=$((width - 8)); [ "$sw" -gt 4 ] && [ "${#sup}" -gt "$sw" ] && sup="${sup:0:sw}…"
+  printf ' %s│%s  %s🤖 %s%s\033[K\n' "$c_cyan" "$c_reset" "$c_dim" "$sup" "$c_reset"
   printf ' %s╰──────────────────────────────────────────────%s\033[K\n' "$c_cyan" "$c_reset"
   panel_drawn=1
 }
@@ -1006,17 +1015,62 @@ nuclei_tags="$(printf '%s' "$nuclei_tags" | tr ',' '\n' | awk 'NF' | head -n "$M
 if done_marker nuclei && [ -f "$nuclei_file" ]; then
   set_stage $S_NUCLEI done "$(wc -l <"$nuclei_file") findings (resumed)"
 else
-  # Bounded run: per-request timeout, 1 retry, skip error-prone hosts, and a hard
-  # overall time cap via `timeout` so it can never grind for hours.
-  nuclei_cmd=(nuclei -silent -tags "$nuclei_tags" -severity "$NUCLEI_SEVERITY"
+  # Bounded run with live stats (-stats-json): per-request timeout, 1 retry, skip
+  # error-prone hosts, hard overall time cap. Stats JSON -> nuclei_stats_file (stderr).
+  : > "$nuclei_stats_file"
+  nuclei_cmd=(nuclei -silent -stats -stats-json -stats-interval "${NUCLEI_STATS_INTERVAL:-5}"
+              -tags "$nuclei_tags" -severity "$NUCLEI_SEVERITY"
               -rate-limit "$NUCLEI_RATELIMIT" -timeout "$NUCLEI_TIMEOUT"
               -retries "$NUCLEI_RETRIES" -mhe "$NUCLEI_MHE"
               -l "$alive_file" -o "$nuclei_file")
   if [ "$NUCLEI_MAX_TIME" -gt 0 ] 2>/dev/null && have timeout; then
-    run_stage $S_NUCLEI "$nuclei_file" " hits" timeout "${NUCLEI_MAX_TIME}s" "${nuclei_cmd[@]}"
-  else
-    run_stage $S_NUCLEI "$nuclei_file" " hits" "${nuclei_cmd[@]}"
+    nuclei_cmd=(timeout "${NUCLEI_MAX_TIME}s" "${nuclei_cmd[@]}")
   fi
+  set_stage $S_NUCLEI running "starting…"
+  ( "${nuclei_cmd[@]}" >/dev/null 2>>"$nuclei_stats_file" ) & npid=$!
+  ns=$SECONDS; last_sup=0; sup_pid=""; sup_out=""
+  while kill -0 "$npid" 2>/dev/null; do
+    st="$(grep '^{' "$nuclei_stats_file" 2>/dev/null | tail -1)"
+    if [ -n "$st" ]; then
+      pct="$(printf '%s' "$st"  | jq -r '.percent // empty' 2>/dev/null)"
+      req="$(printf '%s' "$st"  | jq -r '.requests // 0' 2>/dev/null)"
+      errs="$(printf '%s' "$st" | jq -r '.errors // 0' 2>/dev/null)"
+      rps="$(printf '%s' "$st"  | jq -r '.rps // 0' 2>/dev/null)"
+      el=$((SECONDS - ns))
+      eta=""; [ -n "$pct" ] && awk "BEGIN{exit !($pct>0)}" 2>/dev/null && \
+        eta="$(awk -v e="$el" -v p="$pct" 'BEGIN{r=e*(100-p)/p; printf "%dm%02ds", r/60, r%60}')"
+      hits="$(wc -l <"$nuclei_file" 2>/dev/null || echo 0)"
+      ST_DETAIL[$S_NUCLEI]="${pct:-0}% req:$req err:$errs rps:$rps hits:$hits${eta:+ ETA:$eta}"
+    else
+      ST_DETAIL[$S_NUCLEI]="starting… $((SECONDS-ns))s"
+    fi
+    # AI supervisor: periodic plain-language status (background, non-blocking)
+    if [ "$SUPERVISOR" = 1 ] && [ "$AI_ENABLED" = 1 ] && budget_ok; then
+      if [ -n "$sup_pid" ] && ! kill -0 "$sup_pid" 2>/dev/null; then
+        wait "$sup_pid" 2>/dev/null || true
+        [ -s "$sup_out" ] && { SUP_NOTE="$(tr -d '\n' <"$sup_out" | head -c 400)"; printf '[%s] %s\n' "$(date +%H:%M:%S)" "$SUP_NOTE" >>"$supervisor_log"; }
+        rm -f "$sup_out"; sup_pid=""
+      fi
+      if [ -z "$sup_pid" ] && [ $((SECONDS - last_sup)) -ge "$SUPERVISOR_INTERVAL" ] && [ -n "$st" ]; then
+        last_sup=$SECONDS; sup_out="$(mktemp)"
+        sup_sys='You are monitoring a running nuclei vulnerability scan for an AUTHORIZED test. Given recent stats and error samples, reply in ONE short sentence (max 30 words): progress, whether error rate is concerning and likely why (e.g. WAF 429s, dead hosts), and ETA. No preamble.'
+        sup_usr="tags: $nuclei_tags
+hosts: $alive_count  elapsed: $((SECONDS-ns))s
+recent stats: $(grep '^{' "$nuclei_stats_file" | tail -3)
+error sample: $(grep -iv '^{' "$nuclei_stats_file" | grep -iE 'error|timeout|refused|denied|429' | tail -5 | head -c 1500)"
+        ( ai_call "$LLM_MODEL_PLAN" 200 "$sup_sys" "$sup_usr" >"$sup_out" 2>>"$llm_log" ) & sup_pid=$!
+      fi
+    fi
+    render; sleep 3
+  done
+  wait "$npid" 2>/dev/null; nrc=$?
+  if [ -n "$sup_pid" ]; then
+    wait "$sup_pid" 2>/dev/null || true
+    [ -s "$sup_out" ] && { SUP_NOTE="$(tr -d '\n' <"$sup_out" | head -c 400)"; printf '[%s] %s\n' "$(date +%H:%M:%S)" "$SUP_NOTE" >>"$supervisor_log"; }
+    rm -f "$sup_out"
+  fi
+  [ "$nrc" = 124 ] && SUP_NOTE="nuclei hit the ${NUCLEI_MAX_TIME}s time cap - partial results kept"
+  render
   touch "$OUTDIR/.done_nuclei"
 fi
 find_count=$(wc -l < "$nuclei_file" 2>/dev/null || echo 0)

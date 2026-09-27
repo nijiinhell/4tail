@@ -125,6 +125,19 @@ Both AI steps are **optional**. Without an API key (or without `curl`/`jq`), 4ta
 degrades gracefully: it uses sensible default tags and writes the raw findings to
 the report.
 
+### Live nuclei stats + AI supervisor
+
+The long nuclei stage is no longer a black box. It runs with `-stats-json`, so the
+dashboard shows **live progress**: `45% req:540 err:18 rps:37 hits:2 ETA:3m20s`. You can
+see immediately how many requests errored and when it will finish.
+
+On top of that, an **AI supervisor** (`SUPERVISOR=1`, default on when a key is set) reads
+those stats + a sample of the error log every `SUPERVISOR_INTERVAL` seconds (default 120)
+and writes a one-line plain-language status on the `🤖` line — e.g. *"Scan ~50% done,
+error rate high — mostly 429s from CloudFront, ETA ~2m."* It's **report-only** (never
+changes the scan) and budget-gated (uses the cheap planner model, ~200 tokens/note). Notes
+are also saved to `supervisor.log`. Turn it off with `SUPERVISOR=0`.
+
 ## Features
 
 - **Subdomain enumeration** with Subfinder.
