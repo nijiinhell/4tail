@@ -139,7 +139,7 @@ When run in a terminal, 4tail shows a self-updating panel instead of scrolling l
 
 ```
  ╭─ 4tail ───────────────────────────────────────
- │ target=example.com  ai=zai-org/GLM-4.6  elapsed=41s
+ │ target=example.com  ai=zai-org/GLM-5.3  elapsed=41s
  │  ✔  Subdomains    128 subs
  │  ✔  Live hosts    37 live
  │  ✔  AI scan plan  cves,exposures,wordpress,php,nginx
@@ -214,6 +214,33 @@ When it finishes, open the report:
 cat 4tail_example.com_*/report.md
 ```
 
+## Health check (`doctor`)
+
+Before your first real run, verify everything is wired up — including that your LLM
+**model ids actually work on your account**:
+
+```bash
+./4tail.sh doctor      # or: ./4tail.sh -D
+```
+
+It checks required tools (subfinder/httpx/nuclei), optional tools (ffuf/curl/jq/anew),
+SecLists + key wordlists, the Bo0oM base list, and then **pings every configured model**
+(planner, analyst, and each fallback) reporting reachability + latency. Example:
+
+```
+== AI / LLM (Together AI or compatible) ==
+  [PASS] API key present; endpoint: https://api.together.xyz/v1
+  routes plan=Qwen/Qwen2.5-7B-Instruct  triage=deepseek-ai/DeepSeek-V3.1  fallbacks=zai-org/GLM-5.3
+  [PASS] model 'Qwen/Qwen2.5-7B-Instruct' reachable (0.42s)
+  [PASS] model 'deepseek-ai/DeepSeek-V3.1' reachable (0.55s)
+  [PASS] model 'zai-org/GLM-5.3' reachable (0.40s)
+== Summary ==
+  All good - 4tail is fully operational.
+```
+
+Exit code is non-zero if any check FAILs, so it's CI-friendly. It needs no target domain
+and (each ping uses `max_tokens: 16`) costs almost nothing.
+
 ### Options
 
 | Flag | Description | Env var |
@@ -222,7 +249,7 @@ cat 4tail_example.com_*/report.md
 | `-o <dir>`  | Output directory | `OUTDIR` |
 | `-t <tags>` | Fallback Nuclei tags (used when AI is off) | `DEFAULT_NUCLEI_TAGS` |
 | `-S <sev>`  | Nuclei severities | `NUCLEI_SEVERITY` (default `critical,high,medium,low`) |
-| `-m <model>`| LLM model id | `LLM_MODEL` (default `zai-org/GLM-4.6`) |
+| `-m <model>`| LLM model id | `LLM_MODEL` (default `zai-org/GLM-5.3`) |
 | `-y`        | Skip the authorization prompt | `ASSUME_YES=1` |
 | `-h`        | Show help | |
 
@@ -231,13 +258,13 @@ cat 4tail_example.com_*/report.md
 - `TOGETHER_API_KEY` (or `LLM_API_KEY`) — enables the AI decision + triage steps.
 - `LLM_BASE_URL` — API base (default `https://api.together.xyz/v1`). Point this at any
   OpenAI-compatible provider (e.g. Zhipu, OpenRouter, a local server) to switch backends.
-- `LLM_MODEL` — base model id used for every role unless overridden (default `zai-org/GLM-4.6`).
+- `LLM_MODEL` — base model id used for every role unless overridden (default `zai-org/GLM-5.3`).
 - `LLM_MAX_TOKENS` — default output cap (default `1200`, kept low for cost).
 - `LLM_TEMPERATURE`, `LLM_TIMEOUT`, `LLM_RETRIES` — request tuning.
 
 ### Smart model routing ("swarm"-style switching)
 
-**With only a key set, both AI steps use `zai-org/GLM-4.6`.** But 4tail routes each task
+**With only a key set, both AI steps use `zai-org/GLM-5.3`.** But 4tail routes each task
 to its own model + token budget, so you can run a **cheap planner + a stronger analyst**:
 
 | Role | What it does | Env var | Default |
@@ -254,16 +281,16 @@ Example: cheap/fast planner, strong reasoning analyst, GLM as the safety net:
 
 ```bash
 export TOGETHER_API_KEY=...
-export LLM_MODEL_PLAN="Qwen/Qwen2.5-7B-Instruct-Turbo"      # fast + cheap for the plan
-export LLM_MODEL_TRIAGE="deepseek-ai/DeepSeek-V3"           # stronger for analysis
-export LLM_FALLBACK_MODELS="zai-org/GLM-4.6"                # used if either fails
+export LLM_MODEL_PLAN="Qwen/Qwen2.5-7B-Instruct"      # fast + cheap for the plan
+export LLM_MODEL_TRIAGE="deepseek-ai/DeepSeek-V3.1"           # stronger for analysis
+export LLM_FALLBACK_MODELS="zai-org/GLM-5.3"                # used if either fails
 ./4tail.sh example.com
 ```
 
 > Model ids drift — verify the exact strings on [together.ai/models](https://www.together.ai/models)
-> before use. Good cheap planners: `Qwen/Qwen2.5-7B-Instruct-Turbo`,
-> `meta-llama/Meta-Llama-3.1-8B-Instruct-Turbo`. Good analysts: `deepseek-ai/DeepSeek-V3`,
-> `Qwen/Qwen2.5-72B-Instruct-Turbo`, `zai-org/GLM-4.6`. The startup line and `report.md`
+> before use. Good cheap planners: `Qwen/Qwen2.5-7B-Instruct`,
+> `meta-llama/Meta-Llama-3.1-8B-Instruct-Turbo`. Good analysts: `deepseek-ai/DeepSeek-V3.1`,
+> `Qwen/Qwen2.5-72B-Instruct-Turbo`, `zai-org/GLM-5.3`. The startup line and `report.md`
 > both show which models were routed.
 
 ### Scan tuning env vars

@@ -19,7 +19,7 @@ set -o pipefail
 # ---------------------------------------------------------------------------
 LLM_API_KEY="${TOGETHER_API_KEY:-${LLM_API_KEY:-}}"
 LLM_BASE_URL="${LLM_BASE_URL:-https://api.together.xyz/v1}"
-LLM_MODEL="${LLM_MODEL:-zai-org/GLM-4.6}"   # base default for every role
+LLM_MODEL="${LLM_MODEL:-zai-org/GLM-5.3}"   # base default for every role
 LLM_MAX_TOKENS="${LLM_MAX_TOKENS:-1200}"
 LLM_TEMPERATURE="${LLM_TEMPERATURE:-0.2}"
 LLM_TIMEOUT="${LLM_TIMEOUT:-90}"
@@ -29,10 +29,10 @@ LLM_RETRIES="${LLM_RETRIES:-2}"
 # Each AI step can use a different model + token budget. Defaults route both to
 # LLM_MODEL so a single key just works; override to run a cheap planner + a
 # stronger analyst. See README for recommended Together AI ids.
-LLM_MODEL_PLAN="${LLM_MODEL_PLAN:-$LLM_MODEL}"        # scan planner (structured, light)
-LLM_MODEL_TRIAGE="${LLM_MODEL_TRIAGE:-$LLM_MODEL}"   # findings analyst (reasoning-heavy)
+LLM_MODEL_PLAN="${LLM_MODEL_PLAN:-}"        # scan planner (structured, light); default = LLM_MODEL
+LLM_MODEL_TRIAGE="${LLM_MODEL_TRIAGE:-}"    # findings analyst (reasoning-heavy); default = LLM_MODEL
 LLM_MAX_TOKENS_PLAN="${LLM_MAX_TOKENS_PLAN:-700}"    # planner needs little output
-LLM_MAX_TOKENS_TRIAGE="${LLM_MAX_TOKENS_TRIAGE:-$LLM_MAX_TOKENS}"
+LLM_MAX_TOKENS_TRIAGE="${LLM_MAX_TOKENS_TRIAGE:-}"  # default = LLM_MAX_TOKENS
 # Comma-separated models tried, in order, if the primary model call fails.
 LLM_FALLBACK_MODELS="${LLM_FALLBACK_MODELS:-}"
 
@@ -53,6 +53,7 @@ HTTPX_THREADS="${HTTPX_THREADS:-50}"
 OUTDIR="${OUTDIR:-}"
 ASSUME_YES="${ASSUME_YES:-0}"
 NO_TUI="${NO_TUI:-0}"
+DOCTOR="${DOCTOR:-0}"      # 1 = run health checks and exit (see -D / `doctor`)
 
 # ---------------------------------------------------------------------------
 # Colors / plain-log helpers (used in non-TUI mode)
@@ -69,6 +70,7 @@ usage() {
 4tail - AI-assisted recon for authorized security testing
 
 Usage: $0 [options] <target_domain>
+       $0 doctor            # run health checks (tools, wordlists, LLM) and exit
 
 Options:
   -w <file>   Wordlist for ffuf              (env WORDLIST)
@@ -78,6 +80,7 @@ Options:
   -m <model>  LLM model id                   (env LLM_MODEL, default $LLM_MODEL)
   -y          Skip the authorization prompt  (env ASSUME_YES=1)
   -P          Plain output, no live dashboard(env NO_TUI=1)
+  -D          Run health checks and exit     (same as: $0 doctor)
   -h          Show this help
 
 LLM (OpenAI-compatible, defaults to Together AI + GLM):
@@ -94,7 +97,10 @@ EOF
 # ---------------------------------------------------------------------------
 # Argument parsing
 # ---------------------------------------------------------------------------
-while getopts ":w:o:t:S:m:yPh" opt; do
+# `doctor` subcommand (before getopts, which doesn't parse bare words)
+if [ "${1:-}" = "doctor" ]; then DOCTOR=1; shift; fi
+
+while getopts ":w:o:t:S:m:yPDh" opt; do
   case "$opt" in
     w) WORDLIST="$OPTARG" ;;
     o) OUTDIR="$OPTARG" ;;
@@ -103,6 +109,7 @@ while getopts ":w:o:t:S:m:yPh" opt; do
     m) LLM_MODEL="$OPTARG" ;;
     y) ASSUME_YES=1 ;;
     P) NO_TUI=1 ;;
+    D) DOCTOR=1 ;;
     h) usage; exit 0 ;;
     \?) err "Unknown option: -$OPTARG"; usage; exit 1 ;;
     :)  err "Option -$OPTARG requires an argument"; exit 1 ;;
@@ -110,10 +117,17 @@ while getopts ":w:o:t:S:m:yPh" opt; do
 done
 shift $((OPTIND - 1))
 
+# Resolve per-role models/token budgets now that -m / env are applied.
+LLM_MODEL_PLAN="${LLM_MODEL_PLAN:-$LLM_MODEL}"
+LLM_MODEL_TRIAGE="${LLM_MODEL_TRIAGE:-$LLM_MODEL}"
+LLM_MAX_TOKENS_TRIAGE="${LLM_MAX_TOKENS_TRIAGE:-$LLM_MAX_TOKENS}"
+
 domain="${1:-}"
-if [ -z "$domain" ]; then err "No target domain provided."; usage; exit 1; fi
-if ! printf '%s' "$domain" | grep -qE '^[A-Za-z0-9._-]+\.[A-Za-z]{2,}$'; then
-  err "That doesn't look like a bare domain (got: '$domain'). Use e.g. example.com"; exit 1
+if [ "$DOCTOR" != 1 ]; then
+  if [ -z "$domain" ]; then err "No target domain provided."; usage; exit 1; fi
+  if ! printf '%s' "$domain" | grep -qE '^[A-Za-z0-9._-]+\.[A-Za-z]{2,}$'; then
+    err "That doesn't look like a bare domain (got: '$domain'). Use e.g. example.com"; exit 1
+  fi
 fi
 
 # ---------------------------------------------------------------------------
@@ -122,25 +136,25 @@ fi
 have() { command -v "$1" >/dev/null 2>&1; }
 missing=()
 for tool in subfinder httpx nuclei; do have "$tool" || missing+=("$tool"); done
-if [ "${#missing[@]}" -gt 0 ]; then
+if [ "${#missing[@]}" -gt 0 ] && [ "$DOCTOR" != 1 ]; then
   err "Missing required tools: ${missing[*]} (see projectdiscovery.io)"; exit 1
 fi
-have ffuf || warn "ffuf not found - content-discovery step will be skipped."
+[ "$DOCTOR" = 1 ] || have ffuf || warn "ffuf not found - content-discovery step will be skipped."
 
 AI_ENABLED=1
 if [ -z "$LLM_API_KEY" ]; then
-  warn "No API key (TOGETHER_API_KEY) - AI steps disabled, using static defaults."; AI_ENABLED=0
+  [ "$DOCTOR" = 1 ] || warn "No API key (TOGETHER_API_KEY) - AI steps disabled, using static defaults."; AI_ENABLED=0
 elif ! have curl || ! have jq; then
-  warn "curl and jq are required for AI steps - disabling AI, using defaults."; AI_ENABLED=0
+  [ "$DOCTOR" = 1 ] || warn "curl and jq are required for AI steps - disabling AI, using defaults."; AI_ENABLED=0
 fi
-if [ "$AI_ENABLED" = 1 ]; then
+if [ "$AI_ENABLED" = 1 ] && [ "$DOCTOR" != 1 ]; then
   log "AI routing -> plan: $LLM_MODEL_PLAN | triage: $LLM_MODEL_TRIAGE${LLM_FALLBACK_MODELS:+ | fallbacks: $LLM_FALLBACK_MODELS}"
 fi
 
 # ---------------------------------------------------------------------------
 # Authorization gate
 # ---------------------------------------------------------------------------
-if [ "$ASSUME_YES" != "1" ]; then
+if [ "$DOCTOR" != 1 ] && [ "$ASSUME_YES" != "1" ]; then
   printf '%s' "${c_yellow}Confirm you are AUTHORIZED to test '${domain}' [y/N]: ${c_reset}"
   read -r reply
   case "$reply" in y|Y|yes|YES) ;; *) err "Aborted - authorization not confirmed."; exit 1 ;; esac
@@ -149,19 +163,22 @@ fi
 # ---------------------------------------------------------------------------
 # Output layout
 # ---------------------------------------------------------------------------
-ts="$(date +%Y%m%d_%H%M%S)"
-OUTDIR="${OUTDIR:-4tail_${domain}_${ts}}"
-mkdir -p "$OUTDIR"
-subdomains_file="$OUTDIR/subdomains.txt"
-httpx_json="$OUTDIR/httpx.jsonl"
-alive_file="$OUTDIR/alive.txt"
-tech_brief="$OUTDIR/tech_brief.txt"
-fuzz_dir="$OUTDIR/fuzz"; mkdir -p "$fuzz_dir"
-nuclei_file="$OUTDIR/nuclei.txt"
-report_file="$OUTDIR/report.md"
-llm_log="$OUTDIR/llm.log"
-tech_map_file="$OUTDIR/tech_wordlists.tsv"   # tech <TAB> seclists-relative-path
-fuzz_plan_file="$OUTDIR/fuzz_plan.txt"        # host <TAB> wordlists used
+llm_log="/dev/null"   # overridden below for a real run
+if [ "$DOCTOR" != 1 ]; then
+  ts="$(date +%Y%m%d_%H%M%S)"
+  OUTDIR="${OUTDIR:-4tail_${domain}_${ts}}"
+  mkdir -p "$OUTDIR"
+  subdomains_file="$OUTDIR/subdomains.txt"
+  httpx_json="$OUTDIR/httpx.jsonl"
+  alive_file="$OUTDIR/alive.txt"
+  tech_brief="$OUTDIR/tech_brief.txt"
+  fuzz_dir="$OUTDIR/fuzz"; mkdir -p "$fuzz_dir"
+  nuclei_file="$OUTDIR/nuclei.txt"
+  report_file="$OUTDIR/report.md"
+  llm_log="$OUTDIR/llm.log"
+  tech_map_file="$OUTDIR/tech_wordlists.tsv"   # tech <TAB> seclists-relative-path
+  fuzz_plan_file="$OUTDIR/fuzz_plan.txt"        # host <TAB> wordlists used
+fi
 
 # Auto-detect a SecLists installation so fuzzing can pick tech-specific lists.
 # `apt install seclists` (Debian/Ubuntu/Kali) puts it in /usr/share/seclists.
@@ -201,16 +218,18 @@ base_dir="$(dirname "${WORDLIST:-/nonexistent}")"
 API_ENDPOINTS_EXTRA=""
 [ -f "$base_dir/api-endpoints.txt" ] && API_ENDPOINTS_EXTRA="$base_dir/api-endpoints.txt"
 
-if [ -n "$SECLISTS_DIR" ]; then
-  log "SecLists: $SECLISTS_DIR (tech-aware fuzzing enabled)"
-else
-  warn "SecLists not found - fuzzing will use only the base wordlist + tech extensions."
-  warn "Install it (apt install seclists) or set SECLISTS_DIR=/path/to/SecLists."
-fi
-if [ -n "$WORDLIST" ] && [ -f "$WORDLIST" ]; then
-  case "$WORDLIST" in *fuzz.txt) log "Base wordlist: $WORDLIST (Bo0oM juicy list)";; *) log "Base wordlist: $WORDLIST";; esac
-else
-  warn "No base wordlist found. Provide -w, or set FETCH_FUZZTXT=1 to download Bo0oM/fuzz.txt."
+if [ "$DOCTOR" != 1 ]; then
+  if [ -n "$SECLISTS_DIR" ]; then
+    log "SecLists: $SECLISTS_DIR (tech-aware fuzzing enabled)"
+  else
+    warn "SecLists not found - fuzzing will use only the base wordlist + tech extensions."
+    warn "Install it (apt install seclists) or set SECLISTS_DIR=/path/to/SecLists."
+  fi
+  if [ -n "$WORDLIST" ] && [ -f "$WORDLIST" ]; then
+    case "$WORDLIST" in *fuzz.txt) log "Base wordlist: $WORDLIST (Bo0oM juicy list)";; *) log "Base wordlist: $WORDLIST";; esac
+  else
+    warn "No base wordlist found. Provide -w, or set FETCH_FUZZTXT=1 to download Bo0oM/fuzz.txt."
+  fi
 fi
 
 # ===========================================================================
@@ -332,6 +351,103 @@ run_ai_stage() {
   done
   wait "$pid"; return $?
 }
+
+# ===========================================================================
+# DOCTOR - health checks (tools, wordlists, LLM connectivity) then exit
+# ===========================================================================
+DR_FAIL=0; DR_WARN=0
+dr_pass(){ printf '  %s[PASS]%s %s\n' "$c_green"  "$c_reset" "$*"; }
+dr_warn(){ printf '  %s[WARN]%s %s\n' "$c_yellow" "$c_reset" "$*"; DR_WARN=$((DR_WARN+1)); }
+dr_fail(){ printf '  %s[FAIL]%s %s\n' "$c_red"    "$c_reset" "$*"; DR_FAIL=$((DR_FAIL+1)); }
+dr_head(){ printf '\n%s== %s ==%s\n' "$c_cyan" "$*" "$c_reset"; }
+
+# Minimal, dependency-light LLM ping: validates a model id works on this account.
+llm_ping() {
+  local m="$1" body resp code t json msg
+  body="$(jq -n --arg model "$m" \
+    '{model:$model, max_tokens:16, messages:[{role:"user",content:"reply with: ok"}]}' 2>/dev/null)"
+  resp="$(curl -sS -m "$LLM_TIMEOUT" -w $'\n%{http_code} %{time_total}' \
+    -H "content-type: application/json" -H "authorization: Bearer $LLM_API_KEY" \
+    -d "$body" "$LLM_BASE_URL/chat/completions" 2>/dev/null)"
+  code="$(printf '%s' "$resp" | tail -n1 | awk '{print $1}')"
+  t="$(printf '%s'   "$resp" | tail -n1 | awk '{print $2}')"
+  json="$(printf '%s' "$resp" | sed '$d')"
+  if [ "$code" = 200 ] && printf '%s' "$json" | jq -e '.choices[0].message' >/dev/null 2>&1; then
+    dr_pass "model '$m' reachable (${t}s)"
+  else
+    msg="$(printf '%s' "$json" | jq -r '.error.message // .error // empty' 2>/dev/null)"
+    dr_fail "model '$m' NOT usable (http ${code:-?})${msg:+ - $msg}"
+  fi
+}
+
+run_doctor() {
+  printf '%s4tail doctor%s - environment health check\n' "$c_cyan" "$c_reset"
+
+  dr_head "Required tools"
+  local t
+  for t in subfinder httpx nuclei; do
+    if have "$t"; then dr_pass "$t found ($(command -v "$t"))"; else dr_fail "$t MISSING (install from projectdiscovery.io)"; fi
+  done
+
+  dr_head "Optional tools"
+  for t in ffuf curl jq anew; do
+    if have "$t"; then dr_pass "$t found"; else dr_warn "$t not found ($([ "$t" = ffuf ] && echo 'fuzzing skipped' || echo 'AI/dedup limited'))"; fi
+  done
+
+  dr_head "Wordlists"
+  if [ -n "$SECLISTS_DIR" ]; then
+    dr_pass "SecLists: $SECLISTS_DIR"
+    local rel
+    for rel in Discovery/Web-Content/common.txt Discovery/Web-Content/CMS/wordpress.fuzz.txt \
+               Discovery/Web-Content/api/api-endpoints.txt Discovery/Web-Content/raft-large-files.txt; do
+      if [ -f "$SECLISTS_DIR/$rel" ]; then dr_pass "  $rel"; else dr_warn "  missing: $rel"; fi
+    done
+  else
+    dr_warn "SecLists not found (apt install seclists, or set SECLISTS_DIR)"
+  fi
+  if [ -n "$WORDLIST" ] && [ -f "$WORDLIST" ]; then
+    case "$WORDLIST" in
+      *fuzz.txt) dr_pass "Base list: $WORDLIST (Bo0oM juicy list, $(wc -l <"$WORDLIST" 2>/dev/null) lines)";;
+      *)         dr_warn "Base list: $WORDLIST (not Bo0oM fuzz.txt; fine, but that list finds more)";;
+    esac
+    [ -n "$API_ENDPOINTS_EXTRA" ] && dr_pass "API list: $API_ENDPOINTS_EXTRA"
+  else
+    dr_warn "No base wordlist found (provide -w, or FETCH_FUZZTXT=1 to download Bo0oM/fuzz.txt)"
+  fi
+
+  dr_head "AI / LLM (Together AI or compatible)"
+  if [ -z "$LLM_API_KEY" ]; then
+    dr_warn "No API key set (TOGETHER_API_KEY) - AI steps will be skipped; scan still works with defaults"
+  elif ! have curl || ! have jq; then
+    dr_fail "curl and jq are required for AI steps"
+  else
+    dr_pass "API key present; endpoint: $LLM_BASE_URL"
+    printf '  %sroutes%s plan=%s  triage=%s%s\n' "$c_dim" "$c_reset" \
+      "$LLM_MODEL_PLAN" "$LLM_MODEL_TRIAGE" "${LLM_FALLBACK_MODELS:+  fallbacks=$LLM_FALLBACK_MODELS}"
+    # Ping each unique configured model
+    local seen="" m
+    for m in "$LLM_MODEL_PLAN" "$LLM_MODEL_TRIAGE" ${LLM_FALLBACK_MODELS//,/ }; do
+      [ -z "$m" ] && continue
+      case ",$seen," in *",$m,"*) continue;; esac
+      seen="$seen,$m"
+      llm_ping "$m"
+    done
+  fi
+
+  dr_head "Summary"
+  if [ "$DR_FAIL" -gt 0 ]; then
+    printf '  %s%d failed%s, %d warnings - fix the failures before running.\n' "$c_red" "$DR_FAIL" "$c_reset" "$DR_WARN"
+    return 1
+  elif [ "$DR_WARN" -gt 0 ]; then
+    printf '  %sReady%s with %d warning(s) - 4tail will run (some features degraded).\n' "$c_green" "$c_reset" "$DR_WARN"
+    return 0
+  else
+    printf '  %sAll good - 4tail is fully operational.%s\n' "$c_green" "$c_reset"
+    return 0
+  fi
+}
+
+if [ "$DOCTOR" = 1 ]; then run_doctor; exit $?; fi
 
 [ "$TUI" = 1 ] && { printf '\033[?25l'; render; }   # hide cursor + first paint
 
