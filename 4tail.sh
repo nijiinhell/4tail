@@ -63,8 +63,13 @@ DEDUPE_ORIGINS="${DEDUPE_ORIGINS:-1}"    # 1 = one fuzz target per IP/CNAME + re
 USE_DNSX="${USE_DNSX:-1}"                # 1 = use dnsx (if installed) to resolve + drop wildcards
 JSMINE="${JSMINE:-0}"                    # 1 = JS/secret mining + param discovery (-j)
 DEFAULT_NUCLEI_TAGS="${DEFAULT_NUCLEI_TAGS:-cves,exposures,misconfiguration,tech,default-login,takeover}"
+MAX_TAGS="${MAX_TAGS:-15}"                # cap nuclei tags (more tags = far more templates = much slower)
 NUCLEI_SEVERITY="${NUCLEI_SEVERITY:-critical,high,medium,low}"
 NUCLEI_RATELIMIT="${NUCLEI_RATELIMIT:-150}"
+NUCLEI_TIMEOUT="${NUCLEI_TIMEOUT:-8}"    # per-request timeout (s) - stops hanging on dead/slow hosts
+NUCLEI_RETRIES="${NUCLEI_RETRIES:-1}"
+NUCLEI_MHE="${NUCLEI_MHE:-30}"           # skip a host after this many errors (dead CDN edges)
+NUCLEI_MAX_TIME="${NUCLEI_MAX_TIME:-3600}"  # hard cap on the whole nuclei stage (s); 0 = unlimited
 HTTPX_THREADS="${HTTPX_THREADS:-50}"
 OUTDIR="${OUTDIR:-}"
 RESUME="${RESUME:-0}"      # 1 = continue a previous run (reuse finished stages)
@@ -995,12 +1000,23 @@ else
 fi
 
 # Step 5: Nuclei
+# Cap the tag count (the AI sometimes returns 30+ tags -> thousands of templates ->
+# hours of scanning). Keep the most relevant N.
+nuclei_tags="$(printf '%s' "$nuclei_tags" | tr ',' '\n' | awk 'NF' | head -n "$MAX_TAGS" | paste -sd, -)"
 if done_marker nuclei && [ -f "$nuclei_file" ]; then
   set_stage $S_NUCLEI done "$(wc -l <"$nuclei_file") findings (resumed)"
 else
-  run_stage $S_NUCLEI "$nuclei_file" " hits" \
-    nuclei -silent -tags "$nuclei_tags" -severity "$NUCLEI_SEVERITY" \
-           -rate-limit "$NUCLEI_RATELIMIT" -l "$alive_file" -o "$nuclei_file"
+  # Bounded run: per-request timeout, 1 retry, skip error-prone hosts, and a hard
+  # overall time cap via `timeout` so it can never grind for hours.
+  nuclei_cmd=(nuclei -silent -tags "$nuclei_tags" -severity "$NUCLEI_SEVERITY"
+              -rate-limit "$NUCLEI_RATELIMIT" -timeout "$NUCLEI_TIMEOUT"
+              -retries "$NUCLEI_RETRIES" -mhe "$NUCLEI_MHE"
+              -l "$alive_file" -o "$nuclei_file")
+  if [ "$NUCLEI_MAX_TIME" -gt 0 ] 2>/dev/null && have timeout; then
+    run_stage $S_NUCLEI "$nuclei_file" " hits" timeout "${NUCLEI_MAX_TIME}s" "${nuclei_cmd[@]}"
+  else
+    run_stage $S_NUCLEI "$nuclei_file" " hits" "${nuclei_cmd[@]}"
+  fi
   touch "$OUTDIR/.done_nuclei"
 fi
 find_count=$(wc -l < "$nuclei_file" 2>/dev/null || echo 0)

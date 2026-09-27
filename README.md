@@ -404,6 +404,11 @@ export LLM_FALLBACK_MODELS="zai-org/GLM-5.3"                # used if either fai
 - `MAX_EXTS` — cap on per-host extensions (default 10).
 - `FFUF_RATE` — ffuf requests/sec (0 = unlimited).
 - `NUCLEI_SEVERITY`, `NUCLEI_RATELIMIT`, `HTTPX_THREADS`, `OUTDIR`, `DEFAULT_NUCLEI_TAGS`.
+- `MAX_TAGS` — cap nuclei tags (default 15; more tags = far more templates = much slower).
+- `NUCLEI_TIMEOUT` (per-request s, default 8), `NUCLEI_RETRIES` (1), `NUCLEI_MHE` (skip a
+  host after N errors, default 30), `NUCLEI_MAX_TIME` (hard cap on the whole nuclei stage
+  in seconds, default 3600; 0 = unlimited) — these stop nuclei grinding for hours on big,
+  CDN-heavy targets.
 
 ## Output
 
