@@ -89,7 +89,7 @@ each extension multiplies requests), and `FFUF_RATE` (req/sec).
 | Magento | `CMS/sitemap-magento.txt` | Admin, downloader, RCE-prone endpoints |
 | Umbraco | `CMS/Umbraco.fuzz.txt` | .NET CMS admin/config surface |
 | ColdFusion | `coldfusion.txt`, `CMS/ColdFusion.fuzz.txt` | CFIDE, Administrator, AdminAPI |
-| PHP | `raft-large-files.txt` | Large file list rich in `.php` config/backup files |
+| PHP | *(no heavy list)* | Covered by the base list + `.php`/`.phtml` extensions |
 | Java / Tomcat / Spring / Struts | `JavaServlets-Common.fuzz.txt`, `vulnerability-scan_j2ee-websites_WEB-INF.txt` | Servlets/invoker/Struts actions; `WEB-INF`, `web.xml`, class/jar leakage |
 | IIS / ASP / ASP.NET | `Microsoft-Frontpage.txt` | FrontPage/IIS extensions & `_vti_` dirs |
 | API / REST / Swagger / OpenAPI | `api/api-endpoints.txt`, `api/objects.txt`, `api/actions.txt`, `api/api-seen-in-wild.txt`, `common-api-endpoints-mazen160.txt` | REST resources, verbs, versioned routes, doc endpoints |
@@ -101,6 +101,11 @@ each extension multiplies requests), and `FFUF_RATE` (req/sec).
 
 The AI planner can add more mappings on top of this (also existence-checked). All are
 relative to `SECLISTS_DIR` and unioned with your base list per host.
+
+> **Bounty-friendly by design:** heavy generic lists (`raft-*`, `big.txt`,
+> `directory-list-*`, `combined_*`, `dirbuster`) are deliberately **excluded** — from
+> both the static map and anything the AI suggests — so fuzzing stays fast and
+> tech-focused rather than brute-forcing huge dictionaries.
 
 ### Cost-control techniques
 

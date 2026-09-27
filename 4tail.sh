@@ -18,6 +18,8 @@ set -o pipefail
 # LLM configuration (OpenAI-compatible; defaults = Together AI + cheap GLM)
 # ---------------------------------------------------------------------------
 LLM_API_KEY="${TOGETHER_API_KEY:-${LLM_API_KEY:-}}"
+# Strip stray whitespace/newlines (a trailing newline corrupts the auth header -> 401).
+LLM_API_KEY="$(printf '%s' "$LLM_API_KEY" | tr -d '[:space:]')"
 LLM_BASE_URL="${LLM_BASE_URL:-https://api.together.xyz/v1}"
 LLM_MODEL="${LLM_MODEL:-zai-org/GLM-5.3}"   # base default for every role
 LLM_MAX_TOKENS="${LLM_MAX_TOKENS:-1200}"
@@ -399,7 +401,7 @@ run_doctor() {
     dr_pass "SecLists: $SECLISTS_DIR"
     local rel
     for rel in Discovery/Web-Content/common.txt Discovery/Web-Content/CMS/wordpress.fuzz.txt \
-               Discovery/Web-Content/api/api-endpoints.txt Discovery/Web-Content/raft-large-files.txt; do
+               Discovery/Web-Content/api/api-endpoints.txt Discovery/Web-Content/JavaServlets-Common.fuzz.txt; do
       if [ -f "$SECLISTS_DIR/$rel" ]; then dr_pass "  $rel"; else dr_warn "  missing: $rel"; fi
     done
   else
@@ -421,7 +423,7 @@ run_doctor() {
   elif ! have curl || ! have jq; then
     dr_fail "curl and jq are required for AI steps"
   else
-    dr_pass "API key present; endpoint: $LLM_BASE_URL"
+    dr_pass "API key present (length ${#LLM_API_KEY}, ends …${LLM_API_KEY: -4}); endpoint: $LLM_BASE_URL"
     printf '  %sroutes%s plan=%s  triage=%s%s\n' "$c_dim" "$c_reset" \
       "$LLM_MODEL_PLAN" "$LLM_MODEL_TRIAGE" "${LLM_FALLBACK_MODELS:+  fallbacks=$LLM_FALLBACK_MODELS}"
     # Ping each unique configured model
@@ -517,7 +519,7 @@ sanitize_tags() {
 #   Magento    sitemap-magento.txt -> admin, downloader, RCE-prone endpoints
 #   Umbraco    CMS/Umbraco.fuzz.txt -> .NET CMS admin/config surface
 #   ColdFusion coldfusion.txt + CMS/ColdFusion.fuzz.txt -> CFIDE, admin, AdminAPI
-#   PHP        raft-large-files.txt -> huge file list rich in .php config/backup
+#   PHP        (no heavy list) -> covered by the base list + .php/.phtml extensions
 #   Java/JSP   JavaServlets-Common.fuzz.txt -> servlets, invoker, struts actions
 #   (Tomcat/   vulnerability-scan_j2ee-websites_WEB-INF.txt -> WEB-INF, web.xml,
 #    Spring/    class/jar leakage (source & credential disclosure)
@@ -548,7 +550,6 @@ magento	Discovery/Web-Content/CMS/sitemap-magento.txt
 umbraco	Discovery/Web-Content/CMS/Umbraco.fuzz.txt
 coldfusion	Discovery/Web-Content/coldfusion.txt
 coldfusion	Discovery/Web-Content/CMS/ColdFusion.fuzz.txt
-php	Discovery/Web-Content/raft-large-files.txt
 java	Discovery/Web-Content/JavaServlets-Common.fuzz.txt
 java	Discovery/Web-Content/vulnerability-scan_j2ee-websites_WEB-INF.txt
 tomcat	Discovery/Web-Content/JavaServlets-Common.fuzz.txt
@@ -589,7 +590,9 @@ Reply with ONLY a JSON object (no prose, no code fences) with exactly two keys:
   "wordlists": object mapping each relevant lowercase technology name to an array of
      content-discovery wordlist file paths RELATIVE to the SecLists root
      (e.g. "Discovery/Web-Content/CMS/wordpress.fuzz.txt"). Use only real, well-known
-     SecLists paths; keep 1-3 paths per technology; omit technologies you are unsure of.'
+     SecLists paths; keep 1-3 paths per technology; omit technologies you are unsure of.
+     Prefer small, tech-SPECIFIC lists (CMS/*, api/*, *.fuzz.txt). Do NOT use big generic
+     lists (raft-*, big.txt, directory-list-*, combined_*, dirbuster) - those are excluded.'
   plan_out="$(mktemp)"
   run_ai_stage 2 "$LLM_MODEL_PLAN" "$LLM_MAX_TOKENS_PLAN" "$sys_plan" "Target: $domain
 Live hosts: $alive_count
@@ -602,10 +605,13 @@ $(head -c 6000 "$tech_brief")" "$plan_out"
   [ -z "$ai_tags" ] && ai_tags="$(cat "$plan_out")"
   clean_plan="$(printf '%s' "$ai_tags" | sanitize_tags)"
 
-  # --- parse wordlist map (append to tech map; existence checked at fuzz time) ---
+  # --- parse wordlist map (append to tech map; heavy generic lists filtered out,
+  #     existence checked at fuzz time) ---
   if [ -n "$SECLISTS_DIR" ]; then
     jq -r '.wordlists // {} | to_entries[]? | (.key|ascii_downcase) as $k | .value[]? | "\($k)\t\(.)"' \
-       "$plan_out" 2>/dev/null >> "$tech_map_file" || true
+       "$plan_out" 2>/dev/null \
+       | grep -viE 'raft-|big\.txt|directory-list|combined_|dirbuster|/all\.txt' \
+       >> "$tech_map_file" || true
   fi
   rm -f "$plan_out"
 
@@ -639,6 +645,8 @@ host_wordlists() {
     [ -z "$t" ] && continue
     while IFS=$'\t' read -r key rel; do
       [ -z "$key" ] && continue
+      # skip heavy/generic lists (bounty scans prefer small tech-specific lists)
+      case "$rel" in *raft-*|*big.txt|*directory-list*|*combined_*|*dirbuster*|*/all.txt) continue ;; esac
       case "$t" in *"$key"*) [ -f "$SECLISTS_DIR/$rel" ] && printf '%s\n' "$SECLISTS_DIR/$rel" ;; esac
     done < "$tech_map_file"
   done
