@@ -125,6 +125,21 @@ Both AI steps are **optional**. Without an API key (or without `curl`/`jq`), 4ta
 degrades gracefully: it uses sensible default tags and writes the raw findings to
 the report.
 
+### Content-discovery results (ffuf) are now first-class
+
+Fuzzing hits are aggregated across all hosts into `fuzz_findings.txt`
+(`status  length  url`, prioritised: 200s → 401/403 → rest), shown in the report as a
+**"Content discovery hits"** table, and **fed to the AI triage** so the model calls out
+the juicy paths (`.git`, `.env`, backups, admin/api/upload/debug). ffuf runs with `-ac`
+(auto-calibration) to drop soft-404 / catch-all noise, so the hits are real.
+
+### JS mining scans first-party only
+
+JS/secret mining now keeps only scripts hosted on the target's own domain
+(`JS_FIRST_PARTY=1`, default) — third-party analytics/CDN scripts (google-analytics,
+gtag, jsdelivr, jquery cdn…) carry public keys and generate false positives that aren't
+yours to fix. Set `JS_FIRST_PARTY=0` to scan everything.
+
 ### Live nuclei stats + AI supervisor
 
 The long nuclei stage is no longer a black box. It runs with `-stats-json`, so the

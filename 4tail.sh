@@ -229,6 +229,7 @@ if [ "$DOCTOR" != 1 ]; then
   fuzz_plan_file="$OUTDIR/fuzz_plan.txt"        # host <TAB> wordlists used
   nuclei_stats_file="$OUTDIR/nuclei_stats.jsonl"
   supervisor_log="$OUTDIR/supervisor.log"
+  fuzz_findings_file="$OUTDIR/fuzz_findings.txt"   # aggregated ffuf hits: status<TAB>length<TAB>url
   cost_ledger="${LLM_COST_LEDGER:-$OUTDIR/.llm_cost_usd}"
   [ -f "$cost_ledger" ] || printf '0\n' > "$cost_ledger"
 fi
@@ -933,7 +934,9 @@ else
     names="$(printf '%s\n' "${wls[@]}" | sed 's#.*/##' | paste -sd+ -)"
     ext_flag="$(build_ext_flag "$techs")"
     printf '%s\t%s\t(%s words) exts:[%s]\n' "$url" "$names" "$(wc -l < "$combined")" "$ext_flag" >> "$fuzz_plan_file"
-    ffuf_args=(-u "$url/FUZZ" -w "$combined" -mc 200,204,301,302,307,401,403
+    # -ac auto-calibration filters soft-404 / catch-all responses (huge quality boost:
+    # without it a host that answers 200 to everything floods the results with junk).
+    ffuf_args=(-u "$url/FUZZ" -w "$combined" -ac -mc 200,204,301,302,307,401,403,405,500
                -of json -o "$fuzz_dir/${safe}.json" -s)
     [ -n "$ext_flag" ] && ffuf_args+=(-e "$ext_flag")
     [ "$FFUF_RATE" -gt 0 ] 2>/dev/null && ffuf_args+=(-rate "$FFUF_RATE")
@@ -948,6 +951,20 @@ else
   [ "$MAX_FUZZ_HOSTS" -gt 0 ] 2>/dev/null || touch "$OUTDIR/.done_fuzz"
   set_stage $S_FUZZ done "$fuzzed fuzzed$([ "$resumed" -gt 0 ] && echo ", $resumed resumed")$([ "$skipped_cdn" -gt 0 ] && echo ", $skipped_cdn CDN skipped")$([ "$backoff" = 1 ] && echo ", backoff")"
 fi
+
+# Aggregate ffuf per-host JSON into one findings list (status<TAB>length<TAB>url),
+# prioritised by interestingness. Runs for fresh and resumed runs alike. Without this
+# the content-discovery results were written to disk and never surfaced.
+: > "$fuzz_findings_file"
+if ls "$fuzz_dir"/*.json >/dev/null 2>&1; then
+  for jf in "$fuzz_dir"/*.json; do
+    jq -r '.results[]? | [(.status|tostring), (.length|tostring), .url] | @tsv' "$jf" 2>/dev/null
+  done | awk -F'\t' '!seen[$3]++' > "$OUTDIR/.fuzz_raw"
+  { for s in 200 302 301 307 401 403 405 500 204; do awk -F'\t' -v s="$s" '$1==s' "$OUTDIR/.fuzz_raw"; done
+    awk -F'\t' '$1!~/^(200|301|302|307|401|403|405|500|204)$/' "$OUTDIR/.fuzz_raw"; } > "$fuzz_findings_file"
+  rm -f "$OUTDIR/.fuzz_raw"
+fi
+fuzz_hits="$(nlines "$fuzz_findings_file")"
 
 # Step 4.5: JS & secret mining + param discovery (opt-in with -j)
 js_urls_file="$OUTDIR/js_urls.txt"
@@ -978,6 +995,14 @@ else
         | grep -oiE 'src="[^"]+\.js' | sed -E 's/^src="//' \
         | while read -r j; do case "$j" in http*) echo "$j";; /*) echo "${u%/}$j";; *) echo "${u%/}/$j";; esac; done
     done | sort -u > "$js_urls_file"
+  fi
+  # Keep only FIRST-PARTY JS (hosted on the target's own domain). Third-party scripts
+  # (google-analytics, gtag, cloudflare, jquery cdn...) carry public keys and produce
+  # false positives that aren't the target's to fix. Override with JS_FIRST_PARTY=0.
+  if [ "${JS_FIRST_PARTY:-1}" = 1 ] && [ -s "$js_urls_file" ]; then
+    esc_domain="$(printf '%s' "$domain" | sed 's/\./\\./g')"
+    grep -iE "^https?://([a-z0-9._-]+\.)?${esc_domain}([:/]|$)" "$js_urls_file" > "$js_urls_file.fp" 2>/dev/null || true
+    mv "$js_urls_file.fp" "$js_urls_file"
   fi
   js_total="$(nlines "$js_urls_file")"
   # 2) fetch each JS and scan for secrets
@@ -1127,28 +1152,26 @@ set_stage $S_NUCLEI done "$find_count findings$(done_marker nuclei && echo ' (re
   echo "# 4tail recon report"; echo
   echo "- **Target:** \`$domain\`"
   echo "- **Generated:** $(date -u '+%Y-%m-%d %H:%M UTC')"
-  echo "- **Subdomains:** $sub_count | **Live:** $alive_count | **Findings:** $find_count"
+  echo "- **Subdomains:** $sub_count | **Live:** $alive_count | **Nuclei findings:** $find_count | **Fuzz hits:** ${fuzz_hits:-0}"
   [ "$JSMINE" = 1 ] && echo "- **JS mined:** $(nlines "$js_urls_file") files, $(nlines "$js_secrets_file") secret hits, $(nlines "$params_file") params"
   echo "- **Nuclei:** ${nuclei_target_count:-$alive_count} hosts scanned (deduped from $alive_count) | tags \`$nuclei_tags\` | severity \`$NUCLEI_SEVERITY\`"
   echo "- **AI models:** $([ "$AI_ENABLED" = 1 ] && echo "plan=$LLM_MODEL_PLAN, triage=$LLM_MODEL_TRIAGE" || echo "disabled")"
   [ "$AI_ENABLED" = 1 ] && echo "- **Estimated AI spend:** $(cost_fmt)$([ "${LLM_BUDGET_USD:-0}" != 0 ] && echo " (budget \$$LLM_BUDGET_USD)")"
   echo "- **SecLists:** ${SECLISTS_DIR:-not found} | **Base wordlist:** \`$WORDLIST\`"; echo
-  if [ -s "$fuzz_plan_file" ]; then
-    echo "## Fuzzing strategy (tech-aware wordlists)"
+  if [ -s "$fuzz_findings_file" ]; then
+    echo "## Content discovery hits (ffuf, top 100)"
     echo
-    echo "Each host was fuzzed with the base list plus SecLists lists matched to its detected tech:"
-    echo
-    echo '| Host | Wordlists |'
-    echo '|------|-----------|'
-    while IFS=$'\t' read -r h names words; do
-      echo "| \`$h\` | $names $words |"
-    done < "$fuzz_plan_file"
+    echo '| Status | Length | URL |'
+    echo '|--------|--------|-----|'
+    head -n 100 "$fuzz_findings_file" | while IFS=$'\t' read -r st len u; do
+      echo "| $st | $len | \`$u\` |"
+    done
     echo
   fi
 } > "$report_file"
 
-# Step 6: AI triage  (also analyses mined JS secrets + discovered params, not just nuclei)
-have_extra=0; { [ -s "$js_secrets_file" ] || [ -s "$params_file" ]; } && have_extra=1
+# Step 6: AI triage  (analyses nuclei + content-discovery hits + JS secrets + params)
+have_extra=0; { [ -s "$js_secrets_file" ] || [ -s "$params_file" ] || [ -s "$fuzz_findings_file" ]; } && have_extra=1
 if [ "$AI_ENABLED" = "1" ] && { [ "$find_count" -gt 0 ] || [ "$have_extra" = 1 ]; } && ! budget_ok; then
   { echo "## Findings (budget reached, no AI triage)"; echo '```'; cat "$nuclei_file" 2>/dev/null
     [ -s "$js_secrets_file" ] && { echo; echo "# JS secret candidates:"; cat "$js_secrets_file"; }; echo '```'; } >> "$report_file"
@@ -1160,14 +1183,18 @@ elif [ "$AI_ENABLED" = "1" ] && { [ "$find_count" -gt 0 ] || [ "$have_extra" = 1
   )"
   [ -z "$sorted_findings" ] && sorted_findings="$(cat "$nuclei_file" 2>/dev/null)"
   sys_triage='You are a senior security analyst on an AUTHORIZED bug-bounty engagement.
-Given a technology brief, severity-sorted nuclei output, JS secret candidates and
-discovered request parameters, produce a thorough report in GitHub-flavored Markdown with:
+Given a technology brief, nuclei output, CONTENT-DISCOVERY hits (discovered URLs/paths),
+JS secret candidates and discovered request parameters, produce a thorough report in
+GitHub-flavored Markdown with:
 "## Executive summary" (3-5 sentences),
 "## Prioritised findings" (table: Severity | Host | Issue | Why it matters | Next step),
+"## Notable discovered paths" (from the content-discovery hits, call out the juicy ones:
+backups/.git/.env/config/admin/api/upload/debug endpoints; ignore generic assets; note
+which 401/403 are worth auth testing),
 "## Secrets & sensitive exposure" (assess each JS secret candidate: likely real vs false
-positive, impact, and how to verify safely - flag private keys / cloud creds as critical),
-"## Interesting parameters to test" (map discovered params to likely bug classes: IDOR,
-SSRF, LFI, SQLi, open-redirect - with a concrete test idea each),
+positive, impact, safe verification - flag private keys / cloud creds as critical),
+"## Interesting parameters to test" (map discovered params to bug classes: IDOR, SSRF,
+LFI, SQLi, open-redirect - concrete test idea each),
 "## Attack surface notes" and "## Recommended manual follow-ups".
 Use ONLY the provided data - do not invent findings.
 Output ONLY the final report starting exactly with the line "## Executive summary".
@@ -1180,6 +1207,9 @@ $(head -c 8000 "$tech_brief")
 
 === nuclei findings (severity-sorted) ===
 $(printf '%s\n' "$sorted_findings" | head -n 400 | head -c 30000)
+
+=== content-discovery hits (status  length  url) ===
+$(head -n 150 "$fuzz_findings_file" 2>/dev/null | head -c 12000)
 
 === JS secret candidates (url <TAB> match) ===
 $(head -c 8000 "$js_secrets_file" 2>/dev/null)
@@ -1210,9 +1240,14 @@ fi
 
 # Final summary
 spend_note=""; [ "$AI_ENABLED" = 1 ] && spend_note="  ·  AI spend ~$(cost_fmt)"
+tally="nuclei:$find_count  fuzz-hits:${fuzz_hits:-0}$([ "$JSMINE" = 1 ] && echo "  js-secrets:$(nlines "$js_secrets_file")  params:$(nlines "$params_file")")"
 if [ "$TUI" = 1 ]; then
   render
-  printf '\n %s✔ done in %ss%s%s  →  %s%s%s\n' "$c_green" "$((SECONDS-started))" "$c_reset" "$spend_note" "$c_cyan" "$report_file" "$c_reset"
+  printf '\n %s✔ done in %ss%s%s\n   %s%s%s\n   report → %s%s%s\n' \
+    "$c_green" "$((SECONDS-started))" "$c_reset" "$spend_note" \
+    "$c_dim" "$tally" "$c_reset" "$c_cyan" "$report_file" "$c_reset"
 else
-  ok "Done in $((SECONDS-started))s.$spend_note Report: $report_file"
+  ok "Done in $((SECONDS-started))s.$spend_note"
+  ok "$tally"
+  ok "Report: $report_file"
 fi
