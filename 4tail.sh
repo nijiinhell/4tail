@@ -73,6 +73,8 @@ NUCLEI_TIMEOUT="${NUCLEI_TIMEOUT:-8}"    # per-request timeout (s) - stops hangi
 NUCLEI_RETRIES="${NUCLEI_RETRIES:-1}"
 NUCLEI_MHE="${NUCLEI_MHE:-30}"           # skip a host after this many errors (dead CDN edges)
 NUCLEI_MAX_TIME="${NUCLEI_MAX_TIME:-3600}"  # hard cap on the whole nuclei stage (s); 0 = unlimited
+NUCLEI_CONC="${NUCLEI_CONC:-60}"         # template concurrency (-c); higher = faster, more load
+NUCLEI_BULK="${NUCLEI_BULK:-40}"         # hosts scanned in parallel per template (-bulk-size)
 HTTPX_THREADS="${HTTPX_THREADS:-50}"
 OUTDIR="${OUTDIR:-}"
 RESUME="${RESUME:-0}"      # 1 = continue a previous run (reuse finished stages)
@@ -1022,6 +1024,7 @@ else
               -tags "$nuclei_tags" -severity "$NUCLEI_SEVERITY"
               -rate-limit "$NUCLEI_RATELIMIT" -timeout "$NUCLEI_TIMEOUT"
               -retries "$NUCLEI_RETRIES" -mhe "$NUCLEI_MHE"
+              -c "$NUCLEI_CONC" -bulk-size "$NUCLEI_BULK"
               -l "$alive_file" -o "$nuclei_file")
   if [ "$NUCLEI_MAX_TIME" -gt 0 ] 2>/dev/null && have timeout; then
     nuclei_cmd=(timeout "${NUCLEI_MAX_TIME}s" "${nuclei_cmd[@]}")
@@ -1053,12 +1056,12 @@ else
       fi
       if [ -z "$sup_pid" ] && [ $((SECONDS - last_sup)) -ge "$SUPERVISOR_INTERVAL" ] && [ -n "$st" ]; then
         last_sup=$SECONDS; sup_out="$(mktemp)"
-        sup_sys='You are monitoring a running nuclei vulnerability scan for an AUTHORIZED test. Given recent stats and error samples, reply in ONE short sentence (max 30 words): progress, whether error rate is concerning and likely why (e.g. WAF 429s, dead hosts), and ETA. No preamble.'
+        sup_sys='You monitor a running nuclei scan (AUTHORIZED test). Output ONLY the final status as one short sentence (<=30 words): progress %, whether the error rate is concerning and the likely cause (WAF 429s, dead hosts, timeouts), and ETA. No reasoning, no preamble, no "Let me" - just the sentence.'
         sup_usr="tags: $nuclei_tags
 hosts: $alive_count  elapsed: $((SECONDS-ns))s
 recent stats: $(grep '^{' "$nuclei_stats_file" | tail -3)
 error sample: $(grep -iv '^{' "$nuclei_stats_file" | grep -iE 'error|timeout|refused|denied|429' | tail -5 | head -c 1500)"
-        ( ai_call "$LLM_MODEL_PLAN" 200 "$sup_sys" "$sup_usr" >"$sup_out" 2>>"$llm_log" ) & sup_pid=$!
+        ( ai_call "$LLM_MODEL_PLAN" 600 "$sup_sys" "$sup_usr" >"$sup_out" 2>>"$llm_log" ) & sup_pid=$!
       fi
     fi
     render; sleep 3
