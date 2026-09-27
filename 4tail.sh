@@ -367,10 +367,19 @@ ai_call() {
     attempt=0; delay=2
     while :; do
       attempt=$((attempt + 1))
-      response="$(curl -sS --max-time "$LLM_TIMEOUT" "$LLM_BASE_URL/chat/completions" \
+      local http_code curl_rc
+      response="$(curl -sS --max-time "$LLM_TIMEOUT" -w $'\n__HTTP__%{http_code}' \
+        "$LLM_BASE_URL/chat/completions" \
         -H "content-type: application/json" -H "authorization: Bearer $LLM_API_KEY" \
-        -d "$payload" 2>/dev/null)"
-      if [ -n "$response" ] && ! echo "$response" | jq -e '.error' >/dev/null 2>&1; then
+        -d "$payload" 2>>"$llm_log")"; curl_rc=$?
+      http_code="$(printf '%s' "$response" | sed -n 's/.*__HTTP__//p' | tail -1)"
+      response="$(printf '%s' "$response" | sed 's/__HTTP__[0-9]*$//')"
+      if [ "$curl_rc" != 0 ] || [ -z "$response" ]; then
+        echo "[fail] model=$m curl_rc=$curl_rc http=${http_code:-none} (timeout/connection/empty)" >>"$llm_log"
+      elif echo "$response" | jq -e '.error' >/dev/null 2>&1; then
+        echo "[fail] model=$m http=${http_code:-?}: $(echo "$response" | jq -r '.error.message // .error' 2>/dev/null)" >>"$llm_log"
+      fi
+      if [ "$curl_rc" = 0 ] && [ -n "$response" ] && ! echo "$response" | jq -e '.error' >/dev/null 2>&1; then
         text="$(echo "$response" | jq -r '.choices[0].message.content // empty' 2>/dev/null)"
         if [ -n "$text" ]; then
           # accrue estimated cost from token usage
