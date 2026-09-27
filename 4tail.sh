@@ -28,7 +28,9 @@ LLM_RETRIES="${LLM_RETRIES:-2}"
 # ---------------------------------------------------------------------------
 # Scan configuration
 # ---------------------------------------------------------------------------
-WORDLIST="${WORDLIST:-/usr/share/seclists/Discovery/Web-Content/common.txt}"
+WORDLIST="${WORDLIST:-/usr/share/seclists/Discovery/Web-Content/common.txt}"  # base "juicy" list, always used
+SECLISTS_DIR="${SECLISTS_DIR:-}"          # auto-detected below if empty
+MAX_FUZZ_WORDS="${MAX_FUZZ_WORDS:-60000}" # cap per-host combined wordlist size
 DEFAULT_NUCLEI_TAGS="${DEFAULT_NUCLEI_TAGS:-cves,exposures,misconfiguration,tech,default-login,takeover}"
 NUCLEI_SEVERITY="${NUCLEI_SEVERITY:-critical,high,medium,low}"
 NUCLEI_RATELIMIT="${NUCLEI_RATELIMIT:-150}"
@@ -140,6 +142,16 @@ fuzz_dir="$OUTDIR/fuzz"; mkdir -p "$fuzz_dir"
 nuclei_file="$OUTDIR/nuclei.txt"
 report_file="$OUTDIR/report.md"
 llm_log="$OUTDIR/llm.log"
+tech_map_file="$OUTDIR/tech_wordlists.tsv"   # tech <TAB> seclists-relative-path
+fuzz_plan_file="$OUTDIR/fuzz_plan.txt"        # host <TAB> wordlists used
+
+# Auto-detect a SecLists installation so fuzzing can pick tech-specific lists.
+if [ -z "$SECLISTS_DIR" ]; then
+  for d in /usr/share/seclists /usr/share/wordlists/seclists /usr/share/SecLists \
+           "$HOME/SecLists" "$HOME/seclists" /opt/SecLists; do
+    [ -d "$d" ] && { SECLISTS_DIR="$d"; break; }
+  done
+fi
 
 # ===========================================================================
 # LIVE TERMINAL DASHBOARD
@@ -300,19 +312,74 @@ sanitize_tags() {
         case ",${NUCLEI_TAG_ALLOWLIST//[[:space:]]/}," in *",$t,"*) echo "$t";; esac
       done | awk '!seen[$0]++' | paste -sd, -
 }
+# Seed a built-in tech -> SecLists wordlist map. Paths are existence-checked at
+# fuzz time, so entries that don't exist in this SecLists version are harmless.
+# This makes fuzzing tech-aware even with no API key.
+seed_static_tech_map() {
+  : > "$tech_map_file"
+  while IFS= read -r line; do
+    [ -z "$line" ] && continue
+    printf '%s\n' "$line" >> "$tech_map_file"
+  done <<'STATIC'
+wordpress	Discovery/Web-Content/CMS/wordpress.fuzz.txt
+wordpress	Discovery/Web-Content/CMS/wp-plugins.fuzz.txt
+wordpress	Discovery/Web-Content/CMS/wp-themes.fuzz.txt
+joomla	Discovery/Web-Content/CMS/joomla-plugins.fuzz.txt
+joomla	Discovery/Web-Content/CMS/Joomla.txt
+drupal	Discovery/Web-Content/CMS/Drupal.txt
+magento	Discovery/Web-Content/CMS/Magento.txt
+php	Discovery/Web-Content/Common-PHP-Filenames.txt
+php	Discovery/Web-Content/PHP.fuzz.txt
+laravel	Discovery/Web-Content/Laravel.fuzz.txt
+apache	Discovery/Web-Content/Apache.fuzz.txt
+tomcat	Discovery/Web-Content/Apache-Tomcat.txt
+tomcat	Discovery/Web-Content/tomcat.txt
+nginx	Discovery/Web-Content/nginx.txt
+iis	Discovery/Web-Content/IIS.fuzz.txt
+asp	Discovery/Web-Content/IIS.fuzz.txt
+aspnet	Discovery/Web-Content/IIS.fuzz.txt
+spring	Discovery/Web-Content/spring-boot.txt
+java	Discovery/Web-Content/tomcat.txt
+jenkins	Discovery/Web-Content/jenkins-plugins.txt
+git	Discovery/Web-Content/versioning_metafiles.txt
+api	Discovery/Web-Content/api/api-endpoints.txt
+api	Discovery/Web-Content/api/objects.txt
+graphql	Discovery/Web-Content/graphql.txt
+swagger	Discovery/Web-Content/swagger.txt
+STATIC
+}
+[ -n "$SECLISTS_DIR" ] && seed_static_tech_map || : > "$tech_map_file"
+
 nuclei_tags="$DEFAULT_NUCLEI_TAGS"
 if [ "$AI_ENABLED" = "1" ] && [ -s "$tech_brief" ]; then
   sys_plan='You assist AUTHORIZED bug-bounty recon. Given an aggregated brief of the
-technologies, servers and notable paths on live hosts, choose the most relevant nuclei
-tags to scan with. Reply with ONLY a single comma-separated list of lowercase nuclei tags
-(4-12 tags), no prose, no code fences. Always include cves, exposures and misconfiguration
-plus tags matched to the observed stack.'
+technologies, servers and notable paths on live hosts, produce a scan plan.
+Reply with ONLY a JSON object (no prose, no code fences) with exactly two keys:
+  "nuclei_tags": array of 4-12 lowercase nuclei tags (always include cves, exposures,
+     misconfiguration, plus tags matched to the observed stack),
+  "wordlists": object mapping each relevant lowercase technology name to an array of
+     content-discovery wordlist file paths RELATIVE to the SecLists root
+     (e.g. "Discovery/Web-Content/CMS/wordpress.fuzz.txt"). Use only real, well-known
+     SecLists paths; keep 1-3 paths per technology; omit technologies you are unsure of.'
   plan_out="$(mktemp)"
   run_ai_stage 2 "$sys_plan" "Target: $domain
 Live hosts: $alive_count
+SecLists root: ${SECLISTS_DIR:-<not installed>}
 
 $(head -c 6000 "$tech_brief")" "$plan_out"
-  clean_plan="$(sanitize_tags < "$plan_out")"; rm -f "$plan_out"
+
+  # --- parse nuclei tags (JSON first, then salvage raw text) ---
+  ai_tags="$(jq -r '.nuclei_tags[]?' "$plan_out" 2>/dev/null | paste -sd, -)"
+  [ -z "$ai_tags" ] && ai_tags="$(cat "$plan_out")"
+  clean_plan="$(printf '%s' "$ai_tags" | sanitize_tags)"
+
+  # --- parse wordlist map (append to tech map; existence checked at fuzz time) ---
+  if [ -n "$SECLISTS_DIR" ]; then
+    jq -r '.wordlists // {} | to_entries[]? | (.key|ascii_downcase) as $k | .value[]? | "\($k)\t\(.)"' \
+       "$plan_out" 2>/dev/null >> "$tech_map_file" || true
+  fi
+  rm -f "$plan_out"
+
   if [ -n "$clean_plan" ] && [ "$(printf '%s' "$clean_plan" | tr ',' '\n' | grep -c .)" -ge 2 ]; then
     nuclei_tags="$clean_plan"; printf '%s\n' "$nuclei_tags" > "$OUTDIR/ai_scan_plan.txt"
     set_stage 2 done "$nuclei_tags"
@@ -323,23 +390,60 @@ else
   set_stage 2 skip "AI off (defaults)"
 fi
 
-# Step 4: Fuzzing
-if have ffuf && [ -f "$WORDLIST" ]; then
+# Step 4: Fuzzing (tech-aware, per host)
+# For each live host: base "juicy" wordlist  +  SecLists lists matched to its
+# detected tech  ->  deduped combined list  ->  ffuf. Every AI/static path is
+# existence-checked, so nothing bogus reaches ffuf.
+
+# Collect the wordlist paths for a given comma-separated, lowercased tech string.
+# Prints one absolute wordlist path per line (base list first, then tech lists).
+host_wordlists() {
+  local techs="$1" t key rel
+  [ -f "$WORDLIST" ] && printf '%s\n' "$WORDLIST"
+  [ -n "$SECLISTS_DIR" ] && [ -s "$tech_map_file" ] || return 0
+  IFS=',' read -ra _arr <<< "$techs"
+  for t in "${_arr[@]}"; do
+    [ -z "$t" ] && continue
+    while IFS=$'\t' read -r key rel; do
+      [ -z "$key" ] && continue
+      case "$t" in *"$key"*) [ -f "$SECLISTS_DIR/$rel" ] && printf '%s\n' "$SECLISTS_DIR/$rel" ;; esac
+    done < "$tech_map_file"
+  done
+}
+
+# Do we have anything at all to fuzz with?
+fuzz_possible=0
+{ [ -f "$WORDLIST" ] || { [ -n "$SECLISTS_DIR" ] && [ -s "$tech_map_file" ]; }; } && fuzz_possible=1
+
+if have ffuf && [ "$fuzz_possible" = 1 ]; then
   set_stage 3 running "0/$alive_count hosts"
-  idx=0
-  while read -r url; do
+  : > "$fuzz_plan_file"
+  # host \t comma-tech  (dedup by url)
+  hosts_tsv="$(jq -r '[.url, ((.tech // []) | map(ascii_downcase) | join(","))] | @tsv' \
+                 "$httpx_json" 2>/dev/null | sort -u)"
+  [ -n "$hosts_tsv" ] || hosts_tsv="$(sed 's/$/\t/' "$alive_file")"
+  idx=0; total=$(printf '%s\n' "$hosts_tsv" | grep -c .)
+  while IFS=$'\t' read -r url techs; do
     [ -z "$url" ] && continue
     idx=$((idx + 1))
     safe="$(printf '%s' "$url" | tr -c 'A-Za-z0-9._-' '_')"
-    ST_DETAIL[3]="host $idx/$alive_count"; render
-    ffuf -u "$url/FUZZ" -w "$WORDLIST" -mc 200,204,301,302,307,401,403 \
+    # assemble this host's combined wordlist
+    mapfile -t wls < <(host_wordlists "$techs" | awk 'NF' | awk '!seen[$0]++')
+    [ "${#wls[@]}" -eq 0 ] && continue
+    combined="$fuzz_dir/wl_${idx}.txt"
+    cat "${wls[@]}" 2>/dev/null | sort -u | head -n "$MAX_FUZZ_WORDS" > "$combined"
+    names="$(printf '%s\n' "${wls[@]}" | sed 's#.*/##' | paste -sd+ -)"
+    printf '%s\t%s\t(%s words)\n' "$url" "$names" "$(wc -l < "$combined")" >> "$fuzz_plan_file"
+    ST_DETAIL[3]="host $idx/$total  [${techs:-generic}]"; render
+    ffuf -u "$url/FUZZ" -w "$combined" -mc 200,204,301,302,307,401,403 \
          -of json -o "$fuzz_dir/${idx}_${safe}.json" -s >/dev/null 2>>"$llm_log" || true
-  done < "$alive_file"
-  set_stage 3 done "$idx hosts"
+    rm -f "$combined"   # keep the run dir small; fuzz_plan.txt records what was used
+  done <<< "$hosts_tsv"
+  set_stage 3 done "$idx hosts (tech-aware)"
 elif ! have ffuf; then
   set_stage 3 skip "ffuf not installed"
 else
-  set_stage 3 skip "wordlist missing"
+  set_stage 3 skip "no wordlist / SecLists"
 fi
 
 # Step 5: Nuclei
@@ -357,6 +461,18 @@ set_stage 4 done "$find_count findings"
   echo "- **Subdomains:** $sub_count | **Live:** $alive_count | **Findings:** $find_count"
   echo "- **Nuclei tags:** \`$nuclei_tags\` | **Severity:** \`$NUCLEI_SEVERITY\`"
   echo "- **AI model:** $([ "$AI_ENABLED" = 1 ] && echo "$LLM_MODEL" || echo "disabled")"; echo
+  if [ -s "$fuzz_plan_file" ]; then
+    echo "## Fuzzing strategy (tech-aware wordlists)"
+    echo
+    echo "Each host was fuzzed with the base list plus SecLists lists matched to its detected tech:"
+    echo
+    echo '| Host | Wordlists |'
+    echo '|------|-----------|'
+    while IFS=$'\t' read -r h names words; do
+      echo "| \`$h\` | $names $words |"
+    done < "$fuzz_plan_file"
+    echo
+  fi
 } > "$report_file"
 
 # Step 6: AI triage

@@ -18,12 +18,29 @@ The script calls the LLM to make two real decisions:
 
 1. **Adaptive scan planning** — after Httpx probes live hosts *with technology
    detection*, the model reads the detected stack (WordPress, nginx, Jira, PHP, …)
-   and picks the most relevant Nuclei tags, instead of a fixed tag list. Its output
-   is validated against an allowlist so a bogus/hallucinated tag can never silently
-   make Nuclei scan nothing — if the result is unusable, it falls back to defaults.
+   and returns a JSON plan with **(a)** the most relevant Nuclei tags and **(b)** a
+   `tech → SecLists wordlist` mapping. Tags are validated against an allowlist and
+   wordlist paths are existence-checked on disk, so a bogus/hallucinated value can
+   never break the scan — anything unusable falls back to sane defaults. It's a
+   single API call, so adding wordlist intelligence costs nothing extra.
 2. **Finding triage** — after Nuclei runs, the model turns the raw output into a
    prioritized Markdown report (executive summary, severity-sorted table, and
    recommended manual follow-ups).
+
+### Tech-aware fuzzing (smart wordlists)
+
+Fuzzing is no longer "one wordlist for everything". For **each live host**, 4tail:
+
+- always includes your **base "juicy" wordlist** (`WORDLIST`) for high-value findings,
+- **adds the SecLists lists that match that host's detected tech** — e.g. a WordPress
+  host also gets `CMS/wordpress.fuzz.txt` + `wp-plugins.fuzz.txt`, a PHP host gets
+  `Common-PHP-Filenames.txt`, an Apache host gets `Apache.fuzz.txt`,
+- **dedups** the combined list (capped at `MAX_FUZZ_WORDS`) and fuzzes with it.
+
+The tech→wordlist map comes from the AI plan **and** a built-in static map, so it works
+tech-aware even with no API key. SecLists is auto-detected (`SECLISTS_DIR`), and every
+path is existence-checked — lists missing in your SecLists version are simply skipped.
+Which lists each host received is recorded in `fuzz_plan.txt` and in the report.
 
 ### Cost-control techniques
 
@@ -162,8 +179,10 @@ cat 4tail_example.com_*/report.md
 
 ### Scan tuning env vars
 
-- `NUCLEI_SEVERITY`, `NUCLEI_RATELIMIT`, `HTTPX_THREADS`, `WORDLIST`, `OUTDIR`,
-  `DEFAULT_NUCLEI_TAGS`.
+- `WORDLIST` — base "juicy" wordlist, always used for every host.
+- `SECLISTS_DIR` — SecLists root (auto-detected if unset) used for tech-specific lists.
+- `MAX_FUZZ_WORDS` — cap on each host's combined wordlist size (default 60000).
+- `NUCLEI_SEVERITY`, `NUCLEI_RATELIMIT`, `HTTPX_THREADS`, `OUTDIR`, `DEFAULT_NUCLEI_TAGS`.
 
 ## Output
 
@@ -175,6 +194,8 @@ httpx.jsonl         # raw Httpx JSON (status, title, server, tech)
 alive.txt           # deduped live URLs
 tech_brief.txt      # aggregated tech/server/status frequencies (fed to the AI)
 ai_scan_plan.txt    # the Nuclei tags the model chose
+tech_wordlists.tsv  # tech → SecLists wordlist map (static + AI, used for fuzzing)
+fuzz_plan.txt       # which wordlists each host was fuzzed with
 fuzz/               # per-host Ffuf JSON results
 nuclei.txt          # raw Nuclei findings
 report.md           # AI-triaged, prioritized report
