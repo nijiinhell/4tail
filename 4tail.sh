@@ -28,9 +28,13 @@ LLM_RETRIES="${LLM_RETRIES:-2}"
 # ---------------------------------------------------------------------------
 # Scan configuration
 # ---------------------------------------------------------------------------
-WORDLIST="${WORDLIST:-/usr/share/seclists/Discovery/Web-Content/common.txt}"  # base "juicy" list, always used
+WORDLIST="${WORDLIST:-}"                   # base "juicy" list; auto-resolved below (Bo0oM/fuzz.txt preferred)
 SECLISTS_DIR="${SECLISTS_DIR:-}"          # auto-detected below if empty
 MAX_FUZZ_WORDS="${MAX_FUZZ_WORDS:-60000}" # cap per-host combined wordlist size
+EXTENSIONS="${EXTENSIONS:-}"              # explicit ffuf -e list (overrides tech-aware exts)
+MAX_EXTS="${MAX_EXTS:-10}"                # cap on per-host extensions (each multiplies requests)
+FFUF_RATE="${FFUF_RATE:-0}"              # ffuf requests/sec (0 = unlimited)
+FETCH_FUZZTXT="${FETCH_FUZZTXT:-0}"      # 1 = download Bo0oM/fuzz.txt if no base list found
 DEFAULT_NUCLEI_TAGS="${DEFAULT_NUCLEI_TAGS:-cves,exposures,misconfiguration,tech,default-login,takeover}"
 NUCLEI_SEVERITY="${NUCLEI_SEVERITY:-critical,high,medium,low}"
 NUCLEI_RATELIMIT="${NUCLEI_RATELIMIT:-150}"
@@ -153,15 +157,46 @@ if [ -z "$SECLISTS_DIR" ]; then
     [ -d "$d" ] && { SECLISTS_DIR="$d"; break; }
   done
 fi
-# If no base wordlist was given / found, fall back to SecLists' common.txt.
-if [ ! -f "$WORDLIST" ] && [ -n "$SECLISTS_DIR" ] && [ -f "$SECLISTS_DIR/Discovery/Web-Content/common.txt" ]; then
-  WORDLIST="$SECLISTS_DIR/Discovery/Web-Content/common.txt"
-fi
+# Resolve the base "juicy" wordlist. Prefer Bo0oM/fuzz.txt (dotfiles, backups, VCS
+# metadata, cloud creds, path-traversal/WAF-bypass payloads); else SecLists common.txt.
+resolve_base_wordlist() {
+  [ -n "$WORDLIST" ] && [ -f "$WORDLIST" ] && return 0
+  local c
+  for c in \
+    "/root/Desktop/bugs/tools/fuzz.txt/fuzz.txt" \
+    "$HOME/fuzz.txt/fuzz.txt" "$HOME/tools/fuzz.txt/fuzz.txt" \
+    "$HOME/.4tail/fuzz.txt" "/usr/share/wordlists/fuzz.txt" \
+    "/opt/fuzz.txt/fuzz.txt" "./fuzz.txt/fuzz.txt" "./fuzz.txt"; do
+    [ -f "$c" ] && { WORDLIST="$c"; return 0; }
+  done
+  if [ "$FETCH_FUZZTXT" = 1 ] && have curl; then
+    mkdir -p "$HOME/.4tail"
+    if curl -fsSL --max-time 60 \
+         "https://raw.githubusercontent.com/Bo0oM/fuzz.txt/master/fuzz.txt" \
+         -o "$HOME/.4tail/fuzz.txt" 2>/dev/null && [ -s "$HOME/.4tail/fuzz.txt" ]; then
+      WORDLIST="$HOME/.4tail/fuzz.txt"; return 0
+    fi
+  fi
+  [ -n "$SECLISTS_DIR" ] && [ -f "$SECLISTS_DIR/Discovery/Web-Content/common.txt" ] \
+    && WORDLIST="$SECLISTS_DIR/Discovery/Web-Content/common.txt"
+}
+resolve_base_wordlist
+
+# If a Bo0oM api-endpoints.txt sits next to the base list, use it for API hosts.
+base_dir="$(dirname "${WORDLIST:-/nonexistent}")"
+API_ENDPOINTS_EXTRA=""
+[ -f "$base_dir/api-endpoints.txt" ] && API_ENDPOINTS_EXTRA="$base_dir/api-endpoints.txt"
+
 if [ -n "$SECLISTS_DIR" ]; then
   log "SecLists: $SECLISTS_DIR (tech-aware fuzzing enabled)"
 else
-  warn "SecLists not found - fuzzing will use only the base wordlist."
+  warn "SecLists not found - fuzzing will use only the base wordlist + tech extensions."
   warn "Install it (apt install seclists) or set SECLISTS_DIR=/path/to/SecLists."
+fi
+if [ -n "$WORDLIST" ] && [ -f "$WORDLIST" ]; then
+  case "$WORDLIST" in *fuzz.txt) log "Base wordlist: $WORDLIST (Bo0oM juicy list)";; *) log "Base wordlist: $WORDLIST";; esac
+else
+  warn "No base wordlist found. Provide -w, or set FETCH_FUZZTXT=1 to download Bo0oM/fuzz.txt."
 fi
 
 # ===========================================================================
@@ -449,6 +484,10 @@ fi
 host_wordlists() {
   local techs="$1" t key rel
   [ -f "$WORDLIST" ] && printf '%s\n' "$WORDLIST"
+  # Bo0oM api-endpoints.txt (if present next to base list) for API-ish hosts
+  if [ -n "$API_ENDPOINTS_EXTRA" ]; then
+    case ",$techs," in *api*|*graphql*|*swagger*|*rest*|*json*) printf '%s\n' "$API_ENDPOINTS_EXTRA" ;; esac
+  fi
   [ -n "$SECLISTS_DIR" ] && [ -s "$tech_map_file" ] || return 0
   IFS=',' read -ra _arr <<< "$techs"
   for t in "${_arr[@]}"; do
@@ -458,6 +497,40 @@ host_wordlists() {
       case "$t" in *"$key"*) [ -f "$SECLISTS_DIR/$rel" ] && printf '%s\n' "$SECLISTS_DIR/$rel" ;; esac
     done < "$tech_map_file"
   done
+}
+
+# Generic "juicy" extensions distilled from Bo0oM/fuzz.txt's extensions.txt
+# (backups, configs, source, archives, editor swap files). Highest-value first so
+# they survive the MAX_EXTS cap. Applied to every host.
+GENERIC_EXTS="bak,old,zip,sql,conf,config,txt,log,backup,save,orig,swp,~,tar.gz,tgz,gz,ini,inc,tmp"
+
+# Per-host extension set = tech-specific exts (FIRST - highest signal, e.g. .php lets
+# us find config.php.bak) + generic juicy exts. ffuf requests word AND word.ext.
+host_extensions() {
+  local techs="$1" tech="" t
+  IFS=',' read -ra _e <<< "$techs"
+  for t in "${_e[@]}"; do
+    case "$t" in
+      *php*)                                   tech="$tech,php,phtml,phps" ;;
+      *asp*|*iis*|*aspnet*|*.net*)             tech="$tech,aspx,asp,ashx,config,cs" ;;
+      *java*|*jsp*|*tomcat*|*spring*|*struts*) tech="$tech,jsp,jspx,war,properties,class" ;;
+      *coldfusion*|*cfm*)                      tech="$tech,cfm,cfc" ;;
+      *python*|*django*|*flask*)               tech="$tech,py,pyc" ;;
+      *ruby*|*rails*)                          tech="$tech,rb,erb" ;;
+      *node*|*express*|*javascript*)           tech="$tech,js,map,env" ;;
+      *perl*)                                  tech="$tech,pl,cgi" ;;
+    esac
+  done
+  printf '%s,%s' "${tech#,}" "$GENERIC_EXTS"
+}
+
+# Turn a tech string into an ffuf -e value (deduped, capped, leading dot on each).
+build_ext_flag() {
+  local techs="$1" raw
+  if [ -n "$EXTENSIONS" ]; then raw="$EXTENSIONS"; else raw="$(host_extensions "$techs")"; fi
+  printf '%s' "$raw" | tr ',[:space:]' '\n\n' | grep -oE '[A-Za-z0-9.~_-]+' \
+    | awk '!seen[$0]++' | head -n "$MAX_EXTS" \
+    | sed -E 's/^([A-Za-z0-9])/.\1/' | paste -sd, -
 }
 
 # Do we have anything at all to fuzz with?
@@ -482,10 +555,14 @@ if have ffuf && [ "$fuzz_possible" = 1 ]; then
     combined="$fuzz_dir/wl_${idx}.txt"
     cat "${wls[@]}" 2>/dev/null | sort -u | head -n "$MAX_FUZZ_WORDS" > "$combined"
     names="$(printf '%s\n' "${wls[@]}" | sed 's#.*/##' | paste -sd+ -)"
-    printf '%s\t%s\t(%s words)\n' "$url" "$names" "$(wc -l < "$combined")" >> "$fuzz_plan_file"
+    ext_flag="$(build_ext_flag "$techs")"
+    printf '%s\t%s\t(%s words) exts:[%s]\n' "$url" "$names" "$(wc -l < "$combined")" "$ext_flag" >> "$fuzz_plan_file"
     ST_DETAIL[3]="host $idx/$total  [${techs:-generic}]"; render
-    ffuf -u "$url/FUZZ" -w "$combined" -mc 200,204,301,302,307,401,403 \
-         -of json -o "$fuzz_dir/${idx}_${safe}.json" -s >/dev/null 2>>"$llm_log" || true
+    ffuf_args=(-u "$url/FUZZ" -w "$combined" -mc 200,204,301,302,307,401,403
+               -of json -o "$fuzz_dir/${idx}_${safe}.json" -s)
+    [ -n "$ext_flag" ] && ffuf_args+=(-e "$ext_flag")
+    [ "$FFUF_RATE" -gt 0 ] 2>/dev/null && ffuf_args+=(-rate "$FFUF_RATE")
+    ffuf "${ffuf_args[@]}" >/dev/null 2>>"$llm_log" || true
     rm -f "$combined"   # keep the run dir small; fuzz_plan.txt records what was used
   done <<< "$hosts_tsv"
   set_stage 3 done "$idx hosts (tech-aware)"

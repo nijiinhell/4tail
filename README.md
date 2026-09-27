@@ -43,8 +43,41 @@ path is existence-checked — lists missing in your SecLists version are simply 
 Which lists each host received is recorded in `fuzz_plan.txt` and in the report.
 
 > **`apt install seclists`** installs to `/usr/share/seclists`, which 4tail auto-detects.
-> If yours is elsewhere, set `SECLISTS_DIR=/path/to/SecLists`. When no base wordlist is
-> given, 4tail falls back to `…/Discovery/Web-Content/common.txt`.
+> If yours is elsewhere, set `SECLISTS_DIR=/path/to/SecLists`.
+
+#### Base "juicy" list: Bo0oM/fuzz.txt
+
+The base list (used for **every** host) defaults to [Bo0oM/fuzz.txt](https://github.com/Bo0oM/fuzz.txt)
+if found — a hand-curated "quick win" list of *potentially dangerous files*: dotfiles
+(`.git/config`, `.env`, `.bash_history`), backups, config leaks, cloud creds
+(`.aws/credentials`), and path-traversal / WAF-bypass payloads (`%2e%2e//`, `..;/`,
+`%c0%ae`). 4tail auto-detects it at common paths (including
+`/root/Desktop/bugs/tools/fuzz.txt/fuzz.txt`, `~/tools/fuzz.txt/fuzz.txt`, …), and if a
+sibling `api-endpoints.txt` is present it's added for API/GraphQL/Swagger hosts. If none
+is found it falls back to SecLists `common.txt`. Resolution order: `-w` / `WORDLIST` →
+Bo0oM `fuzz.txt` locations → (optional `FETCH_FUZZTXT=1` download) → SecLists `common.txt`.
+
+#### Tech-aware extension fuzzing (from fuzz.txt's extensions.txt)
+
+Bo0oM's `extensions.txt` (juicy suffixes like `.bak .old .zip .sql .conf .swp`) is the
+key to finding files like `config.php.bak` or `web.config.old`. 4tail turns this into
+**per-host `ffuf -e` extension sets**: the highest-signal **tech extensions first**
+(so they survive the cap), then generic juicy ones:
+
+| Detected tech | Extensions appended (before generic juicy) |
+|---|---|
+| PHP | `.php .phtml .phps` |
+| IIS / ASP / ASP.NET | `.aspx .asp .ashx .config .cs` |
+| Java / JSP / Tomcat / Spring / Struts | `.jsp .jspx .war .properties .class` |
+| ColdFusion | `.cfm .cfc` |
+| Python / Django / Flask | `.py .pyc` |
+| Ruby / Rails | `.rb .erb` |
+| Node / Express | `.js .map .env` |
+| Perl | `.pl .cgi` |
+| *(every host also gets)* | `.bak .old .zip .sql .conf .config .txt .log …` |
+
+Tune with `EXTENSIONS` (explicit list, overrides tech logic), `MAX_EXTS` (cap, default 10 —
+each extension multiplies requests), and `FFUF_RATE` (req/sec).
 
 #### Built-in tech → SecLists wordlist map (paths verified against SecLists)
 
@@ -206,9 +239,13 @@ cat 4tail_example.com_*/report.md
 
 ### Scan tuning env vars
 
-- `WORDLIST` — base "juicy" wordlist, always used for every host.
+- `WORDLIST` — base "juicy" wordlist (auto-resolves to Bo0oM/fuzz.txt if unset).
+- `FETCH_FUZZTXT=1` — download Bo0oM/fuzz.txt to `~/.4tail/` if no base list is found.
 - `SECLISTS_DIR` — SecLists root (auto-detected if unset) used for tech-specific lists.
 - `MAX_FUZZ_WORDS` — cap on each host's combined wordlist size (default 60000).
+- `EXTENSIONS` — explicit ffuf `-e` list, overrides tech-aware extensions.
+- `MAX_EXTS` — cap on per-host extensions (default 10).
+- `FFUF_RATE` — ffuf requests/sec (0 = unlimited).
 - `NUCLEI_SEVERITY`, `NUCLEI_RATELIMIT`, `HTTPX_THREADS`, `OUTDIR`, `DEFAULT_NUCLEI_TAGS`.
 
 ## Output
