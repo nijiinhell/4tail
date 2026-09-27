@@ -52,7 +52,29 @@ the report.
 - **Content discovery** with Ffuf (configurable wordlist).
 - **Vulnerability scanning** with Nuclei (configurable severity + rate limit).
 - **AI triage report**: a prioritized `report.md` per run.
+- **Live terminal dashboard** that tracks every stage in real time (status icon,
+  live counts, elapsed time), with a plain-log fallback for pipes/CI.
 - All artifacts written to a timestamped results directory.
+
+## The live dashboard
+
+When run in a terminal, 4tail shows a self-updating panel instead of scrolling logs:
+
+```
+ ╭─ 4tail ───────────────────────────────────────
+ │ target=example.com  ai=zai-org/GLM-4.6  elapsed=41s
+ │  ✔  Subdomains    128 subs
+ │  ✔  Live hosts    37 live
+ │  ✔  AI scan plan  cves,exposures,wordpress,php,nginx
+ │  ⠹  Fuzzing       host 12/37
+ │  ○  Nuclei scan
+ │  ○  AI triage
+ ╰──────────────────────────────────────────────
+```
+
+Icons: `○` pending · spinner running · `✔` done · `▲` warning · `–` skipped.
+It auto-disables (falling back to plain `[*]/[+]/[!]` logs) when output isn't a
+terminal — e.g. piped to a file or run in CI. Force plain mode with `-P` or `NO_TUI=1`.
 
 ## Prerequisites
 
@@ -65,16 +87,54 @@ the report.
 - A [Together AI API key](https://api.together.xyz/) *(optional, enables the AI steps)* —
   or any other OpenAI-compatible endpoint.
 
+## Install on Linux
+
+```bash
+# 1. Get the code
+git clone https://github.com/nijiinhell/4tail.git
+cd 4tail
+chmod +x 4tail.sh
+
+# 2. Install the ProjectDiscovery tools (needs Go >= 1.21)
+go install -v github.com/projectdiscovery/subfinder/v2/cmd/subfinder@latest
+go install -v github.com/projectdiscovery/httpx/cmd/httpx@latest
+go install -v github.com/projectdiscovery/nuclei/v3/cmd/nuclei@latest
+go install -v github.com/ffuf/ffuf/v2@latest         # optional (fuzzing)
+export PATH="$PATH:$(go env GOPATH)/bin"             # add to ~/.bashrc to persist
+nuclei -update-templates                             # pull nuclei templates
+
+# 3. Small helpers used by the AI steps + a wordlist
+sudo apt install -y jq curl                          # Debian/Ubuntu
+sudo apt install -y seclists                         # or download a wordlist yourself
+
+# 4. (optional) an API key for the AI steps
+export TOGETHER_API_KEY="your-together-ai-key"
+```
+
+> The script checks its dependencies on startup and tells you exactly what's
+> missing, so you can install as you go. `subfinder`, `httpx`, `nuclei` are
+> required; `ffuf`, `jq`, `curl` and the API key are optional.
+
 ## Usage
 
 ```bash
-chmod +x 4tail.sh
+# Simplest run (you'll be asked to confirm authorization):
+./4tail.sh example.com
 
 # With AI decision-making + triage (Together AI + GLM by default):
-TOGETHER_API_KEY=... ./4tail.sh -w /path/to/wordlist.txt example.com
+TOGETHER_API_KEY=... ./4tail.sh -w /usr/share/seclists/Discovery/Web-Content/common.txt example.com
 
-# Without an API key (static defaults, no AI):
-./4tail.sh example.com
+# Skip the confirmation prompt, custom output dir, higher severities only:
+TOGETHER_API_KEY=... ./4tail.sh -y -o run1 -S critical,high example.com
+
+# Plain output (no live dashboard), e.g. when logging to a file:
+./4tail.sh -P example.com | tee run.log
+```
+
+When it finishes, open the report:
+
+```bash
+cat 4tail_example.com_*/report.md
 ```
 
 ### Options

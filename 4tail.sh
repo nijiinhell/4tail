@@ -5,12 +5,9 @@
 # Pipeline: subfinder -> httpx (tech detect) -> [AI plans the scan]
 #           -> ffuf (content discovery) -> nuclei -> [AI triages findings].
 #
-# The AI steps use any OpenAI-compatible endpoint. Defaults target Together AI
-# with a low-cost GLM model, and are tuned to keep token spend small:
-#   * inputs are AGGREGATED (tech frequency brief) instead of raw host dumps,
-#     so cost stays roughly flat no matter how big the target is;
-#   * outputs are capped with a small max_tokens;
-#   * AI is skipped entirely when there's nothing useful to reason about.
+# Features a LIVE terminal dashboard that tracks each stage in real time.
+# The AI steps use any OpenAI-compatible endpoint (defaults: Together AI + GLM),
+# tuned to keep token spend small.
 #
 # USE ONLY against targets you are explicitly authorised to test.
 
@@ -20,38 +17,35 @@ set -o pipefail
 # ---------------------------------------------------------------------------
 # LLM configuration (OpenAI-compatible; defaults = Together AI + cheap GLM)
 # ---------------------------------------------------------------------------
-# API key: TOGETHER_API_KEY preferred, LLM_API_KEY accepted as an alias.
 LLM_API_KEY="${TOGETHER_API_KEY:-${LLM_API_KEY:-}}"
 LLM_BASE_URL="${LLM_BASE_URL:-https://api.together.xyz/v1}"
-# Cheap default. Override with LLM_MODEL / -m. Browse IDs at together.ai/models
-# (e.g. zai-org/GLM-4.6, zai-org/GLM-4.5-Air-FP8 for even lower cost).
 LLM_MODEL="${LLM_MODEL:-zai-org/GLM-4.6}"
-LLM_MAX_TOKENS="${LLM_MAX_TOKENS:-1200}"   # small cap -> low output cost
+LLM_MAX_TOKENS="${LLM_MAX_TOKENS:-1200}"
 LLM_TEMPERATURE="${LLM_TEMPERATURE:-0.2}"
 LLM_TIMEOUT="${LLM_TIMEOUT:-90}"
 LLM_RETRIES="${LLM_RETRIES:-2}"
 
 # ---------------------------------------------------------------------------
-# Scan configuration (override via environment or flags)
+# Scan configuration
 # ---------------------------------------------------------------------------
 WORDLIST="${WORDLIST:-/usr/share/seclists/Discovery/Web-Content/common.txt}"
 DEFAULT_NUCLEI_TAGS="${DEFAULT_NUCLEI_TAGS:-cves,exposures,misconfiguration,tech,default-login,takeover}"
 NUCLEI_SEVERITY="${NUCLEI_SEVERITY:-critical,high,medium,low}"
-NUCLEI_RATELIMIT="${NUCLEI_RATELIMIT:-150}"   # requests/sec, be a good citizen
+NUCLEI_RATELIMIT="${NUCLEI_RATELIMIT:-150}"
 HTTPX_THREADS="${HTTPX_THREADS:-50}"
 OUTDIR="${OUTDIR:-}"
 ASSUME_YES="${ASSUME_YES:-0}"
+NO_TUI="${NO_TUI:-0}"
 
 # ---------------------------------------------------------------------------
-# Output helpers
+# Colors / plain-log helpers (used in non-TUI mode)
 # ---------------------------------------------------------------------------
 c_reset=$'\033[0m'; c_blue=$'\033[1;34m'; c_green=$'\033[1;32m'
-c_yellow=$'\033[1;33m'; c_red=$'\033[1;31m'; c_dim=$'\033[2m'
+c_yellow=$'\033[1;33m'; c_red=$'\033[1;31m'; c_dim=$'\033[2m'; c_cyan=$'\033[1;36m'
 log()  { printf '%s[*]%s %s\n' "$c_blue"   "$c_reset" "$*"; }
 ok()   { printf '%s[+]%s %s\n' "$c_green"  "$c_reset" "$*"; }
 warn() { printf '%s[!]%s %s\n' "$c_yellow" "$c_reset" "$*" >&2; }
 err()  { printf '%s[x]%s %s\n' "$c_red"    "$c_reset" "$*" >&2; }
-ai()   { printf '%s[ai]%s %s\n' "$c_yellow" "$c_reset" "$*"; }
 
 usage() {
   cat <<EOF
@@ -66,6 +60,7 @@ Options:
   -S <sev>    Nuclei severities              (env NUCLEI_SEVERITY, default $NUCLEI_SEVERITY)
   -m <model>  LLM model id                   (env LLM_MODEL, default $LLM_MODEL)
   -y          Skip the authorization prompt  (env ASSUME_YES=1)
+  -P          Plain output, no live dashboard(env NO_TUI=1)
   -h          Show this help
 
 LLM (OpenAI-compatible, defaults to Together AI + GLM):
@@ -82,7 +77,7 @@ EOF
 # ---------------------------------------------------------------------------
 # Argument parsing
 # ---------------------------------------------------------------------------
-while getopts ":w:o:t:S:m:yh" opt; do
+while getopts ":w:o:t:S:m:yPh" opt; do
   case "$opt" in
     w) WORDLIST="$OPTARG" ;;
     o) OUTDIR="$OPTARG" ;;
@@ -90,6 +85,7 @@ while getopts ":w:o:t:S:m:yh" opt; do
     S) NUCLEI_SEVERITY="$OPTARG" ;;
     m) LLM_MODEL="$OPTARG" ;;
     y) ASSUME_YES=1 ;;
+    P) NO_TUI=1 ;;
     h) usage; exit 0 ;;
     \?) err "Unknown option: -$OPTARG"; usage; exit 1 ;;
     :)  err "Option -$OPTARG requires an argument"; exit 1 ;;
@@ -99,10 +95,8 @@ shift $((OPTIND - 1))
 
 domain="${1:-}"
 if [ -z "$domain" ]; then err "No target domain provided."; usage; exit 1; fi
-# Basic sanity check on the domain to avoid accidental garbage/URLs.
 if ! printf '%s' "$domain" | grep -qE '^[A-Za-z0-9._-]+\.[A-Za-z]{2,}$'; then
-  err "That doesn't look like a bare domain (got: '$domain'). Use e.g. example.com"
-  exit 1
+  err "That doesn't look like a bare domain (got: '$domain'). Use e.g. example.com"; exit 1
 fi
 
 # ---------------------------------------------------------------------------
@@ -118,11 +112,9 @@ have ffuf || warn "ffuf not found - content-discovery step will be skipped."
 
 AI_ENABLED=1
 if [ -z "$LLM_API_KEY" ]; then
-  warn "No API key (TOGETHER_API_KEY) - AI steps disabled, using static defaults."
-  AI_ENABLED=0
+  warn "No API key (TOGETHER_API_KEY) - AI steps disabled, using static defaults."; AI_ENABLED=0
 elif ! have curl || ! have jq; then
-  warn "curl and jq are required for AI steps - disabling AI, using defaults."
-  AI_ENABLED=0
+  warn "curl and jq are required for AI steps - disabling AI, using defaults."; AI_ENABLED=0
 fi
 
 # ---------------------------------------------------------------------------
@@ -147,90 +139,154 @@ tech_brief="$OUTDIR/tech_brief.txt"
 fuzz_dir="$OUTDIR/fuzz"; mkdir -p "$fuzz_dir"
 nuclei_file="$OUTDIR/nuclei.txt"
 report_file="$OUTDIR/report.md"
-log "Results -> $OUTDIR"
+llm_log="$OUTDIR/llm.log"
+
+# ===========================================================================
+# LIVE TERMINAL DASHBOARD
+# ===========================================================================
+if [ -t 1 ] && [ "$NO_TUI" != "1" ]; then TUI=1; else TUI=0; fi
+
+# Stages: label + state + detail. States: pending|running|done|warn|skip
+ST_LABEL=("Subdomains" "Live hosts" "AI scan plan" "Fuzzing" "Nuclei scan" "AI triage")
+ST_STATE=(pending pending pending pending pending pending)
+ST_DETAIL=("" "" "" "" "" "")
+PANEL_LINES=$(( ${#ST_LABEL[@]} + 3 ))   # top border + info + stages + bottom border
+panel_drawn=0
+SPIN='|/-\'; spin_i=0
+started=$SECONDS
+
+icon() {
+  case "$1" in
+    pending) printf '%s○%s' "$c_dim" "$c_reset" ;;
+    running) printf '%s%s%s' "$c_yellow" "${SPIN:spin_i:1}" "$c_reset" ;;
+    done)    printf '%s✔%s' "$c_green" "$c_reset" ;;
+    warn)    printf '%s▲%s' "$c_yellow" "$c_reset" ;;
+    skip)    printf '%s–%s' "$c_dim" "$c_reset" ;;
+    *)       printf ' ' ;;
+  esac
+}
+
+render() {
+  [ "$TUI" = 1 ] || return 0
+  spin_i=$(( (spin_i + 1) & 3 ))
+  [ "$panel_drawn" = 1 ] && printf '\033[%dA' "$PANEL_LINES"
+  local model_line="off"; [ "$AI_ENABLED" = 1 ] && model_line="$LLM_MODEL"
+  printf ' %s╭─ 4tail ───────────────────────────────────────%s\033[K\n' "$c_cyan" "$c_reset"
+  printf ' %s│%s target=%s  ai=%s  elapsed=%ss\033[K\n' "$c_cyan" "$c_reset" "$domain" "$model_line" "$((SECONDS-started))"
+  local i
+  for i in "${!ST_LABEL[@]}"; do
+    printf ' %s│%s  %s  %-13s %s%s%s\033[K\n' \
+      "$c_cyan" "$c_reset" "$(icon "${ST_STATE[$i]}")" "${ST_LABEL[$i]}" \
+      "$c_dim" "${ST_DETAIL[$i]:-}" "$c_reset"
+  done
+  printf ' %s╰──────────────────────────────────────────────%s\033[K\n' "$c_cyan" "$c_reset"
+  panel_drawn=1
+}
+
+set_stage() { ST_STATE[$1]="$2"; [ -n "${3+x}" ] && ST_DETAIL[$1]="$3"; render; }
+
+cleanup() { [ "$TUI" = 1 ] && printf '\033[?25h\n'; }   # restore cursor
+trap cleanup EXIT
+trap 'cleanup; err "interrupted"; exit 130' INT TERM
+
+# Run a command in the background, live-updating a stage from a growing file.
+#   run_stage <idx> <count_file|""> <suffix> <cmd...>
+run_stage() {
+  local idx="$1" cfile="$2" suffix="$3"; shift 3
+  set_stage "$idx" running "0${suffix} · 0s"
+  if [ "$TUI" = 1 ]; then
+    ( "$@" ) >/dev/null 2>>"$llm_log" & local pid=$!
+    local s=$SECONDS n
+    while kill -0 "$pid" 2>/dev/null; do
+      n=0; [ -n "$cfile" ] && [ -f "$cfile" ] && n=$(wc -l < "$cfile" 2>/dev/null || echo 0)
+      ST_DETAIL[$idx]="${n}${suffix} · $((SECONDS-s))s"; render; sleep 0.25
+    done
+    wait "$pid"; return $?
+  else
+    log "${ST_LABEL[$idx]} ..."; ( "$@" ) >/dev/null 2>>"$llm_log"; return $?
+  fi
+}
 
 # ---------------------------------------------------------------------------
-# LLM helper: ai_call <system> <user>  -> prints model text, or fails.
-# OpenAI-compatible chat/completions with retry + backoff. Cost-conscious:
-# low max_tokens, low temperature. Never logs the API key.
+# LLM helper: ai_call <system> <user> -> prints text; retry+backoff; frugal.
 # ---------------------------------------------------------------------------
 ai_call() {
   local system="$1" user="$2" payload response text attempt=0 delay=2
-  payload="$(jq -n \
-    --arg model "$LLM_MODEL" --arg sys "$system" --arg usr "$user" \
+  payload="$(jq -n --arg model "$LLM_MODEL" --arg sys "$system" --arg usr "$user" \
     --argjson max "$LLM_MAX_TOKENS" --argjson temp "$LLM_TEMPERATURE" \
     '{model:$model, max_tokens:$max, temperature:$temp,
       messages:[{role:"system",content:$sys},{role:"user",content:$usr}]}')" || return 1
-
   while :; do
     attempt=$((attempt + 1))
     response="$(curl -sS --max-time "$LLM_TIMEOUT" "$LLM_BASE_URL/chat/completions" \
-      -H "content-type: application/json" \
-      -H "authorization: Bearer $LLM_API_KEY" \
+      -H "content-type: application/json" -H "authorization: Bearer $LLM_API_KEY" \
       -d "$payload" 2>/dev/null)"
-
     if [ -n "$response" ] && ! echo "$response" | jq -e '.error' >/dev/null 2>&1; then
       text="$(echo "$response" | jq -r '.choices[0].message.content // empty' 2>/dev/null)"
       if [ -n "$text" ]; then printf '%s' "$text"; return 0; fi
     fi
-
     if [ "$attempt" -gt "$LLM_RETRIES" ]; then
-      local msg; msg="$(echo "$response" | jq -r '.error.message // .error // "no/empty response"' 2>/dev/null)"
-      warn "LLM call failed after $attempt attempts: ${msg:-unknown}"
+      echo "LLM error: $(echo "$response" | jq -r '.error.message // .error // "empty response"' 2>/dev/null)" >>"$llm_log"
       return 1
     fi
     sleep "$delay"; delay=$((delay * 2))
   done
 }
 
-# ---------------------------------------------------------------------------
-# Step 1: Subdomain enumeration
-# ---------------------------------------------------------------------------
-log "Enumerating subdomains for $domain ..."
-subfinder -silent -d "$domain" -o "$subdomains_file" 2>/dev/null || warn "subfinder error."
-sub_count=$(wc -l < "$subdomains_file" 2>/dev/null || echo 0)
-ok "Subdomains: $sub_count"
-[ "$sub_count" -eq 0 ] && { warn "No subdomains; stopping."; exit 0; }
-
-# ---------------------------------------------------------------------------
-# Step 2: Live-host probing + tech detection
-# ---------------------------------------------------------------------------
-log "Probing live hosts + detecting tech (httpx) ..."
-httpx -silent -json -tech-detect -status-code -title -web-server \
-      -threads "$HTTPX_THREADS" -l "$subdomains_file" -o "$httpx_json" 2>/dev/null \
-      || warn "httpx error."
-if [ -s "$httpx_json" ]; then
-  jq -r '.url' "$httpx_json" 2>/dev/null | sort -u > "$alive_file"
-else
-  : > "$alive_file"
-fi
-alive_count=$(wc -l < "$alive_file" 2>/dev/null || echo 0)
-ok "Live hosts: $alive_count"
-[ "$alive_count" -eq 0 ] && { warn "No live hosts; stopping."; exit 0; }
-
-# Cost-frugal AGGREGATE brief: technology + server + status frequencies.
-# This is what we feed the AI (small & bounded), NOT the raw host list.
-build_tech_brief() {
-  {
-    echo "== technologies (count) =="
-    jq -r '(.tech // [])[]' "$httpx_json" 2>/dev/null | sort | uniq -c | sort -rn | head -40
-    echo "== web servers (count) =="
-    jq -r '.webserver // empty' "$httpx_json" 2>/dev/null | sort | uniq -c | sort -rn | head -15
-    echo "== status codes (count) =="
-    jq -r '.status_code // empty' "$httpx_json" 2>/dev/null | sort | uniq -c | sort -rn
-    echo "== notable hosts (admin/login/api/dev) =="
-    jq -r '.url' "$httpx_json" 2>/dev/null \
-      | grep -iE 'admin|login|portal|api|dev|staging|test|git|jenkins|grafana|kibana|vpn' \
-      | sort -u | head -25
-  } > "$tech_brief"
+# Background an AI call while spinning the given stage; result -> outfile.
+run_ai_stage() {
+  local idx="$1" sys="$2" usr="$3" outfile="$4"
+  set_stage "$idx" running "querying ${LLM_MODEL##*/} · 0s"
+  ( ai_call "$sys" "$usr" >"$outfile" 2>>"$llm_log" ) & local pid=$!
+  local s=$SECONDS
+  while kill -0 "$pid" 2>/dev/null; do
+    ST_DETAIL[$idx]="querying ${LLM_MODEL##*/} · $((SECONDS-s))s"
+    [ "$TUI" = 1 ] && render; sleep 0.25
+  done
+  wait "$pid"; return $?
 }
-if [ -s "$httpx_json" ]; then build_tech_brief; else cp "$alive_file" "$tech_brief"; fi
 
-# ---------------------------------------------------------------------------
-# Step 3: AI plans the scan (chooses nuclei tags from the tech brief)
-# Guardrail: intersect the AI's tags with a known allowlist so a hallucinated
-# tag can't silently make nuclei scan nothing. Fall back to defaults if needed.
-# ---------------------------------------------------------------------------
+[ "$TUI" = 1 ] && { printf '\033[?25l'; render; }   # hide cursor + first paint
+
+# ===========================================================================
+# PIPELINE
+# ===========================================================================
+
+# Step 1: Subdomains
+run_stage 0 "$subdomains_file" " subs" subfinder -silent -d "$domain" -o "$subdomains_file"
+sub_count=$(wc -l < "$subdomains_file" 2>/dev/null || echo 0)
+if [ "$sub_count" -eq 0 ]; then
+  set_stage 0 warn "none found"; [ "$TUI" = 1 ] || warn "No subdomains; stopping."; exit 0
+fi
+set_stage 0 done "$sub_count subs"
+
+# Step 2: Live hosts + tech detection
+run_stage 1 "$httpx_json" " live" \
+  httpx -silent -json -tech-detect -status-code -title -web-server \
+        -threads "$HTTPX_THREADS" -l "$subdomains_file" -o "$httpx_json"
+if [ -s "$httpx_json" ]; then jq -r '.url' "$httpx_json" 2>/dev/null | sort -u > "$alive_file"; else : > "$alive_file"; fi
+alive_count=$(wc -l < "$alive_file" 2>/dev/null || echo 0)
+if [ "$alive_count" -eq 0 ]; then
+  set_stage 1 warn "none live"; [ "$TUI" = 1 ] || warn "No live hosts; stopping."; exit 0
+fi
+set_stage 1 done "$alive_count live"
+
+# Aggregated, cost-frugal brief for the AI
+{
+  echo "== technologies (count) =="
+  jq -r '(.tech // [])[]' "$httpx_json" 2>/dev/null | sort | uniq -c | sort -rn | head -40
+  echo "== web servers (count) =="
+  jq -r '.webserver // empty' "$httpx_json" 2>/dev/null | sort | uniq -c | sort -rn | head -15
+  echo "== status codes (count) =="
+  jq -r '.status_code // empty' "$httpx_json" 2>/dev/null | sort | uniq -c | sort -rn
+  echo "== notable hosts =="
+  jq -r '.url' "$httpx_json" 2>/dev/null \
+    | grep -iE 'admin|login|portal|api|dev|staging|test|git|jenkins|grafana|kibana|vpn' \
+    | sort -u | head -25
+} > "$tech_brief" 2>/dev/null
+[ -s "$tech_brief" ] || cp "$alive_file" "$tech_brief"
+
+# Step 3: AI scan plan (with allowlist guardrail)
 NUCLEI_TAG_ALLOWLIST="cves,cve,exposures,exposure,misconfiguration,misconfig,tech,\
 default-login,takeover,subdomain-takeover,panel,login,exposed-panels,config,\
 backup,files,logs,debug,git,svn,env,sqli,xss,ssrf,lfi,rce,injection,auth-bypass,\
@@ -238,126 +294,112 @@ wordpress,wp-plugin,joomla,drupal,magento,laravel,django,spring,struts,\
 apache,nginx,tomcat,iis,php,jira,confluence,jenkins,gitlab,grafana,kibana,\
 elasticsearch,kubernetes,docker,aws,azure,gcp,ssl,tls,cors,headers,\
 oauth,jwt,api,graphql,swagger,firebase,s3,redis,mongodb,mysql,postgres"
-
 sanitize_tags() {
-  # stdin: comma/space separated tags -> stdout: allowlisted, deduped, comma list
   tr ',[:space:]' '\n\n' | tr 'A-Z' 'a-z' | grep -oE '[a-z0-9._-]+' \
     | while read -r t; do
         case ",${NUCLEI_TAG_ALLOWLIST//[[:space:]]/}," in *",$t,"*) echo "$t";; esac
       done | awk '!seen[$0]++' | paste -sd, -
 }
-
 nuclei_tags="$DEFAULT_NUCLEI_TAGS"
 if [ "$AI_ENABLED" = "1" ] && [ -s "$tech_brief" ]; then
-  ai "Planning scan with $LLM_MODEL (choosing nuclei tags from detected tech) ..."
   sys_plan='You assist AUTHORIZED bug-bounty recon. Given an aggregated brief of the
-technologies, servers and notable paths observed on live hosts, choose the most
-relevant nuclei tags to scan with. Reply with ONLY a single comma-separated list of
-lowercase nuclei tags (4-12 tags), no prose, no code fences. Always include high-value
-general tags (cves, exposures, misconfiguration) plus tags matched to the observed stack.'
-  raw_plan="$(ai_call "$sys_plan" "Target: $domain
+technologies, servers and notable paths on live hosts, choose the most relevant nuclei
+tags to scan with. Reply with ONLY a single comma-separated list of lowercase nuclei tags
+(4-12 tags), no prose, no code fences. Always include cves, exposures and misconfiguration
+plus tags matched to the observed stack.'
+  plan_out="$(mktemp)"
+  run_ai_stage 2 "$sys_plan" "Target: $domain
 Live hosts: $alive_count
 
-$(head -c 6000 "$tech_brief")")" || raw_plan=""
-
-  clean_plan="$(printf '%s' "$raw_plan" | sanitize_tags)"
-  # require at least 2 allowlisted tags, else keep defaults
+$(head -c 6000 "$tech_brief")" "$plan_out"
+  clean_plan="$(sanitize_tags < "$plan_out")"; rm -f "$plan_out"
   if [ -n "$clean_plan" ] && [ "$(printf '%s' "$clean_plan" | tr ',' '\n' | grep -c .)" -ge 2 ]; then
-    nuclei_tags="$clean_plan"
-    ok "AI-selected tags: $nuclei_tags"
-    printf '%s\n' "$nuclei_tags" > "$OUTDIR/ai_scan_plan.txt"
+    nuclei_tags="$clean_plan"; printf '%s\n' "$nuclei_tags" > "$OUTDIR/ai_scan_plan.txt"
+    set_stage 2 done "$nuclei_tags"
   else
-    warn "AI plan unusable; using defaults: $nuclei_tags"
+    set_stage 2 warn "unusable, using defaults"
   fi
 else
-  log "Nuclei tags (default): $nuclei_tags"
+  set_stage 2 skip "AI off (defaults)"
 fi
 
-# ---------------------------------------------------------------------------
-# Step 4: Content discovery (ffuf) - optional
-# ---------------------------------------------------------------------------
-if have ffuf; then
-  if [ -f "$WORDLIST" ]; then
-    log "Content discovery with ffuf (wordlist: $WORDLIST) ..."
-    idx=0
-    while read -r url; do
-      [ -z "$url" ] && continue
-      idx=$((idx + 1))
-      safe="$(printf '%s' "$url" | tr -c 'A-Za-z0-9._-' '_')"
-      printf '%s    fuzzing %s%s\n' "$c_dim" "$url" "$c_reset"
-      ffuf -u "$url/FUZZ" -w "$WORDLIST" -mc 200,204,301,302,307,401,403 \
-           -of json -o "$fuzz_dir/${idx}_${safe}.json" -s 2>/dev/null \
-           || warn "ffuf failed for $url"
-    done < "$alive_file"
-    ok "Fuzzing results -> $fuzz_dir"
-  else
-    warn "Wordlist not found ($WORDLIST) - skipping fuzzing. Set -w / WORDLIST."
-  fi
+# Step 4: Fuzzing
+if have ffuf && [ -f "$WORDLIST" ]; then
+  set_stage 3 running "0/$alive_count hosts"
+  idx=0
+  while read -r url; do
+    [ -z "$url" ] && continue
+    idx=$((idx + 1))
+    safe="$(printf '%s' "$url" | tr -c 'A-Za-z0-9._-' '_')"
+    ST_DETAIL[3]="host $idx/$alive_count"; render
+    ffuf -u "$url/FUZZ" -w "$WORDLIST" -mc 200,204,301,302,307,401,403 \
+         -of json -o "$fuzz_dir/${idx}_${safe}.json" -s >/dev/null 2>>"$llm_log" || true
+  done < "$alive_file"
+  set_stage 3 done "$idx hosts"
+elif ! have ffuf; then
+  set_stage 3 skip "ffuf not installed"
+else
+  set_stage 3 skip "wordlist missing"
 fi
 
-# ---------------------------------------------------------------------------
-# Step 5: Vulnerability scanning (nuclei)
-# ---------------------------------------------------------------------------
-log "Scanning with nuclei (tags: $nuclei_tags | severity: $NUCLEI_SEVERITY) ..."
-nuclei -silent -tags "$nuclei_tags" -severity "$NUCLEI_SEVERITY" \
-       -rate-limit "$NUCLEI_RATELIMIT" -l "$alive_file" -o "$nuclei_file" 2>/dev/null \
-       || warn "nuclei error."
+# Step 5: Nuclei
+run_stage 4 "$nuclei_file" " hits" \
+  nuclei -silent -tags "$nuclei_tags" -severity "$NUCLEI_SEVERITY" \
+         -rate-limit "$NUCLEI_RATELIMIT" -l "$alive_file" -o "$nuclei_file"
 find_count=$(wc -l < "$nuclei_file" 2>/dev/null || echo 0)
-ok "Nuclei findings: $find_count"
+set_stage 4 done "$find_count findings"
 
-# ---------------------------------------------------------------------------
-# Step 6: AI triage -> prioritised report
-# Cost technique: pre-sort findings by severity and cap what we send.
-# ---------------------------------------------------------------------------
+# Report header
 {
-  echo "# 4tail recon report"
-  echo
+  echo "# 4tail recon report"; echo
   echo "- **Target:** \`$domain\`"
   echo "- **Generated:** $(date -u '+%Y-%m-%d %H:%M UTC')"
   echo "- **Subdomains:** $sub_count | **Live:** $alive_count | **Findings:** $find_count"
   echo "- **Nuclei tags:** \`$nuclei_tags\` | **Severity:** \`$NUCLEI_SEVERITY\`"
-  echo "- **AI model:** $([ "$AI_ENABLED" = 1 ] && echo "$LLM_MODEL" || echo "disabled")"
-  echo
+  echo "- **AI model:** $([ "$AI_ENABLED" = 1 ] && echo "$LLM_MODEL" || echo "disabled")"; echo
 } > "$report_file"
 
+# Step 6: AI triage
 if [ "$AI_ENABLED" = "1" ] && [ "$find_count" -gt 0 ]; then
-  ai "Triaging findings with $LLM_MODEL ..."
-  # severity-sorted, capped subset (keeps tokens - and cost - bounded)
   sorted_findings="$(
     for sev in critical high medium low info; do grep -iE "\[$sev\]" "$nuclei_file"; done
     grep -viE '\[(critical|high|medium|low|info)\]' "$nuclei_file"
   )"
   [ -z "$sorted_findings" ] && sorted_findings="$(cat "$nuclei_file")"
-
   sys_triage='You are a senior security analyst on an AUTHORIZED bug-bounty engagement.
 Given a technology brief and severity-sorted nuclei output, produce a concise report in
 GitHub-flavored Markdown with exactly these sections:
 "## Executive summary" (2-4 sentences),
 "## Prioritised findings" (a table: Severity | Host | Issue | Why it matters | Next step),
 "## Recommended manual follow-ups" (short bullet list).
-Use ONLY the provided data - do not invent findings. Be specific and practical.'
-  triage="$(ai_call "$sys_triage" "Target: $domain
+Use ONLY the provided data - do not invent findings.'
+  triage_out="$(mktemp)"
+  run_ai_stage 5 "$sys_triage" "Target: $domain
 
 === technology brief ===
 $(head -c 4000 "$tech_brief")
 
 === findings (severity-sorted) ===
-$(printf '%s\n' "$sorted_findings" | head -n 120 | head -c 14000)")" || triage=""
-
-  if [ -n "$triage" ]; then
-    printf '%s\n' "$triage" >> "$report_file"
-    ok "AI triage written."
+$(printf '%s\n' "$sorted_findings" | head -n 120 | head -c 14000)" "$triage_out"
+  if [ -s "$triage_out" ]; then
+    cat "$triage_out" >> "$report_file"; set_stage 5 done "report.md written"
   else
-    warn "AI triage failed; appending raw findings."
     { echo "## Raw findings"; echo '```'; cat "$nuclei_file"; echo '```'; } >> "$report_file"
+    set_stage 5 warn "AI failed, raw findings saved"
   fi
+  rm -f "$triage_out"
 else
   {
     echo "## Findings"
-    if [ "$find_count" -gt 0 ]; then echo '```'; cat "$nuclei_file"; echo '```'
-    else echo "_No nuclei findings._"; fi
+    if [ "$find_count" -gt 0 ]; then echo '```'; cat "$nuclei_file"; echo '```'; else echo "_No nuclei findings._"; fi
   } >> "$report_file"
+  set_stage 5 skip "$([ "$AI_ENABLED" = 1 ] && echo "no findings" || echo "AI off")"
 fi
 
-echo
-ok "Done. Report: $report_file"
+# Final summary
+if [ "$TUI" = 1 ]; then
+  render
+  printf '\n %s✔ done in %ss%s  →  %s%s%s\n' "$c_green" "$((SECONDS-started))" "$c_reset" "$c_cyan" "$report_file" "$c_reset"
+else
+  ok "Done in $((SECONDS-started))s. Report: $report_file"
+fi
