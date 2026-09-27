@@ -22,15 +22,15 @@ LLM_API_KEY="${TOGETHER_API_KEY:-${LLM_API_KEY:-}}"
 LLM_API_KEY="$(printf '%s' "$LLM_API_KEY" | tr -d '[:space:]')"
 LLM_BASE_URL="${LLM_BASE_URL:-https://api.together.xyz/v1}"
 LLM_MODEL="${LLM_MODEL:-zai-org/GLM-5.3}"   # base default for every role
-LLM_MAX_TOKENS="${LLM_MAX_TOKENS:-2000}"    # generous default (see budget below)
+LLM_MAX_TOKENS="${LLM_MAX_TOKENS:-4000}"    # reasoning models spend tokens thinking; leave room for real output
 LLM_TEMPERATURE="${LLM_TEMPERATURE:-0.2}"
-LLM_TIMEOUT="${LLM_TIMEOUT:-120}"
+LLM_TIMEOUT="${LLM_TIMEOUT:-300}"
 LLM_RETRIES="${LLM_RETRIES:-2}"
 
 # --- Smart model routing (per-task "swarm"-style switching) -----------------
 LLM_MODEL_PLAN="${LLM_MODEL_PLAN:-}"        # scan planner; default = LLM_MODEL
 LLM_MODEL_TRIAGE="${LLM_MODEL_TRIAGE:-}"    # findings analyst; default = LLM_MODEL
-LLM_MAX_TOKENS_PLAN="${LLM_MAX_TOKENS_PLAN:-2000}"   # headroom for reasoning models (GLM/DeepSeek think first)
+LLM_MAX_TOKENS_PLAN="${LLM_MAX_TOKENS_PLAN:-4000}"   # headroom for reasoning models (GLM/DeepSeek think first)
 LLM_MAX_TOKENS_TRIAGE="${LLM_MAX_TOKENS_TRIAGE:-}"  # default = LLM_MAX_TOKENS
 LLM_FALLBACK_MODELS="${LLM_FALLBACK_MODELS:-}"       # tried in order if primary fails
 
@@ -380,7 +380,13 @@ ai_call() {
         echo "[fail] model=$m http=${http_code:-?}: $(echo "$response" | jq -r '.error.message // .error' 2>/dev/null)" >>"$llm_log"
       fi
       if [ "$curl_rc" = 0 ] && [ -n "$response" ] && ! echo "$response" | jq -e '.error' >/dev/null 2>&1; then
+        # Reasoning models (GLM/DeepSeek) may leave .content empty and put text in
+        # .reasoning_content, especially if truncated (finish_reason=length).
         text="$(echo "$response" | jq -r '.choices[0].message.content // empty' 2>/dev/null)"
+        [ -z "$text" ] && text="$(echo "$response" | jq -r '.choices[0].message.reasoning_content // empty' 2>/dev/null)"
+        if [ -z "$text" ] && [ "$(echo "$response" | jq -r '.choices[0].finish_reason // empty' 2>/dev/null)" = "length" ]; then
+          echo "[warn] model=$m hit token limit with empty content - raise LLM_MAX_TOKENS_PLAN/TRIAGE" >>"$llm_log"
+        fi
         if [ -n "$text" ]; then
           # accrue estimated cost from token usage
           local uin uout ucost
