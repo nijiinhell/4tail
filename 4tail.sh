@@ -71,10 +71,12 @@ NUCLEI_SEVERITY="${NUCLEI_SEVERITY:-critical,high,medium,low}"
 NUCLEI_RATELIMIT="${NUCLEI_RATELIMIT:-150}"
 NUCLEI_TIMEOUT="${NUCLEI_TIMEOUT:-8}"    # per-request timeout (s) - stops hanging on dead/slow hosts
 NUCLEI_RETRIES="${NUCLEI_RETRIES:-1}"
-NUCLEI_MHE="${NUCLEI_MHE:-30}"           # skip a host after this many errors (dead CDN edges)
+NUCLEI_MHE="${NUCLEI_MHE:-15}"           # skip a host after this many errors (kills dead-host error spam)
 NUCLEI_MAX_TIME="${NUCLEI_MAX_TIME:-3600}"  # hard cap on the whole nuclei stage (s); 0 = unlimited
-NUCLEI_CONC="${NUCLEI_CONC:-60}"         # template concurrency (-c); higher = faster, more load
-NUCLEI_BULK="${NUCLEI_BULK:-40}"         # hosts scanned in parallel per template (-bulk-size)
+NUCLEI_CONC="${NUCLEI_CONC:-40}"         # template concurrency (-c); higher = faster, more load/errors
+NUCLEI_BULK="${NUCLEI_BULK:-25}"         # hosts scanned in parallel per template (-bulk-size)
+NUCLEI_DEDUPE="${NUCLEI_DEDUPE:-1}"      # 1 = scan one representative per origin+response signature
+NUCLEI_SKIP_CDN="${NUCLEI_SKIP_CDN:-0}"  # 1 = also drop CDN/WAF edges from nuclei (keeps takeover if 0)
 HTTPX_THREADS="${HTTPX_THREADS:-50}"
 OUTDIR="${OUTDIR:-}"
 RESUME="${RESUME:-0}"      # 1 = continue a previous run (reuse finished stages)
@@ -1014,6 +1016,29 @@ fi
 # Cap the tag count (the AI sometimes returns 30+ tags -> thousands of templates ->
 # hours of scanning). Keep the most relevant N.
 nuclei_tags="$(printf '%s' "$nuclei_tags" | tr ',' '\n' | awk 'NF' | head -n "$MAX_TAGS" | paste -sd, -)"
+
+# Build the nuclei target list: dedupe to one host per (origin, response signature) so we
+# don't scan hundreds of CDN duplicates / dead edges (huge cut in errors and time).
+nuclei_targets_file="$OUTDIR/nuclei_targets.txt"
+if [ "$NUCLEI_DEDUPE" = 1 ] && [ -s "$httpx_json" ]; then
+  jq -r '
+      ((.cname // (.a[0]? // .host)) | tostring) as $o
+      | [ .url,
+          ((.tech // []) | map(ascii_downcase) | join(",")),
+          ($o + "|" + (.status_code|tostring) + "|" + ((.content_length//0)|tostring) + "|" + (.title//"")) ]
+      | @tsv' "$httpx_json" 2>/dev/null \
+    | awk -F'\t' '!seen[$3]++ {print $1"\t"$2}' > "$OUTDIR/.nuclei_pick.tsv"
+  if [ "$NUCLEI_SKIP_CDN" = 1 ]; then
+    grep -viE "$CDN_RE" "$OUTDIR/.nuclei_pick.tsv" | cut -f1 > "$nuclei_targets_file"
+  else
+    cut -f1 "$OUTDIR/.nuclei_pick.tsv" > "$nuclei_targets_file"
+  fi
+  rm -f "$OUTDIR/.nuclei_pick.tsv"
+  [ -s "$nuclei_targets_file" ] || cp "$alive_file" "$nuclei_targets_file"
+else
+  cp "$alive_file" "$nuclei_targets_file"
+fi
+nuclei_target_count="$(wc -l <"$nuclei_targets_file" 2>/dev/null || echo 0)"
 if done_marker nuclei && [ -f "$nuclei_file" ]; then
   set_stage $S_NUCLEI done "$(wc -l <"$nuclei_file") findings (resumed)"
 else
@@ -1025,11 +1050,11 @@ else
               -rate-limit "$NUCLEI_RATELIMIT" -timeout "$NUCLEI_TIMEOUT"
               -retries "$NUCLEI_RETRIES" -mhe "$NUCLEI_MHE"
               -c "$NUCLEI_CONC" -bulk-size "$NUCLEI_BULK"
-              -l "$alive_file" -o "$nuclei_file")
+              -l "$nuclei_targets_file" -o "$nuclei_file")
   if [ "$NUCLEI_MAX_TIME" -gt 0 ] 2>/dev/null && have timeout; then
     nuclei_cmd=(timeout "${NUCLEI_MAX_TIME}s" "${nuclei_cmd[@]}")
   fi
-  set_stage $S_NUCLEI running "starting…"
+  set_stage $S_NUCLEI running "starting… ($nuclei_target_count hosts)"
   ( "${nuclei_cmd[@]}" >/dev/null 2>>"$nuclei_stats_file" ) & npid=$!
   ns=$SECONDS; last_sup=0; sup_pid=""; sup_out=""
   while kill -0 "$npid" 2>/dev/null; do
@@ -1086,7 +1111,7 @@ set_stage $S_NUCLEI done "$find_count findings$(done_marker nuclei && echo ' (re
   echo "- **Generated:** $(date -u '+%Y-%m-%d %H:%M UTC')"
   echo "- **Subdomains:** $sub_count | **Live:** $alive_count | **Findings:** $find_count"
   [ "$JSMINE" = 1 ] && echo "- **JS mined:** $(grep -c . "$js_urls_file" 2>/dev/null||echo 0) files, $(grep -c . "$js_secrets_file" 2>/dev/null||echo 0) secret hits, $(grep -c . "$params_file" 2>/dev/null||echo 0) params"
-  echo "- **Nuclei tags:** \`$nuclei_tags\` | **Severity:** \`$NUCLEI_SEVERITY\`"
+  echo "- **Nuclei:** ${nuclei_target_count:-$alive_count} hosts scanned (deduped from $alive_count) | tags \`$nuclei_tags\` | severity \`$NUCLEI_SEVERITY\`"
   echo "- **AI models:** $([ "$AI_ENABLED" = 1 ] && echo "plan=$LLM_MODEL_PLAN, triage=$LLM_MODEL_TRIAGE" || echo "disabled")"
   [ "$AI_ENABLED" = 1 ] && echo "- **Estimated AI spend:** $(cost_fmt)$([ "${LLM_BUDGET_USD:-0}" != 0 ] && echo " (budget \$$LLM_BUDGET_USD)")"
   echo "- **SecLists:** ${SECLISTS_DIR:-not found} | **Base wordlist:** \`$WORDLIST\`"; echo
