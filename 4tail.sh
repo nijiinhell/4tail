@@ -109,6 +109,15 @@ STALE_RANK="${STALE_RANK:-1}"            # 1 = compute a per-host "legacy" score
 OAST="${OAST:-0}"                        # 1 = start interactsh in the background + inject OOB payloads into redirect/SSRF params
 OAST_SERVER="${OAST_SERVER:-}"           # optional self-hosted interactsh server (-s); empty = public (oast.fun)
 OAST_MAX_INJECT="${OAST_MAX_INJECT:-40}" # cap URLs we inject an OOB payload into
+
+# --- Agent mode (autonomous AI validation loop) -----------------------------
+# The AI looks at the juicy findings and fires its own GET probes to confirm/escalate
+# them (read web.config via LFI, param-mine empty 200s, test redirects, walk IDOR ids),
+# sees the responses, and decides the next move - bounded so it never camps on one host.
+AGENT="${AGENT:-0}"                       # 1 = run the autonomous probe loop (-A)
+AGENT_ROUNDS="${AGENT_ROUNDS:-3}"         # max observe->decide->act rounds
+AGENT_MAX_PROBES="${AGENT_MAX_PROBES:-8}" # max GET probes the AI may fire per round
+AGENT_MAX_TIME="${AGENT_MAX_TIME:-240}"   # hard wall-clock cap (s) for the whole loop; 0 = unlimited
 DEFAULT_NUCLEI_TAGS="${DEFAULT_NUCLEI_TAGS:-cves,exposures,misconfiguration,tech,default-login,takeover}"
 MAX_TAGS="${MAX_TAGS:-15}"                # cap nuclei tags (more tags = far more templates = much slower)
 NUCLEI_SEVERITY="${NUCLEI_SEVERITY:-critical,high,medium,low}"
@@ -163,6 +172,7 @@ Options:
   -H <hdr>    Auth header, repeatable (e.g. -H "Authorization: Bearer X"); env AUTH_HEADER/AUTH_COOKIE
   -x <proxy>  Route tools through http(s) proxy (env PROXY)
   -O          OAST: start interactsh, inject OOB payloads, confirm blind SSRF/redirect (env OAST=1)
+  -A          Agent: autonomous AI probe loop - confirms/escalates juicy findings itself (env AGENT=1)
   -R          Resume: continue a previous run (env RESUME=1; use with -o <dir>)
   -b <usd>    LLM credit budget, e.g. 2      (env LLM_BUDGET_USD, 0=unlimited)
   -y          Skip the authorization prompt  (env ASSUME_YES=1)
@@ -187,7 +197,7 @@ EOF
 # `doctor` subcommand (before getopts, which doesn't parse bare words)
 if [ "${1:-}" = "doctor" ]; then DOCTOR=1; shift; fi
 
-while getopts ":w:o:t:S:m:M:p:b:B:H:x:ORqjCyPDh" opt; do
+while getopts ":w:o:t:S:m:M:p:b:B:H:x:OARqjCyPDh" opt; do
   case "$opt" in
     w) WORDLIST="$OPTARG" ;;
     o) OUTDIR="$OPTARG" ;;
@@ -202,6 +212,7 @@ while getopts ":w:o:t:S:m:M:p:b:B:H:x:ORqjCyPDh" opt; do
     H) AUTH_HEADER="${AUTH_HEADER:+$AUTH_HEADER$'\n'}$OPTARG" ;;
     x) PROXY="$OPTARG" ;;
     O) OAST=1 ;;
+    A) AGENT=1 ;;
     b) LLM_BUDGET_USD="$OPTARG" ;;
     R) RESUME=1 ;;
     q) SKIP_FUZZ=1 ;;
@@ -326,6 +337,8 @@ if [ "$DOCTOR" != 1 ]; then
   oast_log="$oast_dir/interactions.jsonl"          # raw interactsh interactions
   oast_map="$oast_dir/injected.tsv"                # marker<TAB>url we injected an OOB payload into
   oast_hits_file="$oast_dir/confirmed.txt"         # correlated: confirmed blind SSRF/redirect
+  agent_file="$OUTDIR/agent_confirmed.txt"         # agent loop: confirmed/escalated issues
+  agent_log="$OUTDIR/agent_log.txt"                # agent loop: full probe transcript
   findings_dir="$OUTDIR/findings"; mkdir -p "$findings_dir"  # per-specialist output
   cost_ledger="${LLM_COST_LEDGER:-$OUTDIR/.llm_cost_usd}"
   [ -f "$cost_ledger" ] || printf '0\n' > "$cost_ledger"
@@ -389,10 +402,10 @@ fi
 if [ -t 1 ] && [ "$NO_TUI" != "1" ]; then TUI=1; else TUI=0; fi
 
 # Stages (named indices so the order is easy to change).
-S_SUBS=0 S_LIVE=1 S_PLAN=2 S_FUZZ=3 S_JS=4 S_CRAWL=5 S_NUCLEI=6 S_TRIAGE=7
-ST_LABEL=("Subdomains" "Live hosts" "AI scan plan" "Fuzzing" "JS & params" "Active funnel" "Nuclei scan" "AI triage")
-ST_STATE=(pending pending pending pending pending pending pending pending)
-ST_DETAIL=("" "" "" "" "" "" "" "")
+S_SUBS=0 S_LIVE=1 S_PLAN=2 S_FUZZ=3 S_JS=4 S_CRAWL=5 S_NUCLEI=6 S_AGENT=7 S_TRIAGE=8
+ST_LABEL=("Subdomains" "Live hosts" "AI scan plan" "Fuzzing" "JS & params" "Active funnel" "Nuclei scan" "AI agent" "AI triage")
+ST_STATE=(pending pending pending pending pending pending pending pending pending)
+ST_DETAIL=("" "" "" "" "" "" "" "" "")
 SUP_NOTE=""                              # latest AI-supervisor status line
 # Loot feed state: a bounded in-memory history of findings ("sev\tsrc\ttext"),
 # plus a per-file cursor so each source file is only read for its new lines.
@@ -491,6 +504,7 @@ loot_refresh() {
   loot_scan "${js_secrets_file:-}"         js      secret
   loot_scan "${api_specs_file:-}"          api     apispec
   loot_scan "${oast_hits_file:-}"          oast    sqlmap
+  loot_scan "${agent_file:-}"              agent   sqlmap
 }
 
 # _draw_panel: emit the panel body at the current cursor position (no positioning).
@@ -1743,6 +1757,78 @@ fi
 find_count=$(wc -l < "$nuclei_file" 2>/dev/null || echo 0)
 set_stage $S_NUCLEI done "$find_count findings$(done_marker nuclei && echo ' (resumed)')"
 
+# Step 5.5: AGENT MODE (-A) - autonomous validation loop.
+# The AI is handed the juicy situation and, each round, decides the next GET probes
+# to confirm/escalate issues itself; 4tail fires them (scope-locked, GET-only, secrets
+# redacted), feeds the responses back, and the AI either digs one level deeper or moves
+# on. Bounded by rounds + a wall-clock cap so it never camps on a single host.
+: > "$agent_file"; : > "$agent_log"
+if [ "$AGENT" != 1 ]; then
+  set_stage $S_AGENT skip "off (-A to enable)"
+elif [ "$AI_ENABLED" != 1 ]; then
+  set_stage $S_AGENT skip "needs an API key"
+elif ! budget_ok; then
+  set_stage $S_AGENT skip "budget reached ($(cost_fmt))"
+else
+  set_stage $S_AGENT running "building situation"
+  agent_seen="$OUTDIR/.agent_seen"; : > "$agent_seen"
+  # Compact "situation" brief: the juiciest, most actionable signals only.
+  situation="$( {
+      echo "TARGET SCOPE: *.$domain"
+      [ -s "${stale_file:-/dev/null}" ] && { echo "LEGACY HOSTS (older=prioritize):"; head -5 "$stale_file"; }
+      [ -s "$dast_file" ] && { echo "CONFIRMED DAST (nuclei):"; head -20 "$dast_file"; }
+      [ -s "$findings_dir/kxss.txt" ] && { echo "REFLECTED PARAMS (kxss):"; head -15 "$findings_dir/kxss.txt"; }
+      [ -s "$gf_file" ] && { echo "GF CANDIDATE BUCKETS (class<TAB>url):"; head -40 "$gf_file"; }
+      [ -s "$fuzz_findings_file" ] && { echo "EMPTY/SMALL 200 ENDPOINTS (param-mine candidates):";
+        awk -F'\t' '$1==200 && $2+0<80 {print $3}' "$fuzz_findings_file" | head -15; }
+      [ -s "$fuzz_findings_file" ] && { echo "NOTABLE PATHS:";
+        awk -F'\t' '$1~/^(200|301|302|401|403)$/{print $1" "$3}' "$fuzz_findings_file" | grep -ivE 'google\.com|etc.{0,3}passwd' | head -25; }
+    } | head -c 12000 )"
+  astart=$SECONDS; round=0; results="(none yet - this is the first round)"
+  while [ "$round" -lt "$AGENT_ROUNDS" ]; do
+    round=$((round+1))
+    budget_ok || { SUP_NOTE="agent: budget reached, stopping"; break; }
+    [ "$AGENT_MAX_TIME" -gt 0 ] 2>/dev/null && [ $((SECONDS-astart)) -ge "$AGENT_MAX_TIME" ] && break
+    set_stage $S_AGENT running "round $round/$AGENT_ROUNDS: AI choosing probes"
+    aout="$(mktemp)"
+    ai_call "$LLM_MODEL_PLAN" 2000 \
+"You are an autonomous web-app pentester on an AUTHORIZED target. From the recon situation and prior probe results, decide the NEXT most valuable GET requests to CONFIRM or ESCALATE the juiciest issues. Ideas: LFI -> read ../web.config, ../global.asa, ../../windows/win.ini; empty/small 200 endpoints (e.g. db.asp) -> try likely params (?id=1&table=users&action=list&debug=1); open-redirect params -> set value to //example.org and watch for a Location; IDOR -> walk adjacent numeric ids; exposed admin/config/backup paths -> fetch them. Be decisive and DO NOT keep hammering one endpoint - breadth over depth, then stop. Respond with ONLY lines, each exactly:
+GET <absolute-url> | <one-line why> | <regex that means success>
+Max $AGENT_MAX_PROBES lines. URLs must be http(s) on the target scope (*.$domain). No prose, no markdown." \
+"SITUATION:
+$situation
+
+PRIOR PROBE RESULTS:
+$results" > "$aout" 2>>"$llm_log" || true
+    probes="$(grep -iE '^GET[[:space:]]+https?://' "$aout" | head -n "$AGENT_MAX_PROBES")"; rm -f "$aout"
+    [ -n "$probes" ] || { [ "$round" -eq 1 ] && SUP_NOTE="agent: no probes proposed"; break; }
+    results=""
+    while IFS= read -r pline; do
+      [ -n "$pline" ] || continue
+      url="$(printf '%s' "$pline" | sed -E 's/^GET[[:space:]]+//I' | awk -F'[|]' '{print $1}' | tr -d '[:space:]')"
+      why="$(printf '%s' "$pline" | awk -F'[|]' '{print $2}' | sed 's/^ *//;s/ *$//')"
+      rx="$(printf '%s'  "$pline" | awk -F'[|]' '{print $3}' | sed 's/^ *//;s/ *$//')"
+      [ -n "$url" ] || continue
+      # HARD GUARDRAILS: http(s) only, must be in target scope, no dup probes.
+      printf '%s' "$url" | grep -qiE "^https?://([a-z0-9._-]+\.)?${esc_domain}([:/]|$)" || continue
+      grep -qxF "$url" "$agent_seen" 2>/dev/null && continue
+      printf '%s\n' "$url" >> "$agent_seen"
+      set_stage $S_AGENT running "round $round: probing ($(nlines "$agent_seen") sent)"; render
+      resp="$(curl -s -i -L --max-time 12 ${CURL_NET[@]+"${CURL_NET[@]}"} "$url" 2>/dev/null | head -c 6000)"
+      # redact anything that looks like a secret before it is stored or sent back to the LLM
+      red="$(printf '%s' "$resp" | sed -E 's/((pass(word|wd)?|connection[-_ ]?string|accountkey|secret|api[-_]?key|token|aws[_-]?secret[_-]?access[_-]?key)[^[:cntrl:]]{0,8}[:=])[^[:cntrl:]"'"'"']{1,}/\1<redacted>/Ig')"
+      hit=""; [ -n "$rx" ] && printf '%s' "$resp" | grep -qiE -- "$rx" 2>/dev/null && hit="HIT"
+      local_status="$(printf '%s' "$resp" | head -1 | tr -d '\r')"
+      snippet="$(printf '%s' "$red" | tr '\n\r\t' '   ' | sed -E 's/  +/ /g' | head -c 240)"
+      printf '[r%s] %-4s %s\n   why: %s\n   resp: %s | %s\n' "$round" "${hit:-...}" "$url" "$why" "$local_status" "$snippet" >> "$agent_log"
+      results="$results"$'\n'"$url => ${hit:-no-match} [$local_status] $snippet"
+      [ "$hit" = HIT ] && printf '[CONFIRMED] %s | %s\n' "$url" "$why" >> "$agent_file"
+    done <<< "$probes"
+    [ -n "$results" ] || break
+  done
+  set_stage $S_AGENT done "$(nlines "$agent_file") confirmed · $(nlines "$agent_seen") probes · ${round}r"
+fi
+
 # Report header
 {
   echo "# 4tail recon report"; echo
@@ -1758,6 +1844,10 @@ set_stage $S_NUCLEI done "$find_count findings$(done_marker nuclei && echo ' (re
   echo "- **AI models:** $([ "$AI_ENABLED" = 1 ] && echo "plan=$LLM_MODEL_PLAN, triage=$LLM_MODEL_TRIAGE" || echo "disabled")"
   [ "$AI_ENABLED" = 1 ] && echo "- **Estimated AI spend:** $(cost_fmt)$([ "${LLM_BUDGET_USD:-0}" != 0 ] && echo " (budget \$$LLM_BUDGET_USD)")"
   echo "- **SecLists:** ${SECLISTS_DIR:-not found} | **Base wordlist:** \`$WORDLIST\`"; echo
+  if [ -s "$agent_file" ]; then
+    echo "## 🤖 Agent-confirmed (autonomous probe loop)"; echo
+    echo '```'; cat "$agent_file"; echo '```'; echo
+  fi
   if [ -s "$fuzz_findings_file" ]; then
     echo "## Content discovery hits (ffuf, top 100)"
     echo
@@ -1787,7 +1877,7 @@ set_stage $S_NUCLEI done "$find_count findings$(done_marker nuclei && echo ' (re
 } > "$report_file"
 
 # Step 6: AI triage  (analyses nuclei + content-discovery + JS + crawl/DAST)
-have_extra=0; { [ -s "$js_secrets_file" ] || [ -s "$params_file" ] || [ -s "$fuzz_findings_file" ] || [ -s "$dast_file" ] || [ -s "$gf_file" ] || [ -s "$findings_dir/dalfox.txt" ] || [ -s "$findings_dir/sqlmap.txt" ]; } && have_extra=1
+have_extra=0; { [ -s "$js_secrets_file" ] || [ -s "$params_file" ] || [ -s "$fuzz_findings_file" ] || [ -s "$dast_file" ] || [ -s "$gf_file" ] || [ -s "$findings_dir/dalfox.txt" ] || [ -s "$findings_dir/sqlmap.txt" ] || [ -s "$agent_file" ]; } && have_extra=1
 if [ "$AI_ENABLED" = "1" ] && { [ "$find_count" -gt 0 ] || [ "$have_extra" = 1 ]; } && ! budget_ok; then
   { echo "## Findings (budget reached, no AI triage)"; echo '```'; cat "$nuclei_file" 2>/dev/null
     [ -s "$js_secrets_file" ] && { echo; echo "# JS secret candidates:"; cat "$js_secrets_file"; }; echo '```'; } >> "$report_file"
@@ -1846,7 +1936,10 @@ $(head -n 120 "$gf_file" 2>/dev/null | head -c 8000)
 $(head -c 8000 "$js_secrets_file" 2>/dev/null)
 
 === discovered parameters (url <TAB> param) ===
-$(head -c 4000 "$params_file" 2>/dev/null)" "$triage_out"
+$(head -c 4000 "$params_file" 2>/dev/null)
+
+=== agent-confirmed issues (autonomous probe loop; treat as CONFIRMED, rank high) ===
+$(head -c 4000 "$agent_file" 2>/dev/null)" "$triage_out"
   if [ -s "$triage_out" ]; then
     # Drop any leading reasoning: keep from the LAST "## Executive summary" to the end
     # (reasoning models may restate the section names earlier while thinking).
@@ -1899,6 +1992,7 @@ if have jq; then
     [ -f "$findings_dir/kxss.txt" ] && while IFS= read -r l; do [ -n "$l" ] && emit_f reflected-param low kxss "$(nurl "$l")" "$l"; done < "$findings_dir/kxss.txt"
     [ -f "${api_specs_file:-}" ] && while IFS= read -r l; do [ -n "$l" ] && emit_f api-spec info api-discovery "$l" "exposed API spec: $l"; done < "$api_specs_file"
     [ -f "${oast_hits_file:-}" ] && while IFS= read -r l; do [ -n "$l" ] && emit_f blind-ssrf-redirect high oast "$(nurl "$l")" "$l"; done < "$oast_hits_file"
+    [ -f "${agent_file:-}" ] && while IFS= read -r l; do [ -n "$l" ] && emit_f agent-confirmed high agent "$(nurl "$l")" "$l"; done < "$agent_file"
     true   # force group exit 0: a trailing false [ -f ] test must not (via pipefail) trip the || fallback and clobber jq's output
   } | jq -s "{target:\"$domain\", generated:\"$(date -u +%FT%TZ)\", blueprint:\"${BLUEPRINT_NAME:-}\", count:length, findings:.}" > "$findings_json" 2>/dev/null
   [ -s "$findings_json" ] || echo '{}' > "$findings_json"
@@ -1915,7 +2009,7 @@ fi
 
 # Final summary
 spend_note=""; [ "$AI_ENABLED" = 1 ] && spend_note="  ·  AI spend ~$(cost_fmt)"
-tally="nuclei:$find_count  fuzz-hits:${fuzz_hits:-0}$([ "$JSMINE" = 1 ] && echo "  js-secrets:$(nlines "$js_secrets_file")  params:$(nlines "$params_file")")$([ "$CRAWL" = 1 ] && echo "  active:$(nlines "$targets_active_file")  api-specs:$(nlines "${api_specs_file:-/dev/null}")  dast:$(nlines "$dast_file")  dalfox:$(nlines "$findings_dir/dalfox.txt")  sqlmap:$(nlines "$findings_dir/sqlmap.txt")")$([ "$OAST" = 1 ] && echo "  oast-confirmed:$(nlines "${oast_hits_file:-/dev/null}")")"
+tally="nuclei:$find_count  fuzz-hits:${fuzz_hits:-0}$([ "$JSMINE" = 1 ] && echo "  js-secrets:$(nlines "$js_secrets_file")  params:$(nlines "$params_file")")$([ "$CRAWL" = 1 ] && echo "  active:$(nlines "$targets_active_file")  api-specs:$(nlines "${api_specs_file:-/dev/null}")  dast:$(nlines "$dast_file")  dalfox:$(nlines "$findings_dir/dalfox.txt")  sqlmap:$(nlines "$findings_dir/sqlmap.txt")")$([ "$OAST" = 1 ] && echo "  oast-confirmed:$(nlines "${oast_hits_file:-/dev/null}")")$([ "$AGENT" = 1 ] && echo "  agent-confirmed:$(nlines "${agent_file:-/dev/null}")")"
 if [ "$TUI" = 1 ]; then
   tui_end    # leave alt screen, reprint final panel into normal scrollback
   printf '\n %s✔ done in %ss%s%s\n   %s%s%s\n   report → %s%s%s\n' \

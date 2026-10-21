@@ -257,6 +257,30 @@ OAST_SERVER=oast.mine.net ./4tail.sh -C -O example.com   # self-hosted interacts
 Needs `interactsh-client` (ProjectDiscovery). It sends target-derived callbacks to the
 collaborator server, so keep it to authorized targets; off by default.
 
+### Agent mode — autonomous validation loop (`-A`)
+
+This is the "live AI hunter": instead of stopping at *candidates*, the AI looks at the
+juicy findings and **fires its own follow-up probes to confirm or escalate them**, sees the
+responses, and decides the next move — then moves on. Each round it proposes concrete GET
+requests (read `web.config`/`global.asa` through a confirmed LFI, param-mine an empty-`200`
+`db.asp`, set a redirect param to a canary and watch for a `Location`, walk adjacent IDOR
+ids, fetch exposed admin/backup paths), 4tail executes them and feeds the (redacted)
+responses back, and anything matching the AI's own success check becomes an
+**agent-confirmed** finding — surfaced in the loot feed, `findings.json`, and a `🤖
+Agent-confirmed` section at the top of the report.
+
+```bash
+./4tail.sh -C -A example.com                         # funnel + autonomous agent
+AGENT_ROUNDS=4 AGENT_MAX_TIME=360 ./4tail.sh -C -A example.com
+```
+
+**Bounded by design so it never camps on one host:** `AGENT_ROUNDS` (default 3)
+observe→decide→act rounds, `AGENT_MAX_PROBES` (8) GET requests per round, and a hard
+`AGENT_MAX_TIME` wall-clock cap (240s). **Hard guardrails:** GET-only, every probe
+scope-locked to the target domain (off-scope/non-http URLs are dropped), duplicate probes
+skipped, and secrets (passwords, connection strings, keys, tokens) redacted before anything
+is stored or sent back to the model. Off by default; runs behind the authorization gate.
+
 ### Response-fingerprint dedup
 
 Content-discovery hits are deduped by **response fingerprint — `(status, length)` — never by
