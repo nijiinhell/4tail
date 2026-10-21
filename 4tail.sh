@@ -14,6 +14,14 @@
 set -u
 set -o pipefail
 
+# Snapshot which tuning vars the user set explicitly, BEFORE we apply any defaults,
+# so a loaded blueprint never overrides a value the user chose on the CLI/env.
+for _v in CRAWL_MAX_URLS CRAWL_MAX_TIME DAST_MAX_URLS NUCLEI_MAX_HOSTS NUCLEI_SEVERITY \
+          MAX_TAGS ACT_MAX_JUICY ACT_MAX_DALFOX ACT_MAX_KXSS ACT_MAX_SQLMAP ACT_MAX_ARJUN \
+          ACT_DAST_TAGS ACT_SPECIALISTS ACT_FOCUS; do
+  eval "_user_set_$_v=\${$_v+1}"
+done
+
 # ---------------------------------------------------------------------------
 # LLM configuration (OpenAI-compatible; defaults = Together AI + cheap GLM)
 # ---------------------------------------------------------------------------
@@ -65,11 +73,26 @@ FETCH_FUZZTXT="${FETCH_FUZZTXT:-0}"      # 1 = download Bo0oM/fuzz.txt if no bas
 DEDUPE_ORIGINS="${DEDUPE_ORIGINS:-1}"    # 1 = one fuzz target per IP/CNAME + response cluster
 USE_DNSX="${USE_DNSX:-1}"                # 1 = use dnsx (if installed) to resolve + drop wildcards
 JSMINE="${JSMINE:-0}"                    # 1 = JS/secret mining + param discovery (-j)
-CRAWL="${CRAWL:-0}"                       # 1 = crawl (katana/gau/wayback) -> gf -> nuclei DAST (-C)
+CRAWL="${CRAWL:-0}"                       # 1 = active funnel: crawl -> cluster -> AI juicy -> specialists (-C)
 CRAWL_MAX_URLS="${CRAWL_MAX_URLS:-8000}" # cap collected URLs
 CRAWL_MAX_TIME="${CRAWL_MAX_TIME:-1200}" # hard cap on crawling (s); 0 = unlimited
-DAST="${DAST:-1}"                        # within -C: run nuclei -dast on URLs with params
-DAST_MAX_URLS="${DAST_MAX_URLS:-1500}"   # cap parametered URLs sent to DAST
+DAST="${DAST:-1}"                        # run nuclei -dast on selected URLs
+DAST_MAX_URLS="${DAST_MAX_URLS:-1500}"   # cap URLs sent to DAST
+
+# --- Blueprint (strategy profile) + active-phase caps -----------------------
+# BLUEPRINT: "auto" = AI picks from blueprints/ after recon; or a name / path.
+BLUEPRINT="${BLUEPRINT:-auto}"
+BLUEPRINTS_DIR="${BLUEPRINTS_DIR:-}"      # auto-detected next to the script if empty
+# Active-phase caps/specialists (filled from the blueprint; env here overrides it).
+ACT_MAX_JUICY="${ACT_MAX_JUICY:-100}"     # cap URLs that reach the active specialists
+ACT_MAX_DALFOX="${ACT_MAX_DALFOX:-50}"
+ACT_MAX_KXSS="${ACT_MAX_KXSS:-400}"
+ACT_MAX_SQLMAP="${ACT_MAX_SQLMAP:-3}"     # sqlmap = confirmation only, tightly capped
+ACT_MAX_ARJUN="${ACT_MAX_ARJUN:-25}"
+ACT_SPECIALISTS="${ACT_SPECIALISTS:-nuclei-dast,dalfox,kxss,arjun,sqlmap}"
+ACT_FOCUS="${ACT_FOCUS:-idor,sqli,xss,ssrf,lfi,redirect,ssti}"
+ACT_DAST_TAGS="${ACT_DAST_TAGS:-}"        # empty = all nuclei fuzzing (DAST) templates
+SQLMAP_CONFIRM="${SQLMAP_CONFIRM:-1}"     # allow sqlmap when the blueprint lists it (0 to hard-disable)
 DEFAULT_NUCLEI_TAGS="${DEFAULT_NUCLEI_TAGS:-cves,exposures,misconfiguration,tech,default-login,takeover}"
 MAX_TAGS="${MAX_TAGS:-15}"                # cap nuclei tags (more tags = far more templates = much slower)
 NUCLEI_SEVERITY="${NUCLEI_SEVERITY:-critical,high,medium,low}"
@@ -117,7 +140,8 @@ Options:
   -M <n>      Fuzz at most N hosts            (env MAX_FUZZ_HOSTS, 0=all)
   -p <n>      Fuzz N hosts in parallel        (env FUZZ_PARALLEL, default 1; auto-backoff)
   -j          JS/secret mining + param discovery (env JSMINE=1)
-  -C          Crawl (katana/gau/wayback) -> gf -> nuclei DAST (env CRAWL=1)
+  -C          Active funnel: crawl -> cluster -> AI juicy -> specialists (env CRAWL=1)
+  -B <name>   Blueprint/strategy (env BLUEPRINT; "auto"=AI picks; or webapp_bounty/api_bounty/wordpress/stealth/deep)
   -R          Resume: continue a previous run (env RESUME=1; use with -o <dir>)
   -b <usd>    LLM credit budget, e.g. 2      (env LLM_BUDGET_USD, 0=unlimited)
   -y          Skip the authorization prompt  (env ASSUME_YES=1)
@@ -142,7 +166,7 @@ EOF
 # `doctor` subcommand (before getopts, which doesn't parse bare words)
 if [ "${1:-}" = "doctor" ]; then DOCTOR=1; shift; fi
 
-while getopts ":w:o:t:S:m:M:p:b:RqjCyPDh" opt; do
+while getopts ":w:o:t:S:m:M:p:b:B:RqjCyPDh" opt; do
   case "$opt" in
     w) WORDLIST="$OPTARG" ;;
     o) OUTDIR="$OPTARG" ;;
@@ -153,6 +177,7 @@ while getopts ":w:o:t:S:m:M:p:b:RqjCyPDh" opt; do
     p) FUZZ_PARALLEL="$OPTARG" ;;
     j) JSMINE=1 ;;
     C) CRAWL=1 ;;
+    B) BLUEPRINT="$OPTARG" ;;
     b) LLM_BUDGET_USD="$OPTARG" ;;
     R) RESUME=1 ;;
     q) SKIP_FUZZ=1 ;;
@@ -245,6 +270,9 @@ if [ "$DOCTOR" != 1 ]; then
   urls_params_file="$OUTDIR/urls_params.txt"       # URLs with query params (for gf/DAST)
   gf_file="$OUTDIR/gf_hits.txt"                    # gf pattern -> url
   dast_file="$OUTDIR/dast_findings.txt"            # nuclei -dast findings
+  url_patterns_file="$OUTDIR/url_patterns.txt"     # clustered endpoint patterns
+  targets_active_file="$OUTDIR/targets_active.txt" # AI-selected juicy URLs for specialists
+  findings_dir="$OUTDIR/findings"; mkdir -p "$findings_dir"  # per-specialist output
   cost_ledger="${LLM_COST_LEDGER:-$OUTDIR/.llm_cost_usd}"
   [ -f "$cost_ledger" ] || printf '0\n' > "$cost_ledger"
 fi
@@ -308,7 +336,7 @@ if [ -t 1 ] && [ "$NO_TUI" != "1" ]; then TUI=1; else TUI=0; fi
 
 # Stages (named indices so the order is easy to change).
 S_SUBS=0 S_LIVE=1 S_PLAN=2 S_FUZZ=3 S_JS=4 S_CRAWL=5 S_NUCLEI=6 S_TRIAGE=7
-ST_LABEL=("Subdomains" "Live hosts" "AI scan plan" "Fuzzing" "JS & params" "Crawl & DAST" "Nuclei scan" "AI triage")
+ST_LABEL=("Subdomains" "Live hosts" "AI scan plan" "Fuzzing" "JS & params" "Active funnel" "Nuclei scan" "AI triage")
 ST_STATE=(pending pending pending pending pending pending pending pending)
 ST_DETAIL=("" "" "" "" "" "" "" "")
 SUP_NOTE=""                              # latest AI-supervisor status line
@@ -380,6 +408,62 @@ budget_ok() { # 0 (true) if under budget or unlimited
 }
 cost_fmt() { awk -v c="$(cost_now)" 'BEGIN{printf "$%.4f", c}'; }
 nlines() { [ -f "$1" ] && wc -l < "$1" 2>/dev/null | tr -d ' ' || echo 0; }
+
+# --- Blueprints -------------------------------------------------------------
+BLUEPRINT_NAME=""
+if [ -z "$BLUEPRINTS_DIR" ]; then
+  _sd="$(cd "$(dirname "$0")" 2>/dev/null && pwd)"
+  [ -d "$_sd/blueprints" ] && BLUEPRINTS_DIR="$_sd/blueprints"
+fi
+list_blueprints()    { ls "$BLUEPRINTS_DIR"/*.json 2>/dev/null | sed 's#.*/##; s#\.json$##'; }
+blueprint_catalog()  { local f; for f in "$BLUEPRINTS_DIR"/*.json; do [ -f "$f" ] && jq -r '"- "+.name+": "+(.description // "")' "$f" 2>/dev/null; done; }
+bp_set() { # set $1=var to blueprint value $2, only if user didn't set it and value is real
+  local var="$1" val="$2" flag="_user_set_$1"
+  [ -n "${!flag:-}" ] && return 0
+  { [ -z "$val" ] || [ "$val" = "null" ]; } && return 0
+  eval "$var=\$val"
+}
+load_blueprint() { # $1 = name or path; applies focus/specialists/caps
+  local bp="$1" f=""
+  case "$bp" in
+    */*|*.json) [ -f "$bp" ] && f="$bp" ;;
+    *) [ -n "$BLUEPRINTS_DIR" ] && [ -f "$BLUEPRINTS_DIR/$bp.json" ] && f="$BLUEPRINTS_DIR/$bp.json" ;;
+  esac
+  [ -z "$f" ] && { warn "blueprint '$bp' not found - using built-in active defaults"; return 1; }
+  have jq || { warn "jq required for blueprints - using defaults"; return 1; }
+  BLUEPRINT_NAME="$(jq -r '.name // "custom"' "$f" 2>/dev/null)"
+  bp_set ACT_FOCUS       "$(jq -r '(.focus_areas // []) | join(",")' "$f" 2>/dev/null)"
+  bp_set ACT_SPECIALISTS "$(jq -r '(.specialists // []) | join(",")' "$f" 2>/dev/null)"
+  bp_set ACT_DAST_TAGS   "$(jq -r '.nuclei_dast_tags // ""' "$f" 2>/dev/null)"
+  bp_set ACT_MAX_JUICY   "$(jq -r '.caps.max_juicy_urls // empty' "$f" 2>/dev/null)"
+  bp_set ACT_MAX_DALFOX  "$(jq -r '.caps.max_dalfox // empty' "$f" 2>/dev/null)"
+  bp_set ACT_MAX_KXSS    "$(jq -r '.caps.max_kxss // empty' "$f" 2>/dev/null)"
+  bp_set ACT_MAX_SQLMAP  "$(jq -r '.caps.max_sqlmap // empty' "$f" 2>/dev/null)"
+  bp_set ACT_MAX_ARJUN   "$(jq -r '.caps.max_arjun_hosts // empty' "$f" 2>/dev/null)"
+  bp_set CRAWL_MAX_URLS  "$(jq -r '.caps.crawl_max_urls // empty' "$f" 2>/dev/null)"
+  bp_set CRAWL_MAX_TIME  "$(jq -r '.caps.crawl_max_time // empty' "$f" 2>/dev/null)"
+  bp_set DAST_MAX_URLS   "$(jq -r '.caps.dast_max_urls // empty' "$f" 2>/dev/null)"
+  return 0
+}
+# Resolve the blueprint: explicit name, or AI-chosen from the catalog using the tech brief.
+resolve_blueprint() {
+  if [ "$BLUEPRINT" != "auto" ]; then load_blueprint "$BLUEPRINT"; return; fi
+  local chosen="webapp_bounty" n pick out
+  if [ "$AI_ENABLED" = 1 ] && [ -n "$BLUEPRINTS_DIR" ] && budget_ok && [ -s "$tech_brief" ]; then
+    out="$(mktemp)"
+    ai_call "$LLM_MODEL_PLAN" 400 \
+      'You are a bug-bounty strategist. Pick the single best scan blueprint for this target from the catalog, based on its technology surface. Reply with ONLY the blueprint name (one token), nothing else.' \
+      "Catalog:
+$(blueprint_catalog)
+
+Target: $domain
+Tech brief:
+$(head -c 4000 "$tech_brief")" >"$out" 2>>"$llm_log" || true
+    pick="$(grep -oiE '[a-z_]+' "$out" | tail -1 | tr 'A-Z' 'a-z')"; rm -f "$out"
+    for n in $(list_blueprints); do [ "$pick" = "$n" ] && chosen="$pick"; done
+  fi
+  load_blueprint "$chosen"
+}
 
 # kill background children (nuclei/ffuf/arjun/supervisor) so nothing lingers after
 # a Ctrl-C and pollutes a later resumed run's stats.
@@ -657,6 +741,13 @@ set_stage $S_LIVE done "$alive_count live$(done_marker httpx && echo ' (resumed)
     | sort -u | head -25
 } > "$tech_brief" 2>/dev/null
 [ -s "$tech_brief" ] || cp "$alive_file" "$tech_brief"
+
+# Resolve the strategy blueprint (AI-chosen from the tech surface when BLUEPRINT=auto).
+# Only needed for the active funnel (-C), where it sets focus/specialists/caps.
+if [ "$CRAWL" = 1 ]; then
+  resolve_blueprint
+  log "Blueprint: ${BLUEPRINT_NAME:-defaults}  (focus: $ACT_FOCUS | specialists: $ACT_SPECIALISTS)"
+fi
 
 # Step 3: AI scan plan (with allowlist guardrail)
 NUCLEI_TAG_ALLOWLIST="cves,cve,exposures,exposure,misconfiguration,misconfig,tech,\
@@ -1057,20 +1148,33 @@ else
   set_stage $S_JS done "$js_total JS, $sec_hits secret hits$([ -s "$params_file" ] && echo ', params')"
 fi
 
-# Step 4.7: Crawl (katana/gau/wayback) -> gf -> nuclei DAST  (opt-in with -C)
-# Real endpoints & parameters from crawling/history, then fuzz them for injection bugs.
+# Step 4.7: ACTIVE FUNNEL (-C): crawl (broad/passive) -> cluster -> AI picks juicy URLs
+# -> dispatch paired specialists (parallel, capped) -> merge. The "bug-hunter brain".
+has_spec() { case ",$ACT_SPECIALISTS," in *",$1,"*) return 0;; *) return 1;; esac; }
+# Deterministic URL clustering: collapse ids/uuids/hashes/values so 5000 URLs -> ~N patterns.
+cluster_urls() {  # stdin: urls -> stdout: pattern<TAB>example-url
+  while IFS= read -r u; do
+    [ -z "$u" ] && continue
+    p="$(printf '%s' "$u" \
+      | sed -E 's#/[0-9a-fA-F]{8}-[0-9a-fA-F-]{20,}#/{uuid}#g' \
+      | sed -E 's#=[^&]*#={v}#g' \
+      | sed -E 's#/[0-9]+(/|\?|$)#/{id}\1#g' \
+      | sed -E 's#/[0-9a-fA-F]{12,}(/|\?|$)#/{hash}\1#g')"
+    printf '%s\t%s\n' "$p" "$u"
+  done
+}
+
 if [ "$CRAWL" != 1 ]; then
   set_stage $S_CRAWL skip "off (-C to enable)"
-elif done_marker crawl && [ -f "$urls_file" ]; then
-  set_stage $S_CRAWL done "$(nlines "$urls_file") urls, $(nlines "$dast_file") dast (resumed)"
+elif done_marker crawl && [ -f "$targets_active_file" ]; then
+  set_stage $S_CRAWL done "$(nlines "$urls_file") urls, $(nlines "$targets_active_file") active, $(nlines "$dast_file") dast (resumed)"
 else
   set_stage $S_CRAWL running "collecting URLs"
   esc_domain="$(printf '%s' "$domain" | sed 's/\./\\./g')"
   : > "$urls_file"
-  # passive sources (historical URLs)
+  # (A) Broad / passive URL collection - run exhaustively, it's cheap and WAF-safe.
   have gau         && { printf '%s\n' "$domain" | gau --subs 2>>"$llm_log" >> "$urls_file" || true; }
   have waybackurls && { printf '%s\n' "$domain" | waybackurls 2>>"$llm_log" >> "$urls_file" || true; }
-  # active crawl of live hosts (katana), time-capped
   if have katana; then
     set_stage $S_CRAWL running "katana crawling…"
     kcmd=(katana -silent -list "$alive_file" -d 2 -jc -kf all -c 15 -o "$OUTDIR/.katana.txt")
@@ -1083,37 +1187,104 @@ else
     wait "$kpid" 2>/dev/null || true
     [ -f "$OUTDIR/.katana.txt" ] && cat "$OUTDIR/.katana.txt" >> "$urls_file" && rm -f "$OUTDIR/.katana.txt"
   fi
-  # normalize: in-scope, deduped, capped
   grep -iE "^https?://([a-z0-9._-]+\.)?${esc_domain}([:/]|$)" "$urls_file" 2>/dev/null \
     | sort -u | head -n "$CRAWL_MAX_URLS" > "$urls_file.tmp" && mv "$urls_file.tmp" "$urls_file"
-  # URLs carrying query params (for gf + DAST)
   grep -E '\?[^=]+=' "$urls_file" 2>/dev/null | sort -u > "$urls_params_file" || : > "$urls_params_file"
   url_total="$(nlines "$urls_file")"; param_total="$(nlines "$urls_params_file")"
-  # gf pattern bucketing (candidate injection params)
+
+  # (B) Cluster parametered URLs into endpoint patterns (one exemplar per pattern).
+  set_stage $S_CRAWL running "clustering $param_total param-urls"
+  cluster_urls < "$urls_params_file" | awk -F'\t' '!seen[$1]++' > "$OUTDIR/.patterns.tsv"
+  cut -f1 "$OUTDIR/.patterns.tsv" > "$url_patterns_file"
+  pattern_total="$(nlines "$url_patterns_file")"
+
+  # (C) AI "juicy" funnel: cheap model picks the most promising patterns; expand to real
+  # URLs (capped ACT_MAX_JUICY). Falls back to all param exemplars when AI is off.
+  : > "$targets_active_file"
+  if [ "$AI_ENABLED" = 1 ] && budget_ok && [ "$pattern_total" -gt 0 ]; then
+    set_stage $S_CRAWL running "AI selecting juicy endpoints ($pattern_total patterns)"
+    nl -ba -w1 -s') ' "$url_patterns_file" | head -n 600 > "$OUTDIR/.patterns_numbered.txt"
+    jout="$(mktemp)"
+    ai_call "$LLM_MODEL_PLAN" 1500 \
+      "You are an expert bug-bounty hunter. From the numbered endpoint patterns, select the ones MOST likely to hold IDOR, SQLi, XSS, SSRF, LFI, open-redirect or logic flaws, given the focus areas: $ACT_FOCUS. Ignore static assets (js/css/img/fonts), analytics, and generic CMS noise. Reply with ONLY a comma-separated list of the numbers you pick (max $ACT_MAX_JUICY), nothing else." \
+      "$(cat "$OUTDIR/.patterns_numbered.txt")" >"$jout" 2>>"$llm_log" || true
+    # parse chosen line numbers -> exemplar URLs
+    sel="$(grep -oE '[0-9]+' "$jout" | sort -un | head -n "$ACT_MAX_JUICY")"; rm -f "$jout"
+    if [ -n "$sel" ]; then
+      while read -r n; do sed -n "${n}p" "$OUTDIR/.patterns.tsv" | cut -f2; done <<< "$sel" >> "$targets_active_file"
+    fi
+  fi
+  # fallback / augment: if AI gave nothing, use all param exemplars (capped)
+  [ -s "$targets_active_file" ] || cut -f2 "$OUTDIR/.patterns.tsv" | head -n "$ACT_MAX_JUICY" > "$targets_active_file"
+  sort -u -o "$targets_active_file" "$targets_active_file"
+  rm -f "$OUTDIR/.patterns_numbered.txt"
+  active_total="$(nlines "$targets_active_file")"
+
+  # (D) arjun param discovery on the juicy hosts (augments the active set)
+  if has_spec arjun && have arjun && [ "${ACT_MAX_ARJUN:-0}" -gt 0 ] 2>/dev/null && [ "$active_total" -gt 0 ]; then
+    set_stage $S_CRAWL running "arjun param discovery"
+    awk -F/ '{print $1"//"$3}' "$targets_active_file" | sort -u | head -n "$ACT_MAX_ARJUN" \
+      | while read -r h; do [ -n "$h" ] && arjun -u "$h" -q -oT /dev/stdout 2>/dev/null \
+          | sed "s#^#${h}/?#" ; done >> "$targets_active_file" 2>/dev/null || true
+    sort -u -o "$targets_active_file" "$targets_active_file"
+    active_total="$(nlines "$targets_active_file")"
+  fi
+
+  # (E) gf bucketing on the active set (candidate classes for routing)
   : > "$gf_file"
-  if have gf && [ -s "$urls_params_file" ]; then
+  if have gf && [ -s "$targets_active_file" ]; then
     for pat in sqli xss ssrf lfi redirect rce ssti idor; do
-      gf "$pat" < "$urls_params_file" 2>/dev/null | sed "s/^/${pat}\t/" >> "$gf_file" || true
+      case ",$ACT_FOCUS," in *",$pat,"*|*",rce,"*) ;; *) [ "$pat" != idor ] && continue ;; esac
+      gf "$pat" < "$targets_active_file" 2>/dev/null | sed "s/^/${pat}\t/" >> "$gf_file" || true
     done
   fi
-  # nuclei DAST on parametered URLs (bounded like the main nuclei stage)
-  : > "$dast_file"
-  if [ "$DAST" = 1 ] && have nuclei && [ -s "$urls_params_file" ]; then
-    set_stage $S_CRAWL running "nuclei DAST ($param_total param-urls)…"
-    head -n "$DAST_MAX_URLS" "$urls_params_file" > "$OUTDIR/.dast_targets.txt"
+
+  # (F) Dispatch paired specialists in parallel, each strictly capped.
+  : > "$dast_file"; : > "$findings_dir/dalfox.txt"; : > "$findings_dir/kxss.txt"; : > "$findings_dir/sqlmap.txt"
+  set_stage $S_CRAWL running "dispatching specialists ($active_total urls)"
+  declare -a SPIDS=()
+  # XSS reflection: kxss / Gxss  (fast, pairs into dalfox)
+  if { has_spec kxss && { have kxss || have Gxss; }; } && [ -s "$targets_active_file" ]; then
+    xtool="kxss"; have kxss || xtool="Gxss"
+    ( head -n "$ACT_MAX_KXSS" "$targets_active_file" | "$xtool" 2>/dev/null > "$findings_dir/kxss.txt" ) & SPIDS+=($!)
+  fi
+  # XSS confirm: dalfox pipe
+  if has_spec dalfox && have dalfox && [ -s "$targets_active_file" ]; then
+    xq="$findings_dir/.xssq.txt"; grep -iE '^xss\t' "$gf_file" 2>/dev/null | cut -f2 > "$xq"
+    [ -s "$xq" ] || cp "$targets_active_file" "$xq"
+    ( head -n "$ACT_MAX_DALFOX" "$xq" | dalfox pipe --silence --skip-bav -o "$findings_dir/dalfox.txt" >/dev/null 2>>"$llm_log" ) & SPIDS+=($!)
+  fi
+  # Broad DAST: nuclei -dast across all classes (or ACT_DAST_TAGS)
+  if has_spec nuclei-dast && have nuclei && [ -s "$targets_active_file" ]; then
+    head -n "$DAST_MAX_URLS" "$targets_active_file" > "$OUTDIR/.dast_targets.txt"
     dcmd=(nuclei -silent -dast -l "$OUTDIR/.dast_targets.txt" -rate-limit "$NUCLEI_RATELIMIT"
           -timeout "$NUCLEI_TIMEOUT" -retries "$NUCLEI_RETRIES" -mhe "$NUCLEI_MHE" -o "$dast_file")
+    [ -n "$ACT_DAST_TAGS" ] && dcmd+=(-tags "$ACT_DAST_TAGS")
     [ "$NUCLEI_MAX_TIME" -gt 0 ] 2>/dev/null && have timeout && dcmd=(timeout "${NUCLEI_MAX_TIME}s" "${dcmd[@]}")
-    "${dcmd[@]}" >/dev/null 2>>"$llm_log" & dpid=$!
-    dstart=$SECONDS
-    while kill -0 "$dpid" 2>/dev/null; do
-      ST_DETAIL[$S_CRAWL]="nuclei DAST… $(nlines "$dast_file") hits · $((SECONDS-dstart))s"; render; sleep 2
-    done
-    wait "$dpid" 2>/dev/null || true
-    rm -f "$OUTDIR/.dast_targets.txt"
+    ( "${dcmd[@]}" >/dev/null 2>>"$llm_log" ) & SPIDS+=($!)
   fi
+  # SQLi confirmation: sqlmap on the gf-sqli URLs ONLY, tightly capped (not discovery)
+  if has_spec sqlmap && [ "$SQLMAP_CONFIRM" = 1 ] && have sqlmap && [ "${ACT_MAX_SQLMAP:-0}" -gt 0 ] 2>/dev/null; then
+    sq="$findings_dir/.sqliq.txt"; grep -iE '^sqli\t' "$gf_file" 2>/dev/null | cut -f2 | head -n "$ACT_MAX_SQLMAP" > "$sq"
+    if [ -s "$sq" ]; then
+      ( sqlmap -m "$sq" --batch --smart --level=1 --risk=1 --technique=BEU \
+          --output-dir="$findings_dir/sqlmap" >/dev/null 2>>"$llm_log"
+        grep -rhiE 'parameter .* is vulnerable|is injectable|Type: ' "$findings_dir/sqlmap" 2>/dev/null \
+          | sort -u > "$findings_dir/sqlmap.txt" ) & SPIDS+=($!)
+    fi
+  fi
+  # live progress while specialists run
+  while :; do
+    alive=0; for sp in "${SPIDS[@]:-}"; do [ -n "$sp" ] && kill -0 "$sp" 2>/dev/null && alive=$((alive+1)); done
+    [ "$alive" -eq 0 ] && break
+    ST_DETAIL[$S_CRAWL]="specialists running:$alive  dast:$(nlines "$dast_file") dalfox:$(nlines "$findings_dir/dalfox.txt") kxss:$(nlines "$findings_dir/kxss.txt")"
+    render; sleep 2
+  done
+  for sp in "${SPIDS[@]:-}"; do [ -n "$sp" ] && wait "$sp" 2>/dev/null || true; done
+  rm -f "$OUTDIR/.dast_targets.txt" "$findings_dir/.xssq.txt" "$findings_dir/.sqliq.txt"
+
   touch "$OUTDIR/.done_crawl"
-  set_stage $S_CRAWL done "$url_total urls, $param_total params, $(nlines "$gf_file") gf, $(nlines "$dast_file") dast"
+  set_stage $S_CRAWL done "$url_total urls -> $pattern_total patterns -> $active_total active | dast:$(nlines "$dast_file") dalfox:$(nlines "$findings_dir/dalfox.txt") kxss:$(nlines "$findings_dir/kxss.txt") sqlmap:$(nlines "$findings_dir/sqlmap.txt")"
 fi
 
 # Step 5: Nuclei
@@ -1228,7 +1399,10 @@ set_stage $S_NUCLEI done "$find_count findings$(done_marker nuclei && echo ' (re
   echo "- **Generated:** $(date -u '+%Y-%m-%d %H:%M UTC')"
   echo "- **Subdomains:** $sub_count | **Live:** $alive_count | **Nuclei findings:** $find_count | **Fuzz hits:** ${fuzz_hits:-0}"
   [ "$JSMINE" = 1 ] && echo "- **JS mined:** $(nlines "$js_urls_file") files, $(nlines "$js_secrets_file") secret hits, $(nlines "$params_file") params"
-  [ "$CRAWL" = 1 ] && echo "- **Crawl:** $(nlines "$urls_file") urls, $(nlines "$urls_params_file") with params, $(nlines "$gf_file") gf candidates, **$(nlines "$dast_file") DAST findings**"
+  if [ "$CRAWL" = 1 ]; then
+    echo "- **Active funnel (${BLUEPRINT_NAME:-defaults}):** $(nlines "$urls_file") urls → $(nlines "$url_patterns_file") patterns → **$(nlines "$targets_active_file") juicy**"
+    echo "  - specialists → DAST:$(nlines "$dast_file") · dalfox:$(nlines "$findings_dir/dalfox.txt") · kxss:$(nlines "$findings_dir/kxss.txt") · sqlmap:$(nlines "$findings_dir/sqlmap.txt")"
+  fi
   echo "- **Nuclei:** ${nuclei_target_count:-$alive_count} hosts scanned (deduped from $alive_count) | tags \`$nuclei_tags\` | severity \`$NUCLEI_SEVERITY\`"
   echo "- **AI models:** $([ "$AI_ENABLED" = 1 ] && echo "plan=$LLM_MODEL_PLAN, triage=$LLM_MODEL_TRIAGE" || echo "disabled")"
   [ "$AI_ENABLED" = 1 ] && echo "- **Estimated AI spend:** $(cost_fmt)$([ "${LLM_BUDGET_USD:-0}" != 0 ] && echo " (budget \$$LLM_BUDGET_USD)")"
@@ -1246,10 +1420,19 @@ set_stage $S_NUCLEI done "$find_count findings$(done_marker nuclei && echo ' (re
   if [ -s "$dast_file" ]; then
     echo "## DAST findings (nuclei -dast)"; echo; echo '```'; head -n 100 "$dast_file"; echo '```'; echo
   fi
+  if [ -s "$findings_dir/dalfox.txt" ]; then
+    echo "## XSS (dalfox)"; echo; echo '```'; head -n 80 "$findings_dir/dalfox.txt"; echo '```'; echo
+  fi
+  if [ -s "$findings_dir/sqlmap.txt" ]; then
+    echo "## SQLi confirmation (sqlmap)"; echo; echo '```'; head -n 80 "$findings_dir/sqlmap.txt"; echo '```'; echo
+  fi
+  if [ -s "$findings_dir/kxss.txt" ]; then
+    echo "## Reflected-param candidates (kxss) — top 40"; echo; echo '```'; head -n 40 "$findings_dir/kxss.txt"; echo '```'; echo
+  fi
 } > "$report_file"
 
 # Step 6: AI triage  (analyses nuclei + content-discovery + JS + crawl/DAST)
-have_extra=0; { [ -s "$js_secrets_file" ] || [ -s "$params_file" ] || [ -s "$fuzz_findings_file" ] || [ -s "$dast_file" ] || [ -s "$gf_file" ]; } && have_extra=1
+have_extra=0; { [ -s "$js_secrets_file" ] || [ -s "$params_file" ] || [ -s "$fuzz_findings_file" ] || [ -s "$dast_file" ] || [ -s "$gf_file" ] || [ -s "$findings_dir/dalfox.txt" ] || [ -s "$findings_dir/sqlmap.txt" ]; } && have_extra=1
 if [ "$AI_ENABLED" = "1" ] && { [ "$find_count" -gt 0 ] || [ "$have_extra" = 1 ]; } && ! budget_ok; then
   { echo "## Findings (budget reached, no AI triage)"; echo '```'; cat "$nuclei_file" 2>/dev/null
     [ -s "$js_secrets_file" ] && { echo; echo "# JS secret candidates:"; cat "$js_secrets_file"; }; echo '```'; } >> "$report_file"
@@ -1295,6 +1478,12 @@ $(head -n 150 "$fuzz_findings_file" 2>/dev/null | head -c 12000)
 === nuclei DAST findings ===
 $(head -c 8000 "$dast_file" 2>/dev/null)
 
+=== dalfox XSS findings ===
+$(head -c 4000 "$findings_dir/dalfox.txt" 2>/dev/null)
+
+=== sqlmap SQLi confirmation ===
+$(head -c 3000 "$findings_dir/sqlmap.txt" 2>/dev/null)
+
 === gf injection-candidate URLs (pattern <TAB> url) ===
 $(head -n 120 "$gf_file" 2>/dev/null | head -c 8000)
 
@@ -1327,7 +1516,7 @@ fi
 
 # Final summary
 spend_note=""; [ "$AI_ENABLED" = 1 ] && spend_note="  ·  AI spend ~$(cost_fmt)"
-tally="nuclei:$find_count  fuzz-hits:${fuzz_hits:-0}$([ "$JSMINE" = 1 ] && echo "  js-secrets:$(nlines "$js_secrets_file")  params:$(nlines "$params_file")")$([ "$CRAWL" = 1 ] && echo "  urls:$(nlines "$urls_file")  dast:$(nlines "$dast_file")")"
+tally="nuclei:$find_count  fuzz-hits:${fuzz_hits:-0}$([ "$JSMINE" = 1 ] && echo "  js-secrets:$(nlines "$js_secrets_file")  params:$(nlines "$params_file")")$([ "$CRAWL" = 1 ] && echo "  active:$(nlines "$targets_active_file")  dast:$(nlines "$dast_file")  dalfox:$(nlines "$findings_dir/dalfox.txt")  sqlmap:$(nlines "$findings_dir/sqlmap.txt")")"
 if [ "$TUI" = 1 ]; then
   render
   printf '\n %s✔ done in %ss%s%s\n   %s%s%s\n   report → %s%s%s\n' \

@@ -125,25 +125,43 @@ Both AI steps are **optional**. Without an API key (or without `curl`/`jq`), 4ta
 degrades gracefully: it uses sensible default tags and writes the raw findings to
 the report.
 
-### Crawl → gf → nuclei DAST (`-C`) — active bug hunting
+### The Active Funnel (`-C`) — the "bug-hunter brain"
 
-Path fuzzing guesses; crawling finds the *real* endpoints and parameters. With `-C`:
+A funnel: run broad/passive recon exhaustively (it's cheap and WAF-safe), then spend the
+expensive active budget **only** on the highest-value endpoints. With `-C`:
 
-1. **Collect URLs** — `gau`/`waybackurls` (historical) + `katana` (live crawl of alive
-   hosts, time-capped by `CRAWL_MAX_TIME`), merged, scoped to the target, deduped, capped
-   (`CRAWL_MAX_URLS`). → `urls.txt`
-2. **Bucket injection candidates** — `gf` sorts parametered URLs into `sqli`/`xss`/`ssrf`/
-   `lfi`/`redirect`/`rce`/`ssti`/`idor`. → `gf_hits.txt`
-3. **nuclei DAST** — `nuclei -dast` fuzzes the parametered URLs for actual XSS/SQLi/SSRF/
-   open-redirect (bounded by the same timeout/rate/mhe guards). → `dast_findings.txt`
+1. **Collect URLs (broad)** — `gau`/`waybackurls` (historical) + `katana` (live crawl),
+   scoped to target, deduped, capped (`CRAWL_MAX_URLS`). → `urls.txt`
+2. **Cluster** — deterministic normalization collapses `/users/12345?id=7` and
+   `/users/98765?id=9` into one pattern `/users/{id}?id={v}`. Thousands of URLs → a few
+   hundred **endpoint patterns**. → `url_patterns.txt`
+3. **AI picks the juicy ones** — a cheap model ranks the patterns against the blueprint's
+   focus areas and returns the top `max_juicy_urls`, expanded back to real URLs. →
+   `targets_active.txt` (hard-capped — this is the cost/noise control).
+4. **Dispatch paired specialists** (parallel, each capped, each optional):
 
-DAST findings + gf candidates flow into the report and the **AI triage**, which adds an
-"Injection candidates (DAST & params)" section (param → bug class → concrete test). This
-is the step that turns 4tail from recon into finding bugs. Needs `katana`/`gau`/
-`waybackurls`/`gf` installed (each optional; the stage uses whatever is present).
+   | Bug class | Tool(s) | Role |
+   |-----------|---------|------|
+   | XSS | `kxss`/`Gxss` → `dalfox` | reflection probe → confirm |
+   | all injection | `nuclei -dast` | broad fuzzing (xss/sqli/ssti/ssrf/lfi/crlf/redirect) |
+   | SQLi | `sqlmap` | **confirmation only** on gf-flagged SQLi URLs, `≤ max_sqlmap`, `--level=1 --risk=1` |
+   | params | `arjun` | discover hidden params on juicy hosts |
+
+Findings (`findings/dalfox.txt`, `dast_findings.txt`, `findings/sqlmap.txt`, …) flow into
+the report and the **AI triage**. Each tool is optional — the funnel uses whatever is
+installed. `doctor` shows what's present.
+
+### Blueprints (strategy profiles)
+
+`blueprints/*.json` set the active-phase strategy: focus areas, which specialists to run,
+and the caps. With `-B auto` (default) the **AI reads the detected tech surface and picks
+the blueprint** (webapp_bounty / api_bounty / wordpress / stealth / deep); or force one
+with `-B wordpress`. Your explicit env/flags always override a blueprint's values.
 
 ```bash
-./4tail.sh -C -j -b 2 example.com     # full deep pass
+./4tail.sh -C -j -b 2 example.com                 # auto blueprint, full deep pass
+./4tail.sh -C -B stealth example.com              # low-and-slow, no sqlmap
+SQLMAP_CONFIRM=0 ./4tail.sh -C example.com        # never run sqlmap
 ```
 
 ### Content-discovery results (ffuf) are now first-class

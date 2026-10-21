@@ -1,0 +1,17 @@
+{
+  "name": "stealth",
+  "description": "Low-and-slow: minimal active footprint for WAF-heavy targets. No sqlmap, tiny caps, slow rates.",
+  "focus_areas": ["xss", "redirect", "ssrf"],
+  "specialists": ["kxss", "dalfox"],
+  "nuclei_dast_tags": "xss,redirect,ssrf",
+  "caps": {
+    "max_juicy_urls": 40,
+    "max_dalfox": 15,
+    "max_kxss": 150,
+    "max_sqlmap": 0,
+    "max_arjun_hosts": 0,
+    "crawl_max_urls": 3000,
+    "crawl_max_time": 900,
+    "dast_max_urls": 400
+  }
+}
