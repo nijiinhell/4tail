@@ -138,7 +138,15 @@ expensive active budget **only** on the highest-value endpoints. With `-C`:
 3. **AI picks the juicy ones** — a cheap model ranks the patterns against the blueprint's
    focus areas and returns the top `max_juicy_urls`, expanded back to real URLs. →
    `targets_active.txt` (hard-capped — this is the cost/noise control).
-4. **Dispatch paired specialists** (parallel, each capped, each optional):
+4. **API specs → AI-built tests** (`API_SPECS=1`, default on with `-C`) — finds
+   Swagger/OpenAPI (`/swagger.json`, `/v3/api-docs`, …) and GraphQL (`/graphql`,
+   `/graphiql`) endpoints, both from the collected URLs and by probing common paths on the
+   live hosts (auth-aware). Each spec is fetched and handed to the AI, which writes concrete
+   GET test URLs that exercise the riskiest endpoints for IDOR / broken-authz / SQLi / SSRF
+   (realistic probe values substituted for path & query params). These are folded into
+   `targets_active.txt` so they flow through all the specialists below. → `api_specs.txt`,
+   `api_tests.txt`
+5. **Dispatch paired specialists** (parallel, each capped, each optional):
 
    | Bug class | Tool(s) | Role |
    |-----------|---------|------|
@@ -191,6 +199,37 @@ and writes a one-line plain-language status on the `🤖` line — e.g. *"Scan ~
 error rate high — mostly 429s from CloudFront, ETA ~2m."* It's **report-only** (never
 changes the scan) and budget-gated (uses the cheap planner model, ~200 tokens/note). Notes
 are also saved to `supervisor.log`. Turn it off with `SUPERVISOR=0`.
+
+### Authenticated scanning + proxy pass-through
+
+Bugs behind a login (IDOR, broken authz, account-level logic) are invisible to an
+unauthenticated scan. Pass session auth and it **cascades to every active tool** — httpx,
+ffuf, katana, nuclei (main + `-dast`), dalfox, and the API-spec/JS `curl` fetches:
+
+```bash
+# header auth (repeat -H for more than one)
+./4tail.sh -C -H "Authorization: Bearer eyJ…" example.com
+# cookie auth
+AUTH_COOKIE="session=abc; csrf=xyz" ./4tail.sh -C example.com
+# route everything through Burp/mitmproxy for inspection or replay
+./4tail.sh -C -x http://127.0.0.1:8080 example.com
+```
+
+`-H`/`AUTH_HEADER` (newline-separated for several), `AUTH_COOKIE`, and `-x`/`PROXY`.
+
+### Structured output (JSON + SARIF)
+
+Every run writes `findings.json` — a normalized, deduped list of all findings (nuclei,
+nuclei-dast, ffuf content-discovery, dalfox, sqlmap, kxss, JS secrets, exposed API specs)
+with `type`, `severity`, `source`, `url`, and `detail`, plus run metadata (target,
+timestamp, blueprint). Feed it straight into ticketing/automation. Set `EMIT_SARIF=1` to
+also emit `findings.sarif` (SARIF 2.1.0) for GitHub code-scanning / IDE ingestion.
+
+### Self-heal preflight
+
+`UPDATE_TEMPLATES=1` runs `nuclei -update-templates` before scanning, so a stale template
+store can't silently cost you findings. `doctor` already flags missing tools; this keeps
+the ones you have current.
 
 ## Features
 

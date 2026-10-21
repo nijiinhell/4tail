@@ -93,6 +93,16 @@ ACT_SPECIALISTS="${ACT_SPECIALISTS:-nuclei-dast,dalfox,kxss,arjun,sqlmap}"
 ACT_FOCUS="${ACT_FOCUS:-idor,sqli,xss,ssrf,lfi,redirect,ssti}"
 ACT_DAST_TAGS="${ACT_DAST_TAGS:-}"        # empty = all nuclei fuzzing (DAST) templates
 SQLMAP_CONFIRM="${SQLMAP_CONFIRM:-1}"     # allow sqlmap when the blueprint lists it (0 to hard-disable)
+API_SPECS="${API_SPECS:-1}"               # 1 = detect Swagger/OpenAPI/GraphQL specs -> AI builds targeted tests (part of -C)
+API_MAX_SPECS="${API_MAX_SPECS:-5}"       # cap spec documents fetched + fed to the AI
+API_MAX_TESTS="${API_MAX_TESTS:-60}"      # cap AI-generated API test URLs folded into the active set
+
+# --- Authentication + proxy (cascade to all active tools) -------------------
+AUTH_HEADER="${AUTH_HEADER:-}"            # one or more "Header: value" (newline-separated); also -H
+AUTH_COOKIE="${AUTH_COOKIE:-}"           # "name=val; name2=val2"  -> sent as Cookie header
+PROXY="${PROXY:-}"                       # http(s)://host:port routed through httpx/nuclei/ffuf/katana/dalfox/curl
+UPDATE_TEMPLATES="${UPDATE_TEMPLATES:-0}" # 1 = nuclei -update-templates before scanning (self-heal)
+EMIT_SARIF="${EMIT_SARIF:-0}"            # 1 = also write findings.sarif
 DEFAULT_NUCLEI_TAGS="${DEFAULT_NUCLEI_TAGS:-cves,exposures,misconfiguration,tech,default-login,takeover}"
 MAX_TAGS="${MAX_TAGS:-15}"                # cap nuclei tags (more tags = far more templates = much slower)
 NUCLEI_SEVERITY="${NUCLEI_SEVERITY:-critical,high,medium,low}"
@@ -140,8 +150,10 @@ Options:
   -M <n>      Fuzz at most N hosts            (env MAX_FUZZ_HOSTS, 0=all)
   -p <n>      Fuzz N hosts in parallel        (env FUZZ_PARALLEL, default 1; auto-backoff)
   -j          JS/secret mining + param discovery (env JSMINE=1)
-  -C          Active funnel: crawl -> cluster -> AI juicy -> specialists (env CRAWL=1)
+  -C          Active funnel: crawl -> cluster -> AI juicy -> API specs -> specialists (env CRAWL=1)
   -B <name>   Blueprint/strategy (env BLUEPRINT; "auto"=AI picks; or webapp_bounty/api_bounty/wordpress/stealth/deep)
+  -H <hdr>    Auth header, repeatable (e.g. -H "Authorization: Bearer X"); env AUTH_HEADER/AUTH_COOKIE
+  -x <proxy>  Route tools through http(s) proxy (env PROXY)
   -R          Resume: continue a previous run (env RESUME=1; use with -o <dir>)
   -b <usd>    LLM credit budget, e.g. 2      (env LLM_BUDGET_USD, 0=unlimited)
   -y          Skip the authorization prompt  (env ASSUME_YES=1)
@@ -166,7 +178,7 @@ EOF
 # `doctor` subcommand (before getopts, which doesn't parse bare words)
 if [ "${1:-}" = "doctor" ]; then DOCTOR=1; shift; fi
 
-while getopts ":w:o:t:S:m:M:p:b:B:RqjCyPDh" opt; do
+while getopts ":w:o:t:S:m:M:p:b:B:H:x:RqjCyPDh" opt; do
   case "$opt" in
     w) WORDLIST="$OPTARG" ;;
     o) OUTDIR="$OPTARG" ;;
@@ -178,6 +190,8 @@ while getopts ":w:o:t:S:m:M:p:b:B:RqjCyPDh" opt; do
     j) JSMINE=1 ;;
     C) CRAWL=1 ;;
     B) BLUEPRINT="$OPTARG" ;;
+    H) AUTH_HEADER="${AUTH_HEADER:+$AUTH_HEADER$'\n'}$OPTARG" ;;
+    x) PROXY="$OPTARG" ;;
     b) LLM_BUDGET_USD="$OPTARG" ;;
     R) RESUME=1 ;;
     q) SKIP_FUZZ=1 ;;
@@ -208,6 +222,23 @@ if [ "$DOCTOR" != 1 ]; then
   [ "$ASSUME_YES" = 1 ] || log "Parsed target: $domain"
 fi
 
+# Build auth header list + per-tool network (auth+proxy) argument arrays, cascaded to
+# every active tool so scans can reach the logged-in surface and route through a proxy.
+AUTH_H=()
+[ -n "$AUTH_COOKIE" ] && AUTH_H+=("Cookie: $AUTH_COOKIE")
+if [ -n "$AUTH_HEADER" ]; then
+  while IFS= read -r _l; do [ -n "$_l" ] && AUTH_H+=("$_l"); done <<< "$AUTH_HEADER"
+fi
+_hdr=(); for _h in ${AUTH_H[@]+"${AUTH_H[@]}"}; do _hdr+=(-H "$_h"); done
+HTTPX_NET=("${_hdr[@]}");  [ -n "$PROXY" ] && HTTPX_NET+=(-proxy "$PROXY")
+NUCLEI_NET=("${_hdr[@]}"); [ -n "$PROXY" ] && NUCLEI_NET+=(-proxy "$PROXY")
+FFUF_NET=("${_hdr[@]}");   [ -n "$PROXY" ] && FFUF_NET+=(-x "$PROXY")
+KATANA_NET=("${_hdr[@]}"); [ -n "$PROXY" ] && KATANA_NET+=(-proxy "$PROXY")
+DALFOX_NET=("${_hdr[@]}"); [ -n "$PROXY" ] && DALFOX_NET+=(--proxy "$PROXY")
+CURL_NET=("${_hdr[@]}");   [ -n "$PROXY" ] && CURL_NET+=(-x "$PROXY")
+[ "${#AUTH_H[@]}" -gt 0 ] && [ "$ASSUME_YES" != 1 ] && log "Auth: ${#AUTH_H[@]} header(s) will be sent to active tools"
+[ -n "$PROXY" ] && log "Proxy: routing active tools through $PROXY"
+
 # ---------------------------------------------------------------------------
 # Dependency checks
 # ---------------------------------------------------------------------------
@@ -218,6 +249,12 @@ if [ "${#missing[@]}" -gt 0 ] && [ "$DOCTOR" != 1 ]; then
   err "Missing required tools: ${missing[*]} (see projectdiscovery.io)"; exit 1
 fi
 [ "$DOCTOR" = 1 ] || have ffuf || warn "ffuf not found - content-discovery step will be skipped."
+
+# Self-heal preflight: refresh nuclei templates on request (UPDATE_TEMPLATES=1 / -U behaviour).
+if [ "$DOCTOR" != 1 ] && [ "$UPDATE_TEMPLATES" = 1 ] && have nuclei; then
+  log "Self-heal: updating nuclei templates (this can take a bit)…"
+  nuclei -update-templates -silent >/dev/null 2>&1 || warn "nuclei template update failed (continuing)"
+fi
 
 AI_ENABLED=1
 if [ -z "$LLM_API_KEY" ]; then
@@ -272,6 +309,8 @@ if [ "$DOCTOR" != 1 ]; then
   dast_file="$OUTDIR/dast_findings.txt"            # nuclei -dast findings
   url_patterns_file="$OUTDIR/url_patterns.txt"     # clustered endpoint patterns
   targets_active_file="$OUTDIR/targets_active.txt" # AI-selected juicy URLs for specialists
+  api_specs_file="$OUTDIR/api_specs.txt"           # discovered Swagger/OpenAPI/GraphQL spec URLs
+  api_tests_file="$OUTDIR/api_tests.txt"           # AI-generated API test URLs (folded into active set)
   findings_dir="$OUTDIR/findings"; mkdir -p "$findings_dir"  # per-specialist output
   cost_ledger="${LLM_COST_LEDGER:-$OUTDIR/.llm_cost_usd}"
   [ -f "$cost_ledger" ] || printf '0\n' > "$cost_ledger"
@@ -726,6 +765,7 @@ else
   fi
   run_stage $S_LIVE "$httpx_json" " live" \
     httpx -silent -json -tech-detect -status-code -title -web-server -ip -cname \
+          ${HTTPX_NET[@]+"${HTTPX_NET[@]}"} \
           -threads "$HTTPX_THREADS" -l "$probe_input" -o "$httpx_json"
   touch "$OUTDIR/.done_httpx"
 fi
@@ -1053,6 +1093,7 @@ else
     # without it a host that answers 200 to everything floods the results with junk).
     ffuf_args=(-u "$url/FUZZ" -w "$combined" -ac -mc 200,204,301,302,307,401,403,405,500
                -of json -o "$fuzz_dir/${safe}.json" -s)
+    [ "${#FFUF_NET[@]}" -gt 0 ] && ffuf_args+=("${FFUF_NET[@]}")
     [ -n "$ext_flag" ] && ffuf_args+=(-e "$ext_flag")
     [ "$FFUF_RATE" -gt 0 ] 2>/dev/null && ffuf_args+=(-rate "$FFUF_RATE")
     [ "$TUI" = 1 ] || log "Fuzzing $fuzzed/$cap: $url"
@@ -1106,7 +1147,7 @@ else
     printf '%s\n' "$scan_targets" | while read -r u; do getJS --url "$u" 2>/dev/null; done | sort -u > "$js_urls_file"
   else
     printf '%s\n' "$scan_targets" | while read -r u; do
-      curl -s -L --max-time 15 "$u" 2>/dev/null \
+      curl -s -L --max-time 15 ${CURL_NET[@]+"${CURL_NET[@]}"} "$u" 2>/dev/null \
         | grep -oiE 'src="[^"]+\.js' | sed -E 's/^src="//' \
         | while read -r j; do case "$j" in http*) echo "$j";; /*) echo "${u%/}$j";; *) echo "${u%/}/$j";; esac; done
     done | sort -u > "$js_urls_file"
@@ -1126,7 +1167,7 @@ else
     [ -z "$j" ] && continue
     ji=$((ji + 1)); [ "$ji" -gt "$JS_MAX" ] && break
     ST_DETAIL[$S_JS]="scanning JS $ji/$js_total  hits:$(nlines "$js_secrets_file")"; render
-    curl -s -L --max-time 15 "$j" 2>/dev/null | grep -aoE "$SECRET_RE" 2>/dev/null \
+    curl -s -L --max-time 15 ${CURL_NET[@]+"${CURL_NET[@]}"} "$j" 2>/dev/null | grep -aoE "$SECRET_RE" 2>/dev/null \
       | sort -u | sed "s#^#${j}\t#" >> "$js_secrets_file"
   done < "$js_urls_file"
   sort -u -o "$js_secrets_file" "$js_secrets_file"
@@ -1187,6 +1228,7 @@ else
   if have katana; then
     set_stage $S_CRAWL running "katana crawling…"
     kcmd=(katana -silent -list "$alive_file" -d 2 -jc -kf all -c 15 -o "$OUTDIR/.katana.txt")
+    [ "${#KATANA_NET[@]}" -gt 0 ] && kcmd+=("${KATANA_NET[@]}")
     [ "$CRAWL_MAX_TIME" -gt 0 ] 2>/dev/null && have timeout && kcmd=(timeout "${CRAWL_MAX_TIME}s" "${kcmd[@]}")
     "${kcmd[@]}" >/dev/null 2>>"$llm_log" & kpid=$!
     kstart=$SECONDS
@@ -1229,6 +1271,61 @@ else
   rm -f "$OUTDIR/.patterns_numbered.txt"
   active_total="$(nlines "$targets_active_file")"
 
+  # (C2) API specs: find Swagger/OpenAPI/GraphQL, let the AI turn each spec into concrete
+  # test requests, and fold them into the active set. APIs are where IDOR/authz/logic bugs
+  # live and plain crawling misses them (undocumented params, methods, versioned paths).
+  : > "$api_specs_file"; : > "$api_tests_file"
+  if [ "$API_SPECS" = 1 ]; then
+    set_stage $S_CRAWL running "probing for API specs (swagger/openapi/graphql)"
+    # (a) specs already seen in collected URLs
+    grep -iE '(swagger|openapi|api-docs|v[0-9]+/api-docs|/graphql|/graphiql|apispec|/\.well-known/)' \
+      "$urls_file" 2>/dev/null | grep -iE 'https?://' | sort -u >> "$api_specs_file" || true
+    # (b) probe common spec paths on each live host (capped, auth-aware)
+    api_probe_paths=(/swagger.json /swagger/v1/swagger.json /openapi.json /v2/api-docs /v3/api-docs \
+                     /api-docs /api/swagger.json /api/openapi.json /swagger-ui/index.html /graphql /api/graphql)
+    while IFS= read -r h; do
+      [ -n "$h" ] || continue
+      base="${h%/}"
+      for p in "${api_probe_paths[@]}"; do
+        u="$base$p"
+        code="$(curl -s -o /dev/null -w '%{http_code}' -L --max-time 10 \
+                 ${CURL_NET[@]+"${CURL_NET[@]}"} "$u" 2>/dev/null || echo 000)"
+        case "$code" in 200|401|403) printf '%s\n' "$u" >> "$api_specs_file" ;; esac
+      done
+    done < <(sort -u "$alive_file" 2>/dev/null | head -n 20)
+    sort -u -o "$api_specs_file" "$api_specs_file"
+
+    # (c) fetch each spec and let the AI generate targeted test URLs
+    spec_n=0
+    while IFS= read -r spec; do
+      [ -n "$spec" ] || continue
+      [ "$spec_n" -ge "$API_MAX_SPECS" ] && break
+      body="$(curl -s -L --max-time 15 ${CURL_NET[@]+"${CURL_NET[@]}"} "$spec" 2>/dev/null \
+               | head -c 60000)"
+      [ -n "$body" ] || continue
+      spec_n=$((spec_n+1))
+      set_stage $S_CRAWL running "AI building API tests from spec $spec_n/$API_MAX_SPECS"
+      if [ "$AI_ENABLED" = 1 ] && budget_ok; then
+        aout="$(mktemp)"
+        ai_call "$LLM_MODEL_PLAN" 2000 \
+          "You are an API security tester. Below is an API spec (OpenAPI/Swagger JSON/YAML, or a GraphQL/GraphiQL page) fetched from $spec. Build concrete HTTP GET test URLs (absolute, same origin) that exercise the riskiest endpoints for IDOR, broken authz, SQLi, SSRF and mass-assignment: substitute realistic probe values for path/query params (ids=1, user=1, q=test', url=http://169.254.169.254/, file=/etc/passwd as appropriate). Only GET-able URLs, one per line, no commentary, no markdown, max $API_MAX_TESTS lines." \
+          "$body" >"$aout" 2>>"$llm_log" || true
+        grep -oE 'https?://[^ "'"'"'`<>]+' "$aout" 2>/dev/null \
+          | grep -iE "^https?://([a-z0-9._-]+\.)?${esc_domain}([:/]|$)" \
+          >> "$api_tests_file" || true
+        rm -f "$aout"
+      fi
+    done < "$api_specs_file"
+
+    if [ -s "$api_tests_file" ]; then
+      sort -u "$api_tests_file" | head -n "$API_MAX_TESTS" > "$api_tests_file.tmp" && mv "$api_tests_file.tmp" "$api_tests_file"
+      cat "$api_tests_file" >> "$targets_active_file"
+      sort -u -o "$targets_active_file" "$targets_active_file"
+      active_total="$(nlines "$targets_active_file")"
+    fi
+    set_stage $S_CRAWL running "api specs: $(nlines "$api_specs_file") found, $(nlines "$api_tests_file") tests built"
+  fi
+
   # (D) arjun param discovery on the juicy hosts (augments the active set)
   if has_spec arjun && have arjun && [ "${ACT_MAX_ARJUN:-0}" -gt 0 ] 2>/dev/null && [ "$active_total" -gt 0 ]; then
     set_stage $S_CRAWL running "arjun param discovery"
@@ -1261,7 +1358,8 @@ else
   if has_spec dalfox && have dalfox && [ -s "$targets_active_file" ]; then
     xq="$findings_dir/.xssq.txt"; grep -iE '^xss\t' "$gf_file" 2>/dev/null | cut -f2 > "$xq"
     [ -s "$xq" ] || cp "$targets_active_file" "$xq"
-    ( head -n "$ACT_MAX_DALFOX" "$xq" | dalfox pipe --silence --skip-bav -o "$findings_dir/dalfox.txt" >/dev/null 2>>"$llm_log" ) & SPIDS+=($!)
+    dfx=(dalfox pipe --silence --skip-bav -o "$findings_dir/dalfox.txt"); [ "${#DALFOX_NET[@]}" -gt 0 ] && dfx+=("${DALFOX_NET[@]}")
+    ( head -n "$ACT_MAX_DALFOX" "$xq" | "${dfx[@]}" >/dev/null 2>>"$llm_log" ) & SPIDS+=($!)
   fi
   # Broad DAST: nuclei -dast across all classes (or ACT_DAST_TAGS)
   if has_spec nuclei-dast && have nuclei && [ -s "$targets_active_file" ]; then
@@ -1269,6 +1367,7 @@ else
     dcmd=(nuclei -silent -dast -l "$OUTDIR/.dast_targets.txt" -rate-limit "$NUCLEI_RATELIMIT"
           -timeout "$NUCLEI_TIMEOUT" -retries "$NUCLEI_RETRIES" -mhe "$NUCLEI_MHE" -o "$dast_file")
     [ -n "$ACT_DAST_TAGS" ] && dcmd+=(-tags "$ACT_DAST_TAGS")
+    [ "${#NUCLEI_NET[@]}" -gt 0 ] && dcmd+=("${NUCLEI_NET[@]}")
     [ "$NUCLEI_MAX_TIME" -gt 0 ] 2>/dev/null && have timeout && dcmd=(timeout "${NUCLEI_MAX_TIME}s" "${dcmd[@]}")
     ( "${dcmd[@]}" >/dev/null 2>>"$llm_log" ) & SPIDS+=($!)
   fi
@@ -1293,7 +1392,7 @@ else
   rm -f "$OUTDIR/.dast_targets.txt" "$findings_dir/.xssq.txt" "$findings_dir/.sqliq.txt"
 
   touch "$OUTDIR/.done_crawl"
-  set_stage $S_CRAWL done "$url_total urls -> $pattern_total patterns -> $active_total active | dast:$(nlines "$dast_file") dalfox:$(nlines "$findings_dir/dalfox.txt") kxss:$(nlines "$findings_dir/kxss.txt") sqlmap:$(nlines "$findings_dir/sqlmap.txt")"
+  set_stage $S_CRAWL done "$url_total urls -> $pattern_total patterns -> $active_total active | api:$(nlines "$api_specs_file")spec/$(nlines "$api_tests_file")test dast:$(nlines "$dast_file") dalfox:$(nlines "$findings_dir/dalfox.txt") kxss:$(nlines "$findings_dir/kxss.txt") sqlmap:$(nlines "$findings_dir/sqlmap.txt")"
 fi
 
 # Step 5: Nuclei
@@ -1347,6 +1446,7 @@ else
               -retries "$NUCLEI_RETRIES" -mhe "$NUCLEI_MHE"
               -c "$NUCLEI_CONC" -bulk-size "$NUCLEI_BULK"
               -l "$nuclei_targets_file" -o "$nuclei_file")
+  [ "${#NUCLEI_NET[@]}" -gt 0 ] && nuclei_cmd+=("${NUCLEI_NET[@]}")
   if [ "$NUCLEI_MAX_TIME" -gt 0 ] 2>/dev/null && have timeout; then
     nuclei_cmd=(timeout "${NUCLEI_MAX_TIME}s" "${nuclei_cmd[@]}")
   fi
@@ -1523,9 +1623,37 @@ else
   set_stage $S_TRIAGE skip "$([ "$AI_ENABLED" = 1 ] && echo "nothing to triage" || echo "AI off")"
 fi
 
+# Structured output: findings.json (and optional SARIF) for automation / ticketing.
+findings_json="$OUTDIR/findings.json"
+if have jq; then
+  emit_f() { jq -nc --arg type "$1" --arg sev "$2" --arg src "$3" --arg url "$4" --arg detail "$5" \
+      '{type:$type,severity:$sev,source:$src,url:$url,detail:$detail}'; }
+  nsev() { printf '%s' "$1" | grep -oiE '\[(critical|high|medium|low|info|unknown)\]' | head -1 | tr -d '[]' | tr 'A-Z' 'a-z'; }
+  nurl() { printf '%s' "$1" | grep -oE 'https?://[^ ]+' | head -1; }
+  {
+    [ -f "$nuclei_file" ] && while IFS= read -r l; do [ -n "$l" ] && emit_f nuclei "$(nsev "$l")" nuclei "$(nurl "$l")" "$l"; done < "$nuclei_file"
+    [ -f "$dast_file" ]   && while IFS= read -r l; do [ -n "$l" ] && emit_f dast "$(nsev "$l")" nuclei-dast "$(nurl "$l")" "$l"; done < "$dast_file"
+    [ -f "$fuzz_findings_file" ] && while IFS=$'\t' read -r st len u; do [ -n "$u" ] && emit_f content-discovery info ffuf "$u" "status=$st length=$len"; done < "$fuzz_findings_file"
+    [ -f "$findings_dir/dalfox.txt" ] && while IFS= read -r l; do [ -n "$l" ] && emit_f xss high dalfox "$(nurl "$l")" "$l"; done < "$findings_dir/dalfox.txt"
+    [ -f "$findings_dir/sqlmap.txt" ] && while IFS= read -r l; do [ -n "$l" ] && emit_f sqli high sqlmap "" "$l"; done < "$findings_dir/sqlmap.txt"
+    [ -f "$js_secrets_file" ] && while IFS=$'\t' read -r u m; do [ -n "$m" ] && emit_f secret medium js-mining "$u" "$m"; done < "$js_secrets_file"
+    [ -f "$findings_dir/kxss.txt" ] && while IFS= read -r l; do [ -n "$l" ] && emit_f reflected-param low kxss "$(nurl "$l")" "$l"; done < "$findings_dir/kxss.txt"
+    [ -f "${api_specs_file:-}" ] && while IFS= read -r l; do [ -n "$l" ] && emit_f api-spec info api-discovery "$l" "exposed API spec: $l"; done < "$api_specs_file"
+  } | jq -s "{target:\"$domain\", generated:\"$(date -u +%FT%TZ)\", blueprint:\"${BLUEPRINT_NAME:-}\", count:length, findings:.}" > "$findings_json" 2>/dev/null || echo '{}' > "$findings_json"
+
+  if [ "$EMIT_SARIF" = 1 ]; then
+    jq '{version:"2.1.0", "$schema":"https://json.schemastore.org/sarif-2.1.0.json",
+         runs:[{tool:{driver:{name:"4tail", rules:[]}},
+                results:[.findings[] | {ruleId:.type, level:(if .severity=="critical" or .severity=="high" then "error" elif .severity=="medium" then "warning" else "note" end),
+                                        message:{text:.detail}, properties:{source:.source,severity:.severity},
+                                        locations:[{physicalLocation:{artifactLocation:{uri:.url}}}]}]}]}' \
+       "$findings_json" > "$OUTDIR/findings.sarif" 2>/dev/null || true
+  fi
+fi
+
 # Final summary
 spend_note=""; [ "$AI_ENABLED" = 1 ] && spend_note="  ·  AI spend ~$(cost_fmt)"
-tally="nuclei:$find_count  fuzz-hits:${fuzz_hits:-0}$([ "$JSMINE" = 1 ] && echo "  js-secrets:$(nlines "$js_secrets_file")  params:$(nlines "$params_file")")$([ "$CRAWL" = 1 ] && echo "  active:$(nlines "$targets_active_file")  dast:$(nlines "$dast_file")  dalfox:$(nlines "$findings_dir/dalfox.txt")  sqlmap:$(nlines "$findings_dir/sqlmap.txt")")"
+tally="nuclei:$find_count  fuzz-hits:${fuzz_hits:-0}$([ "$JSMINE" = 1 ] && echo "  js-secrets:$(nlines "$js_secrets_file")  params:$(nlines "$params_file")")$([ "$CRAWL" = 1 ] && echo "  active:$(nlines "$targets_active_file")  api-specs:$(nlines "${api_specs_file:-/dev/null}")  dast:$(nlines "$dast_file")  dalfox:$(nlines "$findings_dir/dalfox.txt")  sqlmap:$(nlines "$findings_dir/sqlmap.txt")")"
 if [ "$TUI" = 1 ]; then
   render
   printf '\n %s✔ done in %ss%s%s\n   %s%s%s\n   report → %s%s%s\n' \
@@ -1535,4 +1663,5 @@ else
   ok "Done in $((SECONDS-started))s.$spend_note"
   ok "$tally"
   ok "Report: $report_file"
+  [ -f "$findings_json" ] && ok "JSON:   $findings_json$([ "$EMIT_SARIF" = 1 ] && echo "  (+ findings.sarif)")"
 fi
