@@ -609,8 +609,13 @@ run_doctor() {
   done
 
   dr_head "Optional tools"
-  for t in ffuf curl jq anew; do
-    if have "$t"; then dr_pass "$t found"; else dr_warn "$t not found ($([ "$t" = ffuf ] && echo 'fuzzing skipped' || echo 'AI/dedup limited'))"; fi
+  for t in ffuf curl jq anew dnsx; do
+    if have "$t"; then dr_pass "$t found"; else dr_warn "$t not found ($([ "$t" = ffuf ] && echo 'fuzzing skipped' || echo 'feature degraded'))"; fi
+  done
+
+  dr_head "Active funnel tools (-C) & JS/params (-j)"
+  for t in katana gau waybackurls gf dalfox kxss Gxss arjun subjs sqlmap; do
+    if have "$t"; then dr_pass "$t found"; else dr_warn "$t not found (that specialist is skipped)"; fi
   done
 
   dr_head "Wordlists"
