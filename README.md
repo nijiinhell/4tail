@@ -231,6 +231,41 @@ also emit `findings.sarif` (SARIF 2.1.0) for GitHub code-scanning / IDE ingestio
 store can't silently cost you findings. `doctor` already flags missing tools; this keeps
 the ones you have current.
 
+### Staleness ranking (old stacks first)
+
+Legacy stacks are disproportionately more likely to hold bugs, so 4tail scores every live
+host by how outdated it looks — EOL servers (IIS ≤8.5, Apache 2.2, old nginx), EOL runtimes
+(PHP 4/5), and dated libraries (TinyMCE, jQuery, FrontPage, ColdFusion, legacy CMS). The
+ranking (`stale.tsv`: `score  url  evidence`) is fed to the AI so it **funnels the active
+budget to the oldest hosts first** — both in scan planning and in juicy-URL selection. On by
+default (`STALE_RANK=0` to disable); no extra tools needed — it reads httpx's tech detection.
+
+### OAST — confirm blind SSRF / open redirect (`-O`)
+
+Reflected bugs are easy to confirm; **blind** ones (server-side redirects/SSRF that never
+echo back) are not. With `-O` (`OAST=1`), 4tail starts an **interactsh** listener in the
+background as it launches, then injects a unique per-URL out-of-band payload into
+redirect/SSRF-style params (`url`, `redirect`, `next`, `RetURL`, `callback`, …). Any DNS/HTTP
+callback is correlated back to the exact URL and promoted to a **Confirmed blind
+SSRF/redirect** finding in `findings.json` and the loot feed.
+
+```bash
+./4tail.sh -C -O example.com                 # public collaborator (oast.fun)
+OAST_SERVER=oast.mine.net ./4tail.sh -C -O example.com   # self-hosted interactsh
+```
+
+Needs `interactsh-client` (ProjectDiscovery). It sends target-derived callbacks to the
+collaborator server, so keep it to authorized targets; off by default.
+
+### Response-fingerprint dedup
+
+Content-discovery hits are deduped by **response fingerprint — `(status, length)` — never by
+URL string**, which is the RFC-correct approach: on case-insensitive IIS, `db.asp` and
+`DB.asp` collapse to one entry, and WAF noise (e.g. 32 identical `403`/`312b` traversal
+blocks) collapses to one representative with a `(×N identical responses)` count. This keeps
+the report and the loot feed clean and cuts triage-LLM tokens, without ever hiding a genuinely
+distinct path on a case-sensitive Linux target.
+
 ## Features
 
 - **Subdomain enumeration** with Subfinder.

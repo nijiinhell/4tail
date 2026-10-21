@@ -103,6 +103,12 @@ AUTH_COOKIE="${AUTH_COOKIE:-}"           # "name=val; name2=val2"  -> sent as Co
 PROXY="${PROXY:-}"                       # http(s)://host:port routed through httpx/nuclei/ffuf/katana/dalfox/curl
 UPDATE_TEMPLATES="${UPDATE_TEMPLATES:-0}" # 1 = nuclei -update-templates before scanning (self-heal)
 EMIT_SARIF="${EMIT_SARIF:-0}"            # 1 = also write findings.sarif
+
+# --- Staleness ranking + OAST (blind-bug confirmation) ----------------------
+STALE_RANK="${STALE_RANK:-1}"            # 1 = compute a per-host "legacy" score; AI funnels budget to older stacks first
+OAST="${OAST:-0}"                        # 1 = start interactsh in the background + inject OOB payloads into redirect/SSRF params
+OAST_SERVER="${OAST_SERVER:-}"           # optional self-hosted interactsh server (-s); empty = public (oast.fun)
+OAST_MAX_INJECT="${OAST_MAX_INJECT:-40}" # cap URLs we inject an OOB payload into
 DEFAULT_NUCLEI_TAGS="${DEFAULT_NUCLEI_TAGS:-cves,exposures,misconfiguration,tech,default-login,takeover}"
 MAX_TAGS="${MAX_TAGS:-15}"                # cap nuclei tags (more tags = far more templates = much slower)
 NUCLEI_SEVERITY="${NUCLEI_SEVERITY:-critical,high,medium,low}"
@@ -156,6 +162,7 @@ Options:
   -B <name>   Blueprint/strategy (env BLUEPRINT; "auto"=AI picks; or webapp_bounty/api_bounty/wordpress/stealth/deep)
   -H <hdr>    Auth header, repeatable (e.g. -H "Authorization: Bearer X"); env AUTH_HEADER/AUTH_COOKIE
   -x <proxy>  Route tools through http(s) proxy (env PROXY)
+  -O          OAST: start interactsh, inject OOB payloads, confirm blind SSRF/redirect (env OAST=1)
   -R          Resume: continue a previous run (env RESUME=1; use with -o <dir>)
   -b <usd>    LLM credit budget, e.g. 2      (env LLM_BUDGET_USD, 0=unlimited)
   -y          Skip the authorization prompt  (env ASSUME_YES=1)
@@ -180,7 +187,7 @@ EOF
 # `doctor` subcommand (before getopts, which doesn't parse bare words)
 if [ "${1:-}" = "doctor" ]; then DOCTOR=1; shift; fi
 
-while getopts ":w:o:t:S:m:M:p:b:B:H:x:RqjCyPDh" opt; do
+while getopts ":w:o:t:S:m:M:p:b:B:H:x:ORqjCyPDh" opt; do
   case "$opt" in
     w) WORDLIST="$OPTARG" ;;
     o) OUTDIR="$OPTARG" ;;
@@ -194,6 +201,7 @@ while getopts ":w:o:t:S:m:M:p:b:B:H:x:RqjCyPDh" opt; do
     B) BLUEPRINT="$OPTARG" ;;
     H) AUTH_HEADER="${AUTH_HEADER:+$AUTH_HEADER$'\n'}$OPTARG" ;;
     x) PROXY="$OPTARG" ;;
+    O) OAST=1 ;;
     b) LLM_BUDGET_USD="$OPTARG" ;;
     R) RESUME=1 ;;
     q) SKIP_FUZZ=1 ;;
@@ -313,6 +321,11 @@ if [ "$DOCTOR" != 1 ]; then
   targets_active_file="$OUTDIR/targets_active.txt" # AI-selected juicy URLs for specialists
   api_specs_file="$OUTDIR/api_specs.txt"           # discovered Swagger/OpenAPI/GraphQL spec URLs
   api_tests_file="$OUTDIR/api_tests.txt"           # AI-generated API test URLs (folded into active set)
+  stale_file="$OUTDIR/stale.tsv"                   # per-host legacy score: score<TAB>url<TAB>evidence
+  oast_dir="$OUTDIR/oast"; mkdir -p "$oast_dir"    # interactsh output + injection map
+  oast_log="$oast_dir/interactions.jsonl"          # raw interactsh interactions
+  oast_map="$oast_dir/injected.tsv"                # marker<TAB>url we injected an OOB payload into
+  oast_hits_file="$oast_dir/confirmed.txt"         # correlated: confirmed blind SSRF/redirect
   findings_dir="$OUTDIR/findings"; mkdir -p "$findings_dir"  # per-specialist output
   cost_ledger="${LLM_COST_LEDGER:-$OUTDIR/.llm_cost_usd}"
   [ -f "$cost_ledger" ] || printf '0\n' > "$cost_ledger"
@@ -385,6 +398,7 @@ SUP_NOTE=""                              # latest AI-supervisor status line
 # plus a per-file cursor so each source file is only read for its new lines.
 LOOT_LINES=()
 declare -A LOOT_SEEN=()
+declare -A LOOT_FP=()
 LOOT_MAX=200
 LOOT_LAST=0
 [ "$LOOT_ROWS" -ge 1 ] 2>/dev/null || LOOT_ROWS=6
@@ -434,7 +448,7 @@ loot_add() {  # sev  src  text   -> push one finding, bounded history
 loot_scan() {  # file  src  mode
   local file="$1" src="$2" mode="$3"
   [ -n "$file" ] && [ -f "$file" ] || return 0
-  local total cur l sev txt
+  local total cur l sev txt fp
   total="$(wc -l < "$file" 2>/dev/null | tr -d ' ')"; [ -n "$total" ] 2>/dev/null || total=0
   cur="${LOOT_SEEN[$file]:-0}"
   if [ "$total" -le "$cur" ]; then LOOT_SEEN[$file]="$total"; return 0; fi
@@ -444,7 +458,13 @@ loot_scan() {  # file  src  mode
       nuclei)  sev="$(printf '%s' "$l" | grep -oiE '\[(critical|high|medium|low|info|unknown)\]' | head -1 | tr -d '[]' | tr 'A-Z' 'a-z')"
                txt="$(printf '%s' "$l" | grep -oE 'https?://[^ ]+' | head -1)"
                [ -n "$txt" ] || txt="$l" ;;
-      ffuf)    sev=info;   txt="$(printf '%s' "$l" | awk -F'\t' '{print $1" "$3}')" ;;
+      ffuf)    sev=info
+               # suppress by response fingerprint: only the first hit of each
+               # (status,length) reaches the feed, so WAF noise doesn't flood it.
+               fp="$(printf '%s' "$l" | awk -F'\t' '{print $1"-"$2}')"
+               if [ -n "${LOOT_FP[$fp]:-}" ]; then continue; fi
+               LOOT_FP[$fp]=1
+               txt="$(printf '%s' "$l" | awk -F'\t' '{print $1" "$3}')" ;;
       kxss)    sev=low;    txt="$(printf '%s' "$l" | sed -E 's/ Unfiltered.*//')" ;;
       dalfox)  sev=high;   txt="$(printf '%s' "$l" | grep -oE 'https?://[^ ]+' | head -1)"; [ -n "$txt" ] || txt="$l" ;;
       sqlmap)  sev=high;   txt="$l" ;;
@@ -470,6 +490,7 @@ loot_refresh() {
   loot_scan "${findings_dir:-}/sqlmap.txt" sqlmap  sqlmap
   loot_scan "${js_secrets_file:-}"         js      secret
   loot_scan "${api_specs_file:-}"          api     apispec
+  loot_scan "${oast_hits_file:-}"          oast    sqlmap
 }
 
 # _draw_panel: emit the panel body at the current cursor position (no positioning).
@@ -627,7 +648,63 @@ $(head -c 4000 "$tech_brief")" >"$out" 2>>"$llm_log" || true
 kill_children() { local p; for p in $(jobs -p 2>/dev/null); do kill "$p" 2>/dev/null; pkill -P "$p" 2>/dev/null; done; }
 cleanup() { [ "$TUI" = 1 ] && printf '\033[?25h\033[?1049l'; }   # restore cursor + leave alt screen (abnormal exit)
 trap cleanup EXIT
-trap 'kill_children; cleanup; err "interrupted"; exit 130' INT TERM
+trap 'kill_children; oast_stop; cleanup; err "interrupted"; exit 130' INT TERM
+
+# --- OAST (out-of-band) via interactsh: confirm BLIND SSRF / redirects -------
+# Started in the background as 4tail launches so the listener is live for the whole
+# run; we inject unique per-URL payload subdomains and, at the end, any DNS/HTTP
+# callback is correlated back to the exact URL -> a Confirmed blind finding.
+OAST_PID=""; OAST_DOMAIN=""
+oast_start() {
+  [ "$OAST" = 1 ] || return 0
+  if ! have interactsh-client; then warn "OAST on but interactsh-client not found; skipping"; OAST=0; return 0; fi
+  local cmd=(interactsh-client -json -o "$oast_log")
+  [ -n "$OAST_SERVER" ] && cmd+=(-s "$OAST_SERVER")
+  : > "$oast_log"; : > "$oast_map"
+  "${cmd[@]}" > "$oast_dir/client.out" 2>&1 &
+  OAST_PID=$!
+  local tries=0
+  while [ "$tries" -lt 20 ]; do
+    OAST_DOMAIN="$(grep -i 'payload' "$oast_dir/client.out" 2>/dev/null | head -1 | grep -oE '[A-Za-z0-9.-]+\.[A-Za-z]{2,}' | tail -1)"
+    [ -n "$OAST_DOMAIN" ] && break
+    kill -0 "$OAST_PID" 2>/dev/null || break
+    sleep 0.5; tries=$((tries+1))
+  done
+  [ -n "$OAST_DOMAIN" ] || warn "OAST: could not obtain a payload domain; OOB injection disabled"
+}
+oast_stop() { [ -n "${OAST_PID:-}" ] && kill "$OAST_PID" 2>/dev/null; OAST_PID=""; }
+# Inject a unique OOB payload into redirect/SSRF-style params of the given URLs.
+oast_inject() {  # reads URLs on stdin
+  [ "$OAST" = 1 ] && [ -n "$OAST_DOMAIN" ] || { cat >/dev/null; return 0; }
+  local u n=0 idx
+  idx="$(wc -l < "$oast_map" 2>/dev/null | tr -d ' ')"; [ -n "$idx" ] 2>/dev/null || idx=0
+  while IFS= read -r u; do
+    [ -n "$u" ] || continue
+    printf '%s' "$u" | grep -qiE '([?&])(url|uri|redirect|redir|next|dest|destination|return|returnurl|return_url|returnto|returl|callback|continue|out|link|target|to|forward|image|img|file|load|fetch|feed|host|site|domain|data|reference|ref)=' || continue
+    [ "$n" -ge "$OAST_MAX_INJECT" ] && break
+    idx=$((idx+1)); n=$((n+1))
+    local marker="m${idx}"
+    local payload="http://${marker}.${OAST_DOMAIN}/"
+    # swap every matching param's value for the payload
+    local inj; inj="$(printf '%s' "$u" | sed -E "s#([?&])(url|uri|redirect|redir|next|dest|destination|return|returnurl|return_url|returnto|returl|callback|continue|out|link|target|to|forward|image|img|file|load|fetch|feed|host|site|domain|data|reference|ref)=[^&]*#\1\2=${payload//#/\\#}#Ig")"
+    printf '%s\t%s\n' "$marker" "$u" >> "$oast_map"
+    curl -s -o /dev/null --max-time 12 ${CURL_NET[@]+"${CURL_NET[@]}"} "$inj" 2>/dev/null || true
+  done
+}
+# Correlate callbacks -> confirmed findings.
+oast_correlate() {
+  [ "$OAST" = 1 ] && [ -n "$OAST_DOMAIN" ] && [ -s "$oast_map" ] || return 0
+  : > "$oast_hits_file"
+  sleep 3   # let late callbacks land
+  local marker u proto
+  while IFS=$'\t' read -r marker u; do
+    [ -n "$marker" ] || continue
+    if grep -qi "${marker}\." "$oast_log" 2>/dev/null; then
+      proto="$(grep -i "${marker}\." "$oast_log" 2>/dev/null | head -1 | jq -r '.protocol // "oob"' 2>/dev/null)"
+      printf '[CONFIRMED] blind OOB interaction (%s) via %s\n' "${proto:-oob}" "$u" >> "$oast_hits_file"
+    fi
+  done < "$oast_map"
+}
 
 # Run a command in the background, live-updating a stage from a growing file.
 #   run_stage <idx> <count_file|""> <suffix> <cmd...>
@@ -774,6 +851,8 @@ run_doctor() {
   for t in katana gau waybackurls gf dalfox kxss Gxss arjun subjs sqlmap; do
     if have "$t"; then dr_pass "$t found"; else dr_warn "$t not found (that specialist is skipped)"; fi
   done
+  if have interactsh-client; then dr_pass "interactsh-client found (OAST ready; enable with OAST=1)"
+  else dr_warn "interactsh-client not found (OAST blind-bug confirmation disabled)"; fi
 
   dr_head "Wordlists"
   if [ -n "$SECLISTS_DIR" ]; then
@@ -843,6 +922,10 @@ if [ "$TUI" = 1 ]; then
   render
 fi
 
+# Bring the OOB listener up now so it's live for the whole run (callbacks can land
+# at any point once we start injecting payloads in the active funnel).
+oast_start
+
 # ===========================================================================
 # PIPELINE
 # ===========================================================================
@@ -907,6 +990,38 @@ set_stage $S_LIVE done "$alive_count live$(done_marker httpx && echo ' (resumed)
     | sort -u | head -25
 } > "$tech_brief" 2>/dev/null
 [ -s "$tech_brief" ] || cp "$alive_file" "$tech_brief"
+
+# Staleness ranking: score each host by how legacy/outdated its stack looks (EOL
+# servers, old runtimes, dated libraries). Older stacks are disproportionately
+# more likely to hold bugs, so the AI uses this to funnel budget to them first.
+if [ "$STALE_RANK" = 1 ] && have jq && [ -s "$httpx_json" ]; then
+  : > "$stale_file"
+  while IFS= read -r row; do
+    [ -n "$row" ] || continue
+    local_url="$(printf '%s' "$row" | jq -r '.url // empty' 2>/dev/null)"
+    [ -n "$local_url" ] || continue
+    blob="$(printf '%s' "$row" | jq -r '[(.webserver // ""), ((.tech // [])|join(" "))] | join(" ")' 2>/dev/null)"
+    lc="$(printf '%s' "$blob" | tr 'A-Z' 'a-z')"
+    score=0; ev=""
+    case "$lc" in *iis/5*|*iis/6*|*iis/7*|*iis/8*) score=$((score+3)); ev="$ev,EOL-IIS";; esac
+    case "$lc" in *apache/2.0*|*apache/2.2*)       score=$((score+3)); ev="$ev,EOL-Apache";; esac
+    case "$lc" in *nginx/0.*|*nginx/1.0*|*nginx/1.1*|*nginx/1.2*|*nginx/1.4*) score=$((score+2)); ev="$ev,old-nginx";; esac
+    case "$lc" in *php/4*|*php/5*)                 score=$((score+3)); ev="$ev,EOL-PHP";; esac
+    case "$lc" in *frontpage*)                     score=$((score+2)); ev="$ev,FrontPage";; esac
+    case "$lc" in *tinymce*)                       score=$((score+2)); ev="$ev,TinyMCE";; esac
+    case "$lc" in *coldfusion*)                    score=$((score+3)); ev="$ev,ColdFusion";; esac
+    case "$lc" in *jquery*)                        score=$((score+1)); ev="$ev,jQuery";; esac
+    case "$lc" in *bootstrap*)                     score=$((score+1)); ev="$ev,Bootstrap";; esac
+    case "$lc" in *wordpress*|*drupal*|*joomla*)   score=$((score+1)); ev="$ev,legacy-CMS";; esac
+    case "$lc" in *asp.net*|*microsoft*)           score=$((score+1)); ev="$ev,ASP.NET";; esac
+    [ "$score" -gt 0 ] && printf '%d\t%s\t%s\n' "$score" "$local_url" "${ev#,}" >> "$stale_file"
+  done < "$httpx_json"
+  if [ -s "$stale_file" ]; then
+    sort -rn -o "$stale_file" "$stale_file"
+    { echo "== legacy ranking (higher score = older stack, prioritize) =="
+      awk -F'\t' '{printf "%s  %s  [%s]\n",$1,$2,$3}' "$stale_file" | head -20; } >> "$tech_brief"
+  fi
+fi
 
 # Resolve the strategy blueprint (AI-chosen from the tech surface when BLUEPRINT=auto).
 # Only needed for the active funnel (-C), where it sets focus/specialists/caps.
@@ -1372,9 +1487,13 @@ else
   if [ "$AI_ENABLED" = 1 ] && budget_ok && [ "$pattern_total" -gt 0 ]; then
     set_stage $S_CRAWL running "AI selecting juicy endpoints ($pattern_total patterns)"
     nl -ba -w1 -s') ' "$url_patterns_file" | head -n 600 > "$OUTDIR/.patterns_numbered.txt"
+    # Surface the legacy ranking so the model prefers URLs on older/outdated hosts.
+    stale_hint=""
+    [ "$STALE_RANK" = 1 ] && [ -s "${stale_file:-/dev/null}" ] && \
+      stale_hint=" These hosts look the most legacy/outdated (older stack = higher bug likelihood, prioritize their URLs): $(awk -F'\t' '{printf "%s(%s) ",$2,$3}' "$stale_file" | head -c 500)."
     jout="$(mktemp)"
     ai_call "$LLM_MODEL_PLAN" 1500 \
-      "You are an expert bug-bounty hunter. From the numbered endpoint patterns, select the ones MOST likely to hold IDOR, SQLi, XSS, SSRF, LFI, open-redirect or logic flaws, given the focus areas: $ACT_FOCUS. Ignore static assets (js/css/img/fonts), analytics, and generic CMS noise. Reply with ONLY a comma-separated list of the numbers you pick (max $ACT_MAX_JUICY), nothing else." \
+      "You are an expert bug-bounty hunter. From the numbered endpoint patterns, select the ones MOST likely to hold IDOR, SQLi, XSS, SSRF, LFI, open-redirect or logic flaws, given the focus areas: $ACT_FOCUS.${stale_hint} Ignore static assets (js/css/img/fonts), analytics, and generic CMS noise. Reply with ONLY a comma-separated list of the numbers you pick (max $ACT_MAX_JUICY), nothing else." \
       "$(cat "$OUTDIR/.patterns_numbered.txt")" >"$jout" 2>>"$llm_log" || true
     # parse chosen line numbers -> exemplar URLs
     sel="$(grep -oE '[0-9]+' "$jout" | sort -un | head -n "$ACT_MAX_JUICY")"; rm -f "$jout"
@@ -1487,6 +1606,12 @@ else
     [ "${#NUCLEI_NET[@]}" -gt 0 ] && dcmd+=("${NUCLEI_NET[@]}")
     [ "$NUCLEI_MAX_TIME" -gt 0 ] 2>/dev/null && have timeout && dcmd=(timeout "${NUCLEI_MAX_TIME}s" "${dcmd[@]}")
     ( "${dcmd[@]}" >/dev/null 2>>"$llm_log" ) & SPIDS+=($!)
+  fi
+  # Blind SSRF / open-redirect confirmation via OAST: inject unique payloads into
+  # redirect/SSRF-style params (prefers the gf redirect/ssrf buckets, else the active set).
+  if [ "$OAST" = 1 ] && [ -n "$OAST_DOMAIN" ]; then
+    { grep -iE '^(redirect|ssrf)\t' "$gf_file" 2>/dev/null | cut -f2; cat "$targets_active_file"; } \
+      | sort -u | oast_inject & SPIDS+=($!)
   fi
   # SQLi confirmation: sqlmap on the gf-sqli URLs ONLY, tightly capped (not discovery)
   if has_spec sqlmap && [ "$SQLMAP_CONFIRM" = 1 ] && have sqlmap && [ "${ACT_MAX_SQLMAP:-0}" -gt 0 ] 2>/dev/null; then
@@ -1740,6 +1865,10 @@ else
   set_stage $S_TRIAGE skip "$([ "$AI_ENABLED" = 1 ] && echo "nothing to triage" || echo "AI off")"
 fi
 
+# OOB: correlate any interactsh callbacks to the URLs we injected, then stop the listener.
+oast_correlate
+oast_stop
+
 # Structured output: findings.json (and optional SARIF) for automation / ticketing.
 findings_json="$OUTDIR/findings.json"
 if have jq; then
@@ -1750,12 +1879,22 @@ if have jq; then
   {
     [ -f "$nuclei_file" ] && while IFS= read -r l; do [ -n "$l" ] && emit_f nuclei "$(nsev "$l")" nuclei "$(nurl "$l")" "$l"; done < "$nuclei_file"
     [ -f "$dast_file" ]   && while IFS= read -r l; do [ -n "$l" ] && emit_f dast "$(nsev "$l")" nuclei-dast "$(nurl "$l")" "$l"; done < "$dast_file"
-    [ -f "$fuzz_findings_file" ] && while IFS=$'\t' read -r st len u; do [ -n "$u" ] && emit_f content-discovery info ffuf "$u" "status=$st length=$len"; done < "$fuzz_findings_file"
+    # Group ffuf hits by response fingerprint (status,length) - never by URL string -
+    # so case-variants (db.asp/DB.asp on IIS) and WAF noise (32 identical 403/312
+    # traversal blocks) collapse to one representative with a count.
+    [ -f "$fuzz_findings_file" ] && awk -F'\t' 'NF>=3{k=$1"\t"$2; c[k]++; if(!(k in r)) r[k]=$3}
+        END{for(k in c) printf "%s\t%s\t%d\n", k, r[k], c[k]}' "$fuzz_findings_file" \
+      | while IFS=$'\t' read -r st len u c; do
+          [ -n "$u" ] || continue
+          note="status=$st length=$len"; [ "${c:-1}" -gt 1 ] && note="$note (×$c identical responses)"
+          emit_f content-discovery info ffuf "$u" "$note"
+        done
     [ -f "$findings_dir/dalfox.txt" ] && while IFS= read -r l; do [ -n "$l" ] && emit_f xss high dalfox "$(nurl "$l")" "$l"; done < "$findings_dir/dalfox.txt"
     [ -f "$findings_dir/sqlmap.txt" ] && while IFS= read -r l; do [ -n "$l" ] && emit_f sqli high sqlmap "" "$l"; done < "$findings_dir/sqlmap.txt"
     [ -f "$js_secrets_file" ] && while IFS=$'\t' read -r u m; do [ -n "$m" ] && emit_f secret medium js-mining "$u" "$m"; done < "$js_secrets_file"
     [ -f "$findings_dir/kxss.txt" ] && while IFS= read -r l; do [ -n "$l" ] && emit_f reflected-param low kxss "$(nurl "$l")" "$l"; done < "$findings_dir/kxss.txt"
     [ -f "${api_specs_file:-}" ] && while IFS= read -r l; do [ -n "$l" ] && emit_f api-spec info api-discovery "$l" "exposed API spec: $l"; done < "$api_specs_file"
+    [ -f "${oast_hits_file:-}" ] && while IFS= read -r l; do [ -n "$l" ] && emit_f blind-ssrf-redirect high oast "$(nurl "$l")" "$l"; done < "$oast_hits_file"
   } | jq -s "{target:\"$domain\", generated:\"$(date -u +%FT%TZ)\", blueprint:\"${BLUEPRINT_NAME:-}\", count:length, findings:.}" > "$findings_json" 2>/dev/null || echo '{}' > "$findings_json"
 
   if [ "$EMIT_SARIF" = 1 ]; then
@@ -1770,7 +1909,7 @@ fi
 
 # Final summary
 spend_note=""; [ "$AI_ENABLED" = 1 ] && spend_note="  ·  AI spend ~$(cost_fmt)"
-tally="nuclei:$find_count  fuzz-hits:${fuzz_hits:-0}$([ "$JSMINE" = 1 ] && echo "  js-secrets:$(nlines "$js_secrets_file")  params:$(nlines "$params_file")")$([ "$CRAWL" = 1 ] && echo "  active:$(nlines "$targets_active_file")  api-specs:$(nlines "${api_specs_file:-/dev/null}")  dast:$(nlines "$dast_file")  dalfox:$(nlines "$findings_dir/dalfox.txt")  sqlmap:$(nlines "$findings_dir/sqlmap.txt")")"
+tally="nuclei:$find_count  fuzz-hits:${fuzz_hits:-0}$([ "$JSMINE" = 1 ] && echo "  js-secrets:$(nlines "$js_secrets_file")  params:$(nlines "$params_file")")$([ "$CRAWL" = 1 ] && echo "  active:$(nlines "$targets_active_file")  api-specs:$(nlines "${api_specs_file:-/dev/null}")  dast:$(nlines "$dast_file")  dalfox:$(nlines "$findings_dir/dalfox.txt")  sqlmap:$(nlines "$findings_dir/sqlmap.txt")")$([ "$OAST" = 1 ] && echo "  oast-confirmed:$(nlines "${oast_hits_file:-/dev/null}")")"
 if [ "$TUI" = 1 ]; then
   tui_end    # leave alt screen, reprint final panel into normal scrollback
   printf '\n %s✔ done in %ss%s%s\n   %s%s%s\n   report → %s%s%s\n' \
