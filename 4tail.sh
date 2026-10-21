@@ -61,12 +61,13 @@ cost_ledger=""                               # resolved after OUTDIR is known
 # ---------------------------------------------------------------------------
 WORDLIST="${WORDLIST:-}"                   # base "juicy" list; auto-resolved below (Bo0oM/fuzz.txt preferred)
 SECLISTS_DIR="${SECLISTS_DIR:-}"          # auto-detected below if empty
-MAX_FUZZ_WORDS="${MAX_FUZZ_WORDS:-60000}" # cap per-host combined wordlist size
+MAX_FUZZ_WORDS="${MAX_FUZZ_WORDS:-18000}" # cap per-host combined wordlist size (bounty-sized; raise for deep runs)
 MAX_FUZZ_HOSTS="${MAX_FUZZ_HOSTS:-0}"     # cap number of hosts to fuzz (0 = all)
+FUZZ_MAX_TIME="${FUZZ_MAX_TIME:-300}"     # hard per-host ffuf time cap (s) so a slow host can't stall the stage; 0 = unlimited
 SKIP_FUZZ="${SKIP_FUZZ:-0}"               # 1 = skip content discovery entirely (nuclei-only)
 SKIP_CDN_FUZZ="${SKIP_CDN_FUZZ:-1}"       # 1 = don't fuzz CDN/WAF edges (cloudfront, cloudflare, …)
 EXTENSIONS="${EXTENSIONS:-}"              # explicit ffuf -e list (overrides tech-aware exts)
-MAX_EXTS="${MAX_EXTS:-10}"                # cap on per-host extensions (each multiplies requests)
+MAX_EXTS="${MAX_EXTS:-4}"                 # cap on per-host extensions (each one multiplies total requests)
 FFUF_RATE="${FFUF_RATE:-0}"              # ffuf requests/sec per host (0 = unlimited)
 FUZZ_PARALLEL="${FUZZ_PARALLEL:-1}"      # fuzz N hosts at once (-p); auto-backoff on WAF blocks
 FETCH_FUZZTXT="${FETCH_FUZZTXT:-0}"      # 1 = download Bo0oM/fuzz.txt if no base list found
@@ -1342,6 +1343,7 @@ else
     [ "${#FFUF_NET[@]}" -gt 0 ] && ffuf_args+=("${FFUF_NET[@]}")
     [ -n "$ext_flag" ] && ffuf_args+=(-e "$ext_flag")
     [ "$FFUF_RATE" -gt 0 ] 2>/dev/null && ffuf_args+=(-rate "$FFUF_RATE")
+    [ "$FUZZ_MAX_TIME" -gt 0 ] 2>/dev/null && ffuf_args+=(-maxtime "$FUZZ_MAX_TIME")  # stop a slow host after N s
     [ "$TUI" = 1 ] || log "Fuzzing $fuzzed/$cap: $url"
     ffuf "${ffuf_args[@]}" >/dev/null 2>>"$llm_log" & JOB[$!]="$safe"
     fuzz_status; render
