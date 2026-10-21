@@ -277,8 +277,12 @@ a fixed-height panel (`LOOT_ROWS`, default 6) so the in-place redraw stays perfe
 synced — no scroll-duplication, and the borders adapt to the terminal width. Turn it off
 with `LOOT_FEED=0`.
 
-The dashboard auto-disables (falling back to plain `[*]/[+]/[!]` logs) when output isn't a
-terminal — e.g. piped to a file or run in CI. Force plain mode with `-P` or `NO_TUI=1`.
+The dashboard renders in the terminal's **alternate screen buffer** (like `htop`/`less`),
+redrawing from a fixed home position each frame — so it never scroll-duplicates or leaves
+orphaned lines, even on narrow terminals or when a tool writes stray output. On exit it
+leaves the alt screen and reprints the final panel into your normal scrollback. It
+auto-disables (falling back to plain `[*]/[+]/[!]` logs) when output isn't a terminal —
+e.g. piped to a file or run in CI. Force plain mode with `-P` or `NO_TUI=1`.
 
 ## Prerequisites
 

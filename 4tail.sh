@@ -472,11 +472,9 @@ loot_refresh() {
   loot_scan "${api_specs_file:-}"          api     apispec
 }
 
-render() {
-  [ "$TUI" = 1 ] || return 0
-  loot_refresh
-  spin_i=$(( (spin_i + 1) & 3 ))
-  [ "$panel_drawn" = 1 ] && printf '\033[%dA' "$PANEL_LINES"
+# _draw_panel: emit the panel body at the current cursor position (no positioning).
+# render() handles positioning; this just paints the rows.
+_draw_panel() {
   local model_line="off"
   if [ "$AI_ENABLED" = 1 ]; then
     if [ "$LLM_MODEL_PLAN" = "$LLM_MODEL_TRIAGE" ]; then model_line="${LLM_MODEL_PLAN##*/}"
@@ -524,7 +522,29 @@ render() {
     done
   fi
   printf ' %s%s%s\033[K\n' "$c_cyan" "$(hbar '╰' '' "$width")" "$c_reset"
+}
+
+# render: redraw the live panel in the alternate screen, anchored at home (row 1).
+# Home-anchored redraw (not relative cursor-up) means stray output or terminal
+# scrolling can never desync or orphan the panel.
+render() {
+  [ "$TUI" = 1 ] || return 0
+  loot_refresh
+  spin_i=$(( (spin_i + 1) & 3 ))
+  printf '\033[H'          # cursor home (top-left of the alt screen)
+  _draw_panel
+  printf '\033[J'          # clear anything below the panel
   panel_drawn=1
+}
+
+# tui_end: leave the alternate screen and reprint the final panel state into the
+# normal scrollback, so the finished dashboard stays visible after the run.
+tui_end() {
+  [ "$TUI" = 1 ] || return 0
+  loot_refresh
+  printf '\033[?25h\033[?1049l'   # restore cursor + leave alt screen
+  TUI=0
+  _draw_panel                     # static dump to normal screen
 }
 
 set_stage() {
@@ -605,7 +625,7 @@ $(head -c 4000 "$tech_brief")" >"$out" 2>>"$llm_log" || true
 # kill background children (nuclei/ffuf/arjun/supervisor) so nothing lingers after
 # a Ctrl-C and pollutes a later resumed run's stats.
 kill_children() { local p; for p in $(jobs -p 2>/dev/null); do kill "$p" 2>/dev/null; pkill -P "$p" 2>/dev/null; done; }
-cleanup() { [ "$TUI" = 1 ] && printf '\033[?25h\n'; }   # restore cursor
+cleanup() { [ "$TUI" = 1 ] && printf '\033[?25h\033[?1049l'; }   # restore cursor + leave alt screen (abnormal exit)
 trap cleanup EXIT
 trap 'kill_children; cleanup; err "interrupted"; exit 130' INT TERM
 
@@ -816,11 +836,10 @@ run_doctor() {
 
 if [ "$DOCTOR" = 1 ]; then run_doctor; exit $?; fi
 
-# hide cursor + reserve the panel's rows so the in-place redraw never scroll-duplicates
+# Enter the alternate screen buffer (like htop/less): a dedicated viewport the panel
+# owns and redraws from home each frame, so nothing can scroll-duplicate or orphan it.
 if [ "$TUI" = 1 ]; then
-  printf '\033[?25l'
-  for _i in $(seq "$PANEL_LINES"); do printf '\n'; done
-  printf '\033[%dA' "$PANEL_LINES"
+  printf '\033[?1049h\033[?25l\033[2J\033[H'   # alt screen, hide cursor, clear, home
   render
 fi
 
@@ -1753,10 +1772,11 @@ fi
 spend_note=""; [ "$AI_ENABLED" = 1 ] && spend_note="  ·  AI spend ~$(cost_fmt)"
 tally="nuclei:$find_count  fuzz-hits:${fuzz_hits:-0}$([ "$JSMINE" = 1 ] && echo "  js-secrets:$(nlines "$js_secrets_file")  params:$(nlines "$params_file")")$([ "$CRAWL" = 1 ] && echo "  active:$(nlines "$targets_active_file")  api-specs:$(nlines "${api_specs_file:-/dev/null}")  dast:$(nlines "$dast_file")  dalfox:$(nlines "$findings_dir/dalfox.txt")  sqlmap:$(nlines "$findings_dir/sqlmap.txt")")"
 if [ "$TUI" = 1 ]; then
-  render
+  tui_end    # leave alt screen, reprint final panel into normal scrollback
   printf '\n %s✔ done in %ss%s%s\n   %s%s%s\n   report → %s%s%s\n' \
     "$c_green" "$((SECONDS-started))" "$c_reset" "$spend_note" \
     "$c_dim" "$tally" "$c_reset" "$c_cyan" "$report_file" "$c_reset"
+  [ -f "$findings_json" ] && printf '   %sJSON   → %s%s%s\n' "$c_dim" "$c_cyan" "$findings_json" "$c_reset"
 else
   ok "Done in $((SECONDS-started))s.$spend_note"
   ok "$tally"
