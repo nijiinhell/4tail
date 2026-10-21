@@ -699,6 +699,10 @@ if done_marker subs && [ -s "$subdomains_file" ]; then
   set_stage $S_SUBS done "$(wc -l <"$subdomains_file") subs (resumed)"
 else
   run_stage $S_SUBS "$subdomains_file" " subs" subfinder -silent -d "$domain" -o "$subdomains_file"
+  # subfinder enumerates subdomains OF the target but not the target host itself; always
+  # include it (and www.) so a specific host like testasp.vulnweb.com is actually probed.
+  { printf '%s\n' "$domain" "www.$domain"; cat "$subdomains_file" 2>/dev/null; } | sort -u > "$subdomains_file.tmp" \
+    && mv "$subdomains_file.tmp" "$subdomains_file"
   touch "$OUTDIR/.done_subs"
 fi
 sub_count=$(wc -l < "$subdomains_file" 2>/dev/null || echo 0)
