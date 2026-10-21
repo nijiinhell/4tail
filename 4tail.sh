@@ -1761,11 +1761,15 @@ set_stage $S_NUCLEI done "$find_count findings$(done_marker nuclei && echo ' (re
   if [ -s "$fuzz_findings_file" ]; then
     echo "## Content discovery hits (ffuf, top 100)"
     echo
-    echo '| Status | Length | URL |'
-    echo '|--------|--------|-----|'
-    head -n 100 "$fuzz_findings_file" | while IFS=$'\t' read -r st len u; do
-      echo "| $st | $len | \`$u\` |"
-    done
+    echo '| Status | Length | URL | Count |'
+    echo '|--------|--------|-----|-------|'
+    # group by response fingerprint (status,length) so WAF noise / case-variants collapse
+    awk -F'\t' 'NF>=3{k=$1"\t"$2; c[k]++; if(!(k in r)) r[k]=$3}
+        END{for(k in c) printf "%s\t%s\t%d\n", k, r[k], c[k]}' "$fuzz_findings_file" \
+      | sort -t"$(printf '\t')" -k1,1n -k3,3nr | head -n 100 \
+      | while IFS=$'\t' read -r st len u c; do
+          echo "| $st | $len | \`$u\` | $([ "$c" -gt 1 ] && echo "×$c" || echo 1) |"
+        done
     echo
   fi
   if [ -s "$dast_file" ]; then
@@ -1823,8 +1827,8 @@ $(head -c 8000 "$tech_brief")
 === nuclei findings (severity-sorted) ===
 $(printf '%s\n' "$sorted_findings" | head -n 400 | head -c 30000)
 
-=== content-discovery hits (status  length  url) ===
-$(head -n 150 "$fuzz_findings_file" 2>/dev/null | head -c 12000)
+=== content-discovery hits (status  length  url  count; grouped by response fingerprint) ===
+$(awk -F'\t' 'NF>=3{k=$1"\t"$2; c[k]++; if(!(k in r)) r[k]=$3} END{for(k in c) printf "%s\t%s\tx%d\n", k, r[k], c[k]}' "$fuzz_findings_file" 2>/dev/null | sort -t"$(printf '\t')" -k1,1n -k3,3r | head -n 150 | head -c 12000)
 
 === nuclei DAST findings ===
 $(head -c 8000 "$dast_file" 2>/dev/null)
@@ -1895,7 +1899,9 @@ if have jq; then
     [ -f "$findings_dir/kxss.txt" ] && while IFS= read -r l; do [ -n "$l" ] && emit_f reflected-param low kxss "$(nurl "$l")" "$l"; done < "$findings_dir/kxss.txt"
     [ -f "${api_specs_file:-}" ] && while IFS= read -r l; do [ -n "$l" ] && emit_f api-spec info api-discovery "$l" "exposed API spec: $l"; done < "$api_specs_file"
     [ -f "${oast_hits_file:-}" ] && while IFS= read -r l; do [ -n "$l" ] && emit_f blind-ssrf-redirect high oast "$(nurl "$l")" "$l"; done < "$oast_hits_file"
-  } | jq -s "{target:\"$domain\", generated:\"$(date -u +%FT%TZ)\", blueprint:\"${BLUEPRINT_NAME:-}\", count:length, findings:.}" > "$findings_json" 2>/dev/null || echo '{}' > "$findings_json"
+    true   # force group exit 0: a trailing false [ -f ] test must not (via pipefail) trip the || fallback and clobber jq's output
+  } | jq -s "{target:\"$domain\", generated:\"$(date -u +%FT%TZ)\", blueprint:\"${BLUEPRINT_NAME:-}\", count:length, findings:.}" > "$findings_json" 2>/dev/null
+  [ -s "$findings_json" ] || echo '{}' > "$findings_json"
 
   if [ "$EMIT_SARIF" = 1 ]; then
     jq '{version:"2.1.0", "$schema":"https://json.schemastore.org/sarif-2.1.0.json",
