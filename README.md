@@ -250,18 +250,34 @@ When run in a terminal, 4tail shows a self-updating panel instead of scrolling l
 
 ```
  ╭─ 4tail ───────────────────────────────────────
- │ target=example.com  ai=zai-org/GLM-5.3  elapsed=41s
+ │ target=example.com  ai=zai-org/GLM-5.3  elapsed=41s  spent=$0.01/$2
  │  ✔  Subdomains    128 subs
  │  ✔  Live hosts    37 live
  │  ✔  AI scan plan  cves,exposures,wordpress,php,nginx
  │  ⠹  Fuzzing       host 12/37
  │  ○  Nuclei scan
  │  ○  AI triage
+ │  🤖 Scan ~40% done, error rate low — mostly 404s, ETA ~3m.
+ ├─ loot ─────────────────────────────────────────
+ │  [INFO] 200 http://example.com/.git/config (ffuf)
+ │  [HIGH] http://example.com/x?f=../../etc/passwd (dast)
+ │  [LOW] http://example.com/search?q=… (kxss)
+ │  [INFO] spec: http://api.example.com/openapi.json (api)
+ │
+ │
  ╰──────────────────────────────────────────────
 ```
 
 Icons: `○` pending · spinner running · `✔` done · `▲` warning · `–` skipped.
-It auto-disables (falling back to plain `[*]/[+]/[!]` logs) when output isn't a
+
+**Loot feed** — findings stream into the `loot` panel in real time as each tool
+produces them (ffuf content-discovery, nuclei/-dast, dalfox, kxss, sqlmap, JS secrets,
+exposed API specs), color-coded by severity (red=high/crit, yellow=medium, cyan=low). It's
+a fixed-height panel (`LOOT_ROWS`, default 6) so the in-place redraw stays perfectly
+synced — no scroll-duplication, and the borders adapt to the terminal width. Turn it off
+with `LOOT_FEED=0`.
+
+The dashboard auto-disables (falling back to plain `[*]/[+]/[!]` logs) when output isn't a
 terminal — e.g. piped to a file or run in CI. Force plain mode with `-P` or `NO_TUI=1`.
 
 ## Prerequisites
