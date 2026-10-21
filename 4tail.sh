@@ -1825,27 +1825,34 @@ else
     set_stage $S_AGENT running "round $round/$AGENT_ROUNDS: AI choosing probes"
     aout="$(mktemp)"
     ai_call "$LLM_MODEL_PLAN" 2000 \
-"You are an autonomous web-app pentester on an AUTHORIZED target. From the recon situation and prior probe results, decide the NEXT most valuable GET requests to CONFIRM or ESCALATE the juiciest issues. Ideas: LFI -> read ../web.config, ../global.asa, ../../windows/win.ini; empty/small 200 endpoints (e.g. db.asp) -> try likely params (?id=1&table=users&action=list&debug=1); open-redirect params -> set value to //example.org and watch for a Location; IDOR -> walk adjacent numeric ids; exposed admin/config/backup paths -> fetch them. Be decisive and DO NOT keep hammering one endpoint - breadth over depth, then stop. Respond with ONLY lines, each exactly:
-GET <absolute-url> | <one-line why> | <regex that means success>
-Max $AGENT_MAX_PROBES lines. URLs must be http(s) on the target scope (*.$domain). No prose, no markdown." \
+"You are an autonomous web-app pentester on an AUTHORIZED target. From the recon situation and prior probe results, pick the NEXT most valuable GET requests to CONFIRM or ESCALATE the juiciest issues:
+- Confirmed/possible LFI (e.g. Templatize.asp?item=): read ../web.config, ../../web.config, ../global.asa, ../../../windows/win.ini, ../../boot.ini
+- Empty/small 200 endpoints (e.g. db.asp): add likely params ?id=1 ?debug=1 ?action=list ?table=users ?cmd=test
+- Redirect params (RetURL/url/next): set value to //example.org/ and watch for a Location
+- IDOR: walk adjacent numeric ids; exposed admin/config/backup paths: fetch them
+Be decisive, breadth over depth, then stop. Output ONE absolute http(s) URL per line (target scope *.$domain only). You MAY append ' | why | success-regex' but a bare URL is fine. No prose before/after, no code fences." \
 "SITUATION:
 $situation
 
 PRIOR PROBE RESULTS:
 $results" > "$aout" 2>>"$llm_log" || true
-    probes="$(grep -iE '^GET[[:space:]]+https?://' "$aout" | head -n "$AGENT_MAX_PROBES")"; rm -f "$aout"
+    # Robust extraction: take every line that carries an in-scope http(s) URL, whatever
+    # wrapping the model used (bare, 'GET ...', '1. ...', '- ...', or inside prose).
+    probes="$(grep -iE 'https?://' "$aout" | head -n $((AGENT_MAX_PROBES * 3)))"; rm -f "$aout"
     [ -n "$probes" ] || { [ "$round" -eq 1 ] && SUP_NOTE="agent: no probes proposed"; break; }
-    results=""
+    # Default "looks sensitive" markers so a probe can confirm even when the model gives no regex.
+    agent_default_rx='connectionString|<configuration|<\?xml|root:.{0,40}:0:0:|\[fonts\]|\[extensions\]|16-bit app support|BEGIN [A-Z ]*PRIVATE KEY|DB_PASSWORD|SA_PASSWORD|Microsoft OLE DB|ODBC|SQL syntax.*MySQL|ORA-[0-9]{4,}|Directory of |<web-app|runtime error'
+    results=""; np=0
     while IFS= read -r pline; do
-      [ -n "$pline" ] || continue
-      url="$(printf '%s' "$pline" | sed -E 's/^GET[[:space:]]+//I' | awk -F'[|]' '{print $1}' | tr -d '[:space:]')"
-      why="$(printf '%s' "$pline" | awk -F'[|]' '{print $2}' | sed 's/^ *//;s/ *$//')"
-      rx="$(printf '%s'  "$pline" | awk -F'[|]' '{print $3}' | sed 's/^ *//;s/ *$//')"
+      [ "$np" -ge "$AGENT_MAX_PROBES" ] && break
+      url="$(printf '%s' "$pline" | grep -oiE 'https?://[^ "'"'"'`|<>]+' | head -1)"
       [ -n "$url" ] || continue
+      why="$(printf '%s' "$pline" | awk -F'\\|' 'NF>=2{print $2}' | sed 's/^ *//;s/ *$//')"; [ -n "$why" ] || why="agent probe"
+      rx="$(printf '%s'  "$pline" | awk -F'\\|' 'NF>=3{print $3}' | sed 's/^ *//;s/ *$//')"; [ -n "$rx" ] || rx="$agent_default_rx"
       # HARD GUARDRAILS: http(s) only, must be in target scope, no dup probes.
       printf '%s' "$url" | grep -qiE "^https?://([a-z0-9._-]+\.)?${esc_domain}([:/]|$)" || continue
       grep -qxF "$url" "$agent_seen" 2>/dev/null && continue
-      printf '%s\n' "$url" >> "$agent_seen"
+      printf '%s\n' "$url" >> "$agent_seen"; np=$((np+1))
       set_stage $S_AGENT running "round $round: probing ($(nlines "$agent_seen") sent)"; render
       resp="$(curl -s -i -L --max-time 12 ${CURL_NET[@]+"${CURL_NET[@]}"} "$url" 2>/dev/null | head -c 6000)"
       # redact anything that looks like a secret before it is stored or sent back to the LLM
