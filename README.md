@@ -37,10 +37,20 @@ Fuzzing is no longer "one wordlist for everything". For **each live host**, 4tai
   `Common-PHP-Filenames.txt`, an Apache host gets `Apache.fuzz.txt`,
 - **dedups** the combined list (capped at `MAX_FUZZ_WORDS`) and fuzzes with it.
 
-The tech→wordlist map comes from the AI plan **and** a built-in static map, so it works
-tech-aware even with no API key. SecLists is auto-detected (`SECLISTS_DIR`), and every
-path is existence-checked — lists missing in your SecLists version are simply skipped.
-Which lists each host received is recorded in `fuzz_plan.txt` and in the report.
+The tech→wordlist map comes from **three** layers: a built-in static map, the AI plan, and
+a **dynamic index of your actual SecLists install** (`SECLISTS_DYNAMIC=1`, default on).
+The dynamic layer indexes every real list under `Discovery/Web-Content` once and matches
+detected tech tokens against real filenames — so a `jenkins`, `grafana`, or `weblogic` host
+automatically pulls `jenkins.txt` / `grafana.txt` / `weblogic.txt` even though those aren't
+hardcoded, and nothing ever references a path that isn't installed. Big generic lists
+(`raft-*`, `big.txt`, `directory-list-*`, `common.txt`, …) are excluded, and each tech token
+pulls at most `SECLISTS_MATCH_MAX` (3) lists. It works tech-aware even with no API key.
+SecLists is auto-detected (`SECLISTS_DIR`), every path is existence-checked, and which lists
+each host received is recorded in `fuzz_plan.txt` and the report.
+
+Fuzzing is bounded so it can't run away on a slow host: `MAX_FUZZ_WORDS` (18k) caps the
+combined per-host list, `MAX_EXTS` (4) caps extensions, and `FUZZ_MAX_TIME` (300s) is a hard
+ffuf `-maxtime` per host. Raise them for deep runs (`MAX_FUZZ_WORDS=60000 FUZZ_MAX_TIME=0`).
 
 > **`apt install seclists`** installs to `/usr/share/seclists`, which 4tail auto-detects.
 > If yours is elsewhere, set `SECLISTS_DIR=/path/to/SecLists`.

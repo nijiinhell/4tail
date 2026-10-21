@@ -61,6 +61,8 @@ cost_ledger=""                               # resolved after OUTDIR is known
 # ---------------------------------------------------------------------------
 WORDLIST="${WORDLIST:-}"                   # base "juicy" list; auto-resolved below (Bo0oM/fuzz.txt preferred)
 SECLISTS_DIR="${SECLISTS_DIR:-}"          # auto-detected below if empty
+SECLISTS_DYNAMIC="${SECLISTS_DYNAMIC:-1}" # 1 = also match detected tech against REAL SecLists filenames (not just the static map)
+SECLISTS_MATCH_MAX="${SECLISTS_MATCH_MAX:-3}" # cap dynamically-matched lists per tech token
 MAX_FUZZ_WORDS="${MAX_FUZZ_WORDS:-18000}" # cap per-host combined wordlist size (bounty-sized; raise for deep runs)
 MAX_FUZZ_HOSTS="${MAX_FUZZ_HOSTS:-0}"     # cap number of hosts to fuzz (0 = all)
 FUZZ_MAX_TIME="${FUZZ_MAX_TIME:-300}"     # hard per-host ffuf time cap (s) so a slow host can't stall the stage; 0 = unlimited
@@ -321,6 +323,7 @@ if [ "$DOCTOR" != 1 ]; then
   report_file="$OUTDIR/report.md"
   llm_log="$OUTDIR/llm.log"
   tech_map_file="$OUTDIR/tech_wordlists.tsv"   # tech <TAB> seclists-relative-path
+  seclists_index="$OUTDIR/.seclists_index.tsv" # basename <TAB> abs-path of real SecLists Web-Content lists
   fuzz_plan_file="$OUTDIR/fuzz_plan.txt"        # host <TAB> wordlists used
   nuclei_stats_file="$OUTDIR/nuclei_stats.jsonl"
   supervisor_log="$OUTDIR/supervisor.log"
@@ -1197,6 +1200,26 @@ fi
 # detected tech  ->  deduped combined list  ->  ffuf. Every AI/static path is
 # existence-checked, so nothing bogus reaches ffuf.
 
+# Index every real SecLists Web-Content list once (basename<TAB>abs-path), excluding
+# the big generic lists. Lets us match detected tech to files that ACTUALLY exist -
+# auto-covering tech we never hardcoded (jenkins, grafana, weblogic, ...) and never
+# referencing a path that isn't installed.
+build_seclists_index() {
+  [ "$SECLISTS_DYNAMIC" = 1 ] && [ -n "$SECLISTS_DIR" ] || return 0
+  [ -s "$seclists_index" ] && return 0   # already built (e.g. resume)
+  local root="$SECLISTS_DIR/Discovery/Web-Content"; [ -d "$root" ] || root="$SECLISTS_DIR"
+  find "$root" -maxdepth 4 -type f \( -iname '*.txt' -o -iname '*.fuzz.txt' \) 2>/dev/null \
+    | grep -viE 'raft-|big\.txt|directory-list|combined_|dirbuster|/all\.txt|/common\.txt|/quickhits' \
+    | while IFS= read -r f; do printf '%s\t%s\n' "$(basename "$f" | tr 'A-Z' 'a-z')" "$f"; done \
+    > "$seclists_index" 2>/dev/null || true
+}
+# Real SecLists files whose basename contains a tech token (specific lists only).
+seclists_match() {  # tech-token -> abs paths
+  local t; t="$(printf '%s' "$1" | tr 'A-Z' 'a-z')"
+  [ "${#t}" -ge 3 ] && [ -s "$seclists_index" ] || return 0
+  awk -F'\t' -v t="$t" 'index($1,t){print $2}' "$seclists_index" | head -n "$SECLISTS_MATCH_MAX"
+}
+
 # Collect the wordlist paths for a given comma-separated, lowercased tech string.
 # Prints one absolute wordlist path per line (base list first, then tech lists).
 host_wordlists() {
@@ -1206,17 +1229,23 @@ host_wordlists() {
   if [ -n "$API_ENDPOINTS_EXTRA" ]; then
     case ",$techs," in *api*|*graphql*|*swagger*|*rest*|*json*) printf '%s\n' "$API_ENDPOINTS_EXTRA" ;; esac
   fi
-  [ -n "$SECLISTS_DIR" ] && [ -s "$tech_map_file" ] || return 0
+  [ -n "$SECLISTS_DIR" ] || return 0
   IFS=',' read -ra _arr <<< "$techs"
-  for t in "${_arr[@]}"; do
-    [ -z "$t" ] && continue
-    while IFS=$'\t' read -r key rel; do
-      [ -z "$key" ] && continue
-      # skip heavy/generic lists (bounty scans prefer small tech-specific lists)
-      case "$rel" in *raft-*|*big.txt|*directory-list*|*combined_*|*dirbuster*|*/all.txt) continue ;; esac
-      case "$t" in *"$key"*) [ -f "$SECLISTS_DIR/$rel" ] && printf '%s\n' "$SECLISTS_DIR/$rel" ;; esac
-    done < "$tech_map_file"
-  done
+  # (a) static + AI tech->list map
+  if [ -s "$tech_map_file" ]; then
+    for t in "${_arr[@]}"; do
+      [ -z "$t" ] && continue
+      while IFS=$'\t' read -r key rel; do
+        [ -z "$key" ] && continue
+        case "$rel" in *raft-*|*big.txt|*directory-list*|*combined_*|*dirbuster*|*/all.txt) continue ;; esac
+        case "$t" in *"$key"*) [ -f "$SECLISTS_DIR/$rel" ] && printf '%s\n' "$SECLISTS_DIR/$rel" ;; esac
+      done < "$tech_map_file"
+    done
+  fi
+  # (b) dynamic: match detected tech against REAL SecLists filenames
+  if [ "$SECLISTS_DYNAMIC" = 1 ]; then
+    for t in "${_arr[@]}"; do [ -n "$t" ] && seclists_match "$t"; done
+  fi
 }
 
 # Generic "juicy" extensions distilled from Bo0oM/fuzz.txt's extensions.txt
@@ -1267,6 +1296,8 @@ elif [ "$fuzz_possible" != 1 ]; then
 elif [ "$RESUME" = 1 ] && [ -f "$OUTDIR/.done_fuzz" ]; then
   set_stage $S_FUZZ done "$(grep -c . "$fuzz_plan_file" 2>/dev/null || echo 0) hosts (resumed)"
 else
+  set_stage $S_FUZZ running "indexing SecLists"
+  build_seclists_index   # index real SecLists files once so tech matching is grounded in what's installed
   set_stage $S_FUZZ running "0 hosts"
   [ "$RESUME" = 1 ] || : > "$fuzz_plan_file"   # keep prior progress when resuming
   if [ "$DEDUPE_ORIGINS" = 1 ] && [ -s "$httpx_json" ]; then
