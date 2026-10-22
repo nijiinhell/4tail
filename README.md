@@ -270,6 +270,30 @@ OAST_SERVER=oast.mine.net ./4tail.sh -C -O example.com   # self-hosted interacts
 Needs `interactsh-client` (ProjectDiscovery). It sends target-derived callbacks to the
 collaborator server, so keep it to authorized targets; off by default.
 
+### Correlation passes — connecting findings into verdicts (`-C`)
+
+Beyond collecting findings, the active funnel now turns them into action:
+
+- **403/401 → access-control bypass.** Every `401`/`403` from content discovery is retried
+  with the handful of bypass tricks that actually work in the wild — path tweaks (`/x/`,
+  `/x/.`, `/x%2e`, `/x..;/`) and header spoofs (`X-Forwarded-For`, `X-Original-URL`,
+  `X-Rewrite-URL`, `X-Custom-IP-Authorization`). Anything that flips to `2xx`/`3xx` is a
+  **confirmed bypass** (`BYPASS=1`, cap `BYPASS_MAX`).
+- **Cross-host path propagation.** Interesting paths discovered on *any* live host are
+  replayed on *every other* host that didn't have them — so a `/admin/debug.asp` found on
+  one box is tried across the whole scope (`PROPAGATE=1`, needs >1 live host).
+- **Dual-identity IDOR / broken authz** (Autorize-style). Supply one or two sessions and
+  4tail replays each id-bearing request as user A, user B, and anon; when B or anon get the
+  **same successful response** as A, per-user authorization isn't enforced — a confirmed
+  anon-access finding or an IDOR candidate to verify. This is where most real bounties live.
+  ```bash
+  AUTH_A="Cookie: session=AAA" AUTH_B="Cookie: session=BBB" ./4tail.sh -C example.com
+  AUTH_A="Authorization: Bearer eyJ…" ./4tail.sh -C example.com   # A + anon only
+  ```
+  Caps via `IDOR_MAX`; GET-only, scope-locked, behind the authorization gate.
+
+All three feed the loot feed, `findings.json`, the agent's situation, and the report.
+
 ### Agent mode — autonomous validation loop (`-A`)
 
 This is the "live AI hunter": instead of stopping at *candidates*, the AI looks at the

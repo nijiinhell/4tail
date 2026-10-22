@@ -105,6 +105,18 @@ API_SPECS="${API_SPECS:-1}"               # 1 = detect Swagger/OpenAPI/GraphQL s
 API_MAX_SPECS="${API_MAX_SPECS:-5}"       # cap spec documents fetched + fed to the AI
 API_MAX_TESTS="${API_MAX_TESTS:-60}"      # cap AI-generated API test URLs folded into the active set
 
+# --- Correlation / exploitation passes (active, part of -C) -----------------
+BYPASS="${BYPASS:-1}"                      # 403/401 -> try proven access-control bypasses
+BYPASS_MAX="${BYPASS_MAX:-20}"             # cap how many 403/401 URLs to probe
+PROPAGATE="${PROPAGATE:-1}"                # replay interesting discovered paths across all live hosts
+PROP_MAX_PATHS="${PROP_MAX_PATHS:-60}"     # cap paths replayed per host
+# Dual-identity IDOR / broken-authz: supply one or two sessions; each is a header line
+# ("Cookie: ..." or "Authorization: Bearer ...").  A is required; B optional (horizontal test).
+AUTH_A="${AUTH_A:-}"
+AUTH_B="${AUTH_B:-}"
+IDOR="${IDOR:-1}"                          # 1 = run the A/B/anon access-control diff when AUTH_A is set
+IDOR_MAX="${IDOR_MAX:-40}"                 # cap id-bearing URLs tested
+
 # --- Authentication + proxy (cascade to all active tools) -------------------
 AUTH_HEADER="${AUTH_HEADER:-}"            # one or more "Header: value" (newline-separated); also -H
 AUTH_COOKIE="${AUTH_COOKIE:-}"           # "name=val; name2=val2"  -> sent as Cookie header
@@ -183,6 +195,7 @@ Options:
   -x <proxy>  Route tools through http(s) proxy (env PROXY)
   -O          OAST: start interactsh, inject OOB payloads, confirm blind SSRF/redirect (env OAST=1)
   -A          Agent: autonomous AI probe loop - confirms/escalates juicy findings itself (env AGENT=1)
+              (-C also runs: 403/401 bypass, cross-host path replay, and A/B/anon IDOR when AUTH_A/AUTH_B are set)
   -R          Resume: continue a previous run (env RESUME=1; use with -o <dir>)
   -b <usd>    LLM credit budget, e.g. 2      (env LLM_BUDGET_USD, 0=unlimited)
   -y          Skip the authorization prompt  (env ASSUME_YES=1)
@@ -351,6 +364,9 @@ if [ "$DOCTOR" != 1 ]; then
   oast_hits_file="$oast_dir/confirmed.txt"         # correlated: confirmed blind SSRF/redirect
   agent_file="$OUTDIR/agent_confirmed.txt"         # agent loop: confirmed/escalated issues
   agent_log="$OUTDIR/agent_log.txt"                # agent loop: full probe transcript
+  bypass_file="$OUTDIR/findings/bypass.txt"        # 403/401 access-control bypasses
+  prop_file="$OUTDIR/findings/propagated.txt"      # paths found on one host, live on another
+  idor_file="$OUTDIR/findings/idor.txt"            # dual-identity IDOR / broken-authz candidates
   findings_dir="$OUTDIR/findings"; mkdir -p "$findings_dir"  # per-specialist output
   cost_ledger="${LLM_COST_LEDGER:-$OUTDIR/.llm_cost_usd}"
   [ -f "$cost_ledger" ] || printf '0\n' > "$cost_ledger"
@@ -517,6 +533,8 @@ loot_refresh() {
   loot_scan "${api_specs_file:-}"          api     apispec
   loot_scan "${oast_hits_file:-}"          oast    sqlmap
   loot_scan "${agent_file:-}"              agent   sqlmap
+  loot_scan "${bypass_file:-}"             bypass  sqlmap
+  loot_scan "${idor_file:-}"               idor    sqlmap
 }
 
 # _draw_panel: emit the panel body at the current cursor position (no positioning).
@@ -615,6 +633,80 @@ nlines() { [ -f "$1" ] && wc -l < "$1" 2>/dev/null | tr -d ' ' || echo 0; }
 # Drop static-asset URLs (stdin->stdout), testing the extension on the PATH only so a
 # file-ish query value (?file=app.js) is kept. Used to clean input to the slow scanners.
 drop_static() { awk -v re="$STATIC_URL_RE" '{ p=tolower($0); sub(/[?#].*/,"",p); if (p !~ re) print }'; }
+
+# ---- Correlation / exploitation helpers (all GET/HEAD, scope-locked, capped) ----
+# Two response "sizes" are the same resource if within 10% (Autorize-style diff).
+_near() { awk -v a="${1:-0}" -v b="${2:-0}" 'BEGIN{d=a-b;if(d<0)d=-d;m=(a>b?a:b);exit !(a==b || (m>0 && d<=0.10*m))}'; }
+
+# (#2) 403/401 -> proven access-control bypasses. Reads "status<TAB>len<TAB>url"; a trick
+# that turns the 401/403 into a 2xx/3xx is recorded. Only the handful of tricks that
+# actually work in the wild - no spray.
+try_403_bypass() {
+  [ "$BYPASS" = 1 ] || { cat >/dev/null; return 0; }
+  local st len url rest host scheme origin path code n=0 t trick h
+  while IFS=$'\t' read -r st len url; do
+    case "$st" in 401|403) ;; *) continue ;; esac
+    [ -n "$url" ] || continue
+    [ "$n" -ge "$BYPASS_MAX" ] && break; n=$((n+1))
+    scheme="${url%%://*}"; rest="${url#*://}"; host="${rest%%/*}"
+    case "$rest" in */*) path="/${rest#*/}" ;; *) path="/" ;; esac
+    origin="$scheme://$host"
+    for t in "$path/" "$path/." "/.$path" "$path%2e" "$path%20" "$path%09" "$path..;/" "$path?" ; do
+      code="$(curl -s -o /dev/null -w '%{http_code}' -L --max-time 8 ${CURL_NET[@]+"${CURL_NET[@]}"} "$origin$t" 2>/dev/null || echo 000)"
+      case "$code" in 200|201|202|203|206|301|302|307) printf '%s -> %s via path trick %s\n' "$url" "$code" "$origin$t" >> "$bypass_file"; n=$n ; break ;; esac
+    done
+    for h in "X-Forwarded-For: 127.0.0.1" "X-Original-URL: $path" "X-Rewrite-URL: $path" "X-Custom-IP-Authorization: 127.0.0.1" ; do
+      code="$(curl -s -o /dev/null -w '%{http_code}' --max-time 8 ${CURL_NET[@]+"${CURL_NET[@]}"} -H "$h" "$url" 2>/dev/null || echo 000)"
+      case "$code" in 200|201|202|203|206) printf '%s -> %s via header %s\n' "$url" "$code" "$h" >> "$bypass_file"; break ;; esac
+    done
+  done
+}
+
+# (#3) Cross-host propagation: paths found on ANY host, replayed on every other live
+# host that doesn't already have them. Finds shared endpoints a per-host fuzz missed.
+propagate_paths() {
+  [ "$PROPAGATE" = 1 ] || return 0
+  local hosts; hosts="$(awk -F/ 'NF>=3{print $1"//"$3}' "$alive_file" 2>/dev/null | sort -u | head -n 40)"
+  [ "$(printf '%s\n' "$hosts" | grep -c .)" -ge 2 ] || return 0   # pointless with one host
+  local paths; paths="$(awk -F'\t' '$1~/^(200|301|302|401|403)$/{print $3}' "$fuzz_findings_file" 2>/dev/null \
+      | sed -E 's#^[a-z]+://[^/]+##' | grep -E '^/.' | drop_static | sort -u | head -n "$PROP_MAX_PATHS")"
+  [ -n "$paths" ] || return 0
+  local origin p code
+  while IFS= read -r origin; do
+    [ -n "$origin" ] || continue
+    while IFS= read -r p; do
+      [ -n "$p" ] || continue
+      grep -qF "$origin$p" "$fuzz_findings_file" 2>/dev/null && continue  # already known on this host
+      code="$(curl -s -o /dev/null -w '%{http_code}' --max-time 8 ${CURL_NET[@]+"${CURL_NET[@]}"} "$origin$p" 2>/dev/null || echo 000)"
+      case "$code" in 200|301|302|401|403) printf '%s\t%s\n' "$code" "$origin$p" >> "$prop_file" ;; esac
+    done <<< "$paths"
+  done <<< "$hosts"
+}
+
+# (#1) Dual-identity IDOR / broken-authz (Autorize-style): replay A's authorized requests
+# as user B and as anon; same successful response = per-user authz not enforced.
+idor_check() {
+  [ "$IDOR" = 1 ] && [ -n "$AUTH_A" ] || return 0
+  local cand; cand="$( { grep -iE '^idor\t' "$gf_file" 2>/dev/null | cut -f2
+      grep -iE '[?&](id|uid|user|userid|account|acct|order|invoice|doc|docid|file|fileid|num|no|pid|gid|key|ref)=[0-9]+' "$targets_active_file" 2>/dev/null
+    } | sort -u | head -n "$IDOR_MAX" )"
+  [ -n "$cand" ] || return 0
+  local u ra rx rb ca sa cx sx cb sb
+  while IFS= read -r u; do
+    [ -n "$u" ] || continue
+    ra="$(curl -s -o /dev/null -w '%{http_code} %{size_download}' --max-time 10 ${CURL_NET[@]+"${CURL_NET[@]}"} -H "$AUTH_A" "$u" 2>/dev/null || echo '000 0')"
+    ca="${ra%% *}"; sa="${ra##* }"
+    [ "$ca" = 200 ] && [ "${sa:-0}" -gt 0 ] 2>/dev/null || continue   # only resources A can actually read
+    rx="$(curl -s -o /dev/null -w '%{http_code} %{size_download}' --max-time 10 ${CURL_NET[@]+"${CURL_NET[@]}"} "$u" 2>/dev/null || echo '000 0')"
+    cx="${rx%% *}"; sx="${rx##* }"
+    [ "$cx" = 200 ] && _near "$sa" "$sx" && printf '[ANON-ACCESS] %s | authorized content served with NO session (A=200/%s anon=200/%s)\n' "$u" "$sa" "$sx" >> "$idor_file"
+    if [ -n "$AUTH_B" ]; then
+      rb="$(curl -s -o /dev/null -w '%{http_code} %{size_download}' --max-time 10 ${CURL_NET[@]+"${CURL_NET[@]}"} -H "$AUTH_B" "$u" 2>/dev/null || echo '000 0')"
+      cb="${rb%% *}"; sb="${rb##* }"
+      [ "$cb" = 200 ] && _near "$sa" "$sb" && printf '[IDOR?] %s | user B gets the same resource as user A (A=200/%s B=200/%s) - verify object ownership\n' "$u" "$sa" "$sb" >> "$idor_file"
+    fi
+  done <<< "$cand"
+}
 
 # Find the installed nuclei template store (config -> common paths). Defined early
 # so `doctor` (which runs before the pipeline helpers) can call it too.
@@ -1764,8 +1856,17 @@ else
   for sp in "${SPIDS[@]:-}"; do [ -n "$sp" ] && wait "$sp" 2>/dev/null || true; done
   rm -f "$OUTDIR/.dast_targets.txt" "$findings_dir/.xssq.txt" "$findings_dir/.sqliq.txt"
 
+  # (G) Correlation / exploitation passes that connect findings into verdicts.
+  : > "$bypass_file"; : > "$prop_file"; : > "$idor_file"
+  set_stage $S_CRAWL running "403 bypass · path propagation · authz diff"
+  awk -F'\t' '$1==401||$1==403' "$fuzz_findings_file" 2>/dev/null \
+    | grep -viE 'google\.com|%2e%2e|\\\.\\\.|etc.{0,3}passwd' \
+    | awk -F'\t' '!seen[$1"\t"$2]++' | try_403_bypass; render
+  propagate_paths; render
+  idor_check; render
+
   touch "$OUTDIR/.done_crawl"
-  set_stage $S_CRAWL done "$url_total urls -> $pattern_total patterns -> $active_total active | api:$(nlines "$api_specs_file")spec/$(nlines "$api_tests_file")test dast:$(nlines "$dast_file") dalfox:$(nlines "$findings_dir/dalfox.txt") kxss:$(nlines "$findings_dir/kxss.txt") sqlmap:$(nlines "$findings_dir/sqlmap.txt")"
+  set_stage $S_CRAWL done "$url_total urls -> $active_total active | dast:$(nlines "$dast_file") dalfox:$(nlines "$findings_dir/dalfox.txt") kxss:$(nlines "$findings_dir/kxss.txt") sqlmap:$(nlines "$findings_dir/sqlmap.txt") bypass:$(nlines "$bypass_file") prop:$(nlines "$prop_file") idor:$(nlines "$idor_file")"
 fi
 
 # Step 5: Nuclei
@@ -1899,6 +2000,8 @@ else
       [ -s "$nuclei_file" ] && { echo "CONFIRMED NUCLEI (cves/exposures/misconfig/tech):"; head -20 "$nuclei_file"; }
       [ -s "$js_secrets_file" ] && { echo "JS SECRET CANDIDATES (url<TAB>match):"; head -15 "$js_secrets_file"; }
       [ -s "${api_specs_file:-/dev/null}" ] && { echo "EXPOSED API SPECS (fetch + inspect):"; head -10 "$api_specs_file"; }
+      [ -s "${bypass_file:-/dev/null}" ] && { echo "ACCESS-CONTROL BYPASSES (403->200):"; head -10 "$bypass_file"; }
+      [ -s "${idor_file:-/dev/null}" ] && { echo "IDOR / AUTHZ CANDIDATES:"; head -10 "$idor_file"; }
       [ -s "$findings_dir/kxss.txt" ] && { echo "REFLECTED PARAMS (kxss):"; head -15 "$findings_dir/kxss.txt"; }
       [ -s "$gf_file" ] && { echo "GF CANDIDATE BUCKETS (class<TAB>url):"; head -40 "$gf_file"; }
       [ -s "$fuzz_findings_file" ] && { echo "EMPTY/SMALL 200 ENDPOINTS (param-mine candidates):";
@@ -2014,6 +2117,15 @@ fi
   if [ -s "$dast_file" ]; then
     echo "## DAST findings (nuclei -dast)"; echo; echo '```'; head -n 100 "$dast_file"; echo '```'; echo
   fi
+  if [ -s "${bypass_file:-/dev/null}" ]; then
+    echo "## Access-control bypasses (403/401 → 2xx)"; echo; echo '```'; cat "$bypass_file"; echo '```'; echo
+  fi
+  if [ -s "${idor_file:-/dev/null}" ]; then
+    echo "## IDOR / broken-authz candidates (verify object ownership)"; echo; echo '```'; cat "$idor_file"; echo '```'; echo
+  fi
+  if [ -s "${prop_file:-/dev/null}" ]; then
+    echo "## Cross-host paths (found on one host, live on another)"; echo; echo '```'; head -n 60 "$prop_file"; echo '```'; echo
+  fi
   if [ -s "$findings_dir/dalfox.txt" ]; then
     echo "## XSS (dalfox)"; echo; echo '```'; head -n 80 "$findings_dir/dalfox.txt"; echo '```'; echo
   fi
@@ -2026,7 +2138,7 @@ fi
 } > "$report_file"
 
 # Step 6: AI triage  (analyses nuclei + content-discovery + JS + crawl/DAST)
-have_extra=0; { [ -s "$js_secrets_file" ] || [ -s "$params_file" ] || [ -s "$fuzz_findings_file" ] || [ -s "$dast_file" ] || [ -s "$gf_file" ] || [ -s "$findings_dir/dalfox.txt" ] || [ -s "$findings_dir/sqlmap.txt" ] || [ -s "$agent_file" ]; } && have_extra=1
+have_extra=0; { [ -s "$js_secrets_file" ] || [ -s "$params_file" ] || [ -s "$fuzz_findings_file" ] || [ -s "$dast_file" ] || [ -s "$gf_file" ] || [ -s "$findings_dir/dalfox.txt" ] || [ -s "$findings_dir/sqlmap.txt" ] || [ -s "$agent_file" ] || [ -s "${bypass_file:-/dev/null}" ] || [ -s "${idor_file:-/dev/null}" ]; } && have_extra=1
 if [ "$AI_ENABLED" = "1" ] && { [ "$find_count" -gt 0 ] || [ "$have_extra" = 1 ]; } && ! budget_ok; then
   { echo "## Findings (budget reached, no AI triage)"; echo '```'; cat "$nuclei_file" 2>/dev/null
     [ -s "$js_secrets_file" ] && { echo; echo "# JS secret candidates:"; cat "$js_secrets_file"; }; echo '```'; } >> "$report_file"
@@ -2088,7 +2200,13 @@ $(head -c 8000 "$js_secrets_file" 2>/dev/null)
 $(head -c 4000 "$params_file" 2>/dev/null)
 
 === agent-confirmed issues (autonomous probe loop; treat as CONFIRMED, rank high) ===
-$(head -c 4000 "$agent_file" 2>/dev/null)" "$triage_out"
+$(head -c 4000 "$agent_file" 2>/dev/null)
+
+=== access-control bypasses (403/401 -> 2xx; CONFIRMED, rank high) ===
+$(head -c 2000 "${bypass_file:-/dev/null}" 2>/dev/null)
+
+=== IDOR / broken-authz candidates (A/B/anon diff; verify object ownership) ===
+$(head -c 2000 "${idor_file:-/dev/null}" 2>/dev/null)" "$triage_out"
   if [ -s "$triage_out" ]; then
     # Drop any leading reasoning: keep from the LAST "## Executive summary" to the end
     # (reasoning models may restate the section names earlier while thinking).
@@ -2142,6 +2260,9 @@ if have jq; then
     [ -f "${api_specs_file:-}" ] && while IFS= read -r l; do [ -n "$l" ] && emit_f api-spec info api-discovery "$l" "exposed API spec: $l"; done < "$api_specs_file"
     [ -f "${oast_hits_file:-}" ] && while IFS= read -r l; do [ -n "$l" ] && emit_f blind-ssrf-redirect high oast "$(nurl "$l")" "$l"; done < "$oast_hits_file"
     [ -f "${agent_file:-}" ] && while IFS= read -r l; do [ -n "$l" ] && emit_f agent-confirmed high agent "$(nurl "$l")" "$l"; done < "$agent_file"
+    [ -f "${bypass_file:-}" ] && while IFS= read -r l; do [ -n "$l" ] && emit_f access-control-bypass high bypass "$(nurl "$l")" "$l"; done < "$bypass_file"
+    [ -f "${idor_file:-}" ] && while IFS= read -r l; do [ -n "$l" ] && emit_f idor-authz high idor "$(nurl "$l")" "$l"; done < "$idor_file"
+    [ -f "${prop_file:-}" ] && while IFS=$'\t' read -r c u; do [ -n "$u" ] && emit_f content-discovery info cross-host "$u" "status=$c (found on a sibling host)"; done < "$prop_file"
     true   # force group exit 0: a trailing false [ -f ] test must not (via pipefail) trip the || fallback and clobber jq's output
   } | jq -s "{target:\"$domain\", generated:\"$(date -u +%FT%TZ)\", blueprint:\"${BLUEPRINT_NAME:-}\", count:length, findings:.}" > "$findings_json" 2>/dev/null
   [ -s "$findings_json" ] || echo '{}' > "$findings_json"
@@ -2158,7 +2279,7 @@ fi
 
 # Final summary
 spend_note=""; [ "$AI_ENABLED" = 1 ] && spend_note="  ·  AI spend ~$(cost_fmt)"
-tally="nuclei:$find_count  fuzz-hits:${fuzz_hits:-0}$([ "$JSMINE" = 1 ] && echo "  js-secrets:$(nlines "$js_secrets_file")  params:$(nlines "$params_file")")$([ "$CRAWL" = 1 ] && echo "  active:$(nlines "$targets_active_file")  api-specs:$(nlines "${api_specs_file:-/dev/null}")  dast:$(nlines "$dast_file")  dalfox:$(nlines "$findings_dir/dalfox.txt")  sqlmap:$(nlines "$findings_dir/sqlmap.txt")")$([ "$OAST" = 1 ] && echo "  oast-confirmed:$(nlines "${oast_hits_file:-/dev/null}")")$([ "$AGENT" = 1 ] && echo "  agent-confirmed:$(nlines "${agent_file:-/dev/null}")")"
+tally="nuclei:$find_count  fuzz-hits:${fuzz_hits:-0}$([ "$JSMINE" = 1 ] && echo "  js-secrets:$(nlines "$js_secrets_file")  params:$(nlines "$params_file")")$([ "$CRAWL" = 1 ] && echo "  active:$(nlines "$targets_active_file")  api-specs:$(nlines "${api_specs_file:-/dev/null}")  dast:$(nlines "$dast_file")  dalfox:$(nlines "$findings_dir/dalfox.txt")  sqlmap:$(nlines "$findings_dir/sqlmap.txt")")$([ "$OAST" = 1 ] && echo "  oast-confirmed:$(nlines "${oast_hits_file:-/dev/null}")")$([ "$AGENT" = 1 ] && echo "  agent-confirmed:$(nlines "${agent_file:-/dev/null}")")$([ "$CRAWL" = 1 ] && echo "  bypass:$(nlines "${bypass_file:-/dev/null}")  idor:$(nlines "${idor_file:-/dev/null}")")"
 if [ "$TUI" = 1 ]; then
   tui_end    # leave alt screen, reprint final panel into normal scrollback
   printf '\n %s✔ done in %ss%s%s\n   %s%s%s\n   report → %s%s%s\n' \
