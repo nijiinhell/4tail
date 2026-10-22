@@ -29,7 +29,7 @@ LLM_API_KEY="${TOGETHER_API_KEY:-${LLM_API_KEY:-}}"
 # Strip stray whitespace/newlines (a trailing newline corrupts the auth header -> 401).
 LLM_API_KEY="$(printf '%s' "$LLM_API_KEY" | tr -d '[:space:]')"
 LLM_BASE_URL="${LLM_BASE_URL:-https://api.together.xyz/v1}"
-LLM_MODEL="${LLM_MODEL:-zai-org/GLM-5.3}"   # base default for every role
+LLM_MODEL="${LLM_MODEL:-zai-org/GLM-5.3-Flash}"   # base default for every role (Flash = ~9x cheaper output than non-Flash GLM-5.3, same quality for these tasks)
 LLM_MAX_TOKENS="${LLM_MAX_TOKENS:-4000}"    # reasoning models spend tokens thinking; leave room for real output
 LLM_TEMPERATURE="${LLM_TEMPERATURE:-0.2}"
 LLM_TIMEOUT="${LLM_TIMEOUT:-300}"
@@ -40,7 +40,7 @@ LLM_MODEL_PLAN="${LLM_MODEL_PLAN:-}"        # scan planner; default = LLM_MODEL
 LLM_MODEL_TRIAGE="${LLM_MODEL_TRIAGE:-}"    # findings analyst; default = LLM_MODEL
 LLM_MAX_TOKENS_PLAN="${LLM_MAX_TOKENS_PLAN:-6000}"   # headroom for reasoning models (GLM/DeepSeek think first)
 LLM_MAX_TOKENS_TRIAGE="${LLM_MAX_TOKENS_TRIAGE:-}"  # default = LLM_MAX_TOKENS
-LLM_FALLBACK_MODELS="${LLM_FALLBACK_MODELS:-}"       # tried in order if primary fails
+LLM_FALLBACK_MODELS="${LLM_FALLBACK_MODELS:-deepseek-ai/DeepSeek-V4.1-Flash}"  # tried in order if the primary errors (resilience; only billed when used)
 # AI supervisor: periodic plain-language status during the long nuclei stage.
 SUPERVISOR="${SUPERVISOR:-1}"                        # 1 = on (needs API key); report-only
 SUPERVISOR_INTERVAL="${SUPERVISOR_INTERVAL:-120}"   # seconds between supervisor notes
