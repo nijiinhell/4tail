@@ -1667,15 +1667,22 @@ else
     set_stage $S_CRAWL running "api specs: $(nlines "$api_specs_file") found, $(nlines "$api_tests_file") tests built"
   fi
 
-  # (D) arjun param discovery on the juicy hosts (augments the active set)
-  if has_spec arjun && have arjun && [ "${ACT_MAX_ARJUN:-0}" -gt 0 ] 2>/dev/null && [ "$active_total" -gt 0 ]; then
+  # (D) Hidden parameters -> real test URLs in the active set.
+  # (D1) Reuse params already discovered by the -j stage (params.txt: url<TAB>param)
+  #      instead of re-running arjun, and emit a testable URL (?param=1), not a bare ?param.
+  if [ -s "${params_file:-/dev/null}" ]; then
+    set_stage $S_CRAWL running "folding $(nlines "$params_file") discovered params into tests"
+    awk -F'\t' 'NF>=2{sep=($1 ~ /\?/)?"&":"?"; print $1 sep $2 "=1"}' "$params_file" >> "$targets_active_file"
+    sort -u -o "$targets_active_file" "$targets_active_file"
+  # (D2) else run arjun here on the juicy hosts (also emitting ?param=1, not bare ?param)
+  elif has_spec arjun && have arjun && [ "${ACT_MAX_ARJUN:-0}" -gt 0 ] 2>/dev/null && [ "$active_total" -gt 0 ]; then
     set_stage $S_CRAWL running "arjun param discovery"
     awk -F/ '{print $1"//"$3}' "$targets_active_file" | sort -u | head -n "$ACT_MAX_ARJUN" \
       | while read -r h; do [ -n "$h" ] && arjun -u "$h" -q -oT /dev/stdout 2>/dev/null \
-          | sed "s#^#${h}/?#" ; done >> "$targets_active_file" 2>/dev/null || true
-    sort -u -o "$targets_active_file" "$targets_active_file"
-    active_total="$(nlines "$targets_active_file")"
+          | sed "s#^#${h}/?#; s#\$#=1#" ; done >> "$targets_active_file" 2>/dev/null || true
   fi
+  sort -u -o "$targets_active_file" "$targets_active_file"
+  active_total="$(nlines "$targets_active_file")"
 
   # (E) gf bucketing on the active set (candidate classes for routing)
   : > "$gf_file"
@@ -1768,13 +1775,15 @@ if [ "$NUCLEI_DEDUPE" = 1 ] && [ -s "$httpx_json" ]; then
       | @tsv' "$httpx_json" 2>/dev/null \
     | awk -F'\t' '!seen[$5]++' \
     | { [ "$NUCLEI_SKIP_CDN" = 1 ] && grep -viE "$CDN_RE" || cat; } \
-    | awk -F'\t' '
+    | awk -F'\t' -v stale="${stale_file:-}" '
+        BEGIN{ if (stale != "") { while ((getline ln < stale) > 0) { n=split(ln,a,"\t"); if (n>=2) sc[a[2]]=a[1] } } }
         { url=$1; tech=$2; st=$3; l=tolower($1" "$4" "$2); s=0;
           if (l ~ /admin|login|portal|dashboard|dev|staging|test|internal|api|graphql|swagger|git|jenkins|grafana|kibana|vpn|auth|sso|jira|confluence|gitlab|panel|backend|secure|account|billing|payment|upload|debug|config/) s+=3;
           if (st=="401"||st=="403") s+=2;
           if (st=="500"||st=="503") s+=1;
           if (tech ~ /wordpress|drupal|joomla|magento|jira|confluence|gitlab|jenkins|grafana|tomcat|spring|php/) s+=2;
           if (tech ~ /cloudfront|cloudflare|akamai|fastly|imperva|incapsula|sucuri|edgecast/) s-=5;
+          if (url in sc) s += sc[url];   # legacy/outdated hosts (stale score) rank higher here too
           printf "%d\t%s\n", s, url }' \
     | sort -t"$(printf '\t')" -k1,1nr -s \
     | cut -f2 > "$nuclei_targets_file"
@@ -1874,6 +1883,9 @@ else
       echo "TARGET SCOPE: *.$domain"
       [ -s "${stale_file:-/dev/null}" ] && { echo "LEGACY HOSTS (older=prioritize):"; head -5 "$stale_file"; }
       [ -s "$dast_file" ] && { echo "CONFIRMED DAST (nuclei):"; head -20 "$dast_file"; }
+      [ -s "$nuclei_file" ] && { echo "CONFIRMED NUCLEI (cves/exposures/misconfig/tech):"; head -20 "$nuclei_file"; }
+      [ -s "$js_secrets_file" ] && { echo "JS SECRET CANDIDATES (url<TAB>match):"; head -15 "$js_secrets_file"; }
+      [ -s "${api_specs_file:-/dev/null}" ] && { echo "EXPOSED API SPECS (fetch + inspect):"; head -10 "$api_specs_file"; }
       [ -s "$findings_dir/kxss.txt" ] && { echo "REFLECTED PARAMS (kxss):"; head -15 "$findings_dir/kxss.txt"; }
       [ -s "$gf_file" ] && { echo "GF CANDIDATE BUCKETS (class<TAB>url):"; head -40 "$gf_file"; }
       [ -s "$fuzz_findings_file" ] && { echo "EMPTY/SMALL 200 ENDPOINTS (param-mine candidates):";
