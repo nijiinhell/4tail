@@ -608,6 +608,17 @@ budget_ok() { # 0 (true) if under budget or unlimited
 cost_fmt() { awk -v c="$(cost_now)" 'BEGIN{printf "$%.4f", c}'; }
 nlines() { [ -f "$1" ] && wc -l < "$1" 2>/dev/null | tr -d ' ' || echo 0; }
 
+# Find the installed nuclei template store (config -> common paths). Defined early
+# so `doctor` (which runs before the pipeline helpers) can call it too.
+locate_nuclei_templates() {
+  [ -n "$NUCLEI_TEMPLATES_DIR" ] && { [ -d "$NUCLEI_TEMPLATES_DIR" ] && printf '%s\n' "$NUCLEI_TEMPLATES_DIR"; return; }
+  local d; d="$(jq -r '."nuclei-templates-directory" // empty' "$HOME/.config/nuclei/.templates-config.json" 2>/dev/null)"
+  [ -n "$d" ] && [ -d "$d" ] && { printf '%s\n' "$d"; return; }
+  for d in "$HOME/nuclei-templates" "$HOME/.local/nuclei-templates" /root/nuclei-templates /root/.local/nuclei-templates; do
+    [ -d "$d" ] && { printf '%s\n' "$d"; return; }
+  done
+}
+
 # --- Blueprints -------------------------------------------------------------
 BLUEPRINT_NAME=""
 if [ -z "$BLUEPRINTS_DIR" ]; then
@@ -1073,15 +1084,6 @@ sanitize_tags() {
     | while read -r t; do
         case ",${NUCLEI_TAG_ALLOWLIST//[[:space:]]/}," in *",$t,"*) echo "$t";; esac
       done | awk '!seen[$0]++' | paste -sd, -
-}
-# Find the installed nuclei template store (config -> common paths).
-locate_nuclei_templates() {
-  [ -n "$NUCLEI_TEMPLATES_DIR" ] && { [ -d "$NUCLEI_TEMPLATES_DIR" ] && printf '%s\n' "$NUCLEI_TEMPLATES_DIR"; return; }
-  local d; d="$(jq -r '."nuclei-templates-directory" // empty' "$HOME/.config/nuclei/.templates-config.json" 2>/dev/null)"
-  [ -n "$d" ] && [ -d "$d" ] && { printf '%s\n' "$d"; return; }
-  for d in "$HOME/nuclei-templates" "$HOME/.local/nuclei-templates" /root/nuclei-templates /root/.local/nuclei-templates; do
-    [ -d "$d" ] && { printf '%s\n' "$d"; return; }
-  done
 }
 # Index the REAL category tags present in the installed templates, dropping the
 # thousands of per-CVE id tags (cve-YYYY-N) so we keep the useful ~few-hundred
