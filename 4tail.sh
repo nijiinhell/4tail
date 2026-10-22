@@ -118,7 +118,7 @@ OAST_MAX_INJECT="${OAST_MAX_INJECT:-40}" # cap URLs we inject an OOB payload int
 # them (read web.config via LFI, param-mine empty 200s, test redirects, walk IDOR ids),
 # sees the responses, and decides the next move - bounded so it never camps on one host.
 AGENT="${AGENT:-0}"                       # 1 = run the autonomous probe loop (-A)
-AGENT_ROUNDS="${AGENT_ROUNDS:-3}"         # max observe->decide->act rounds
+AGENT_ROUNDS="${AGENT_ROUNDS:-6}"         # max observe->decide->act rounds (AI stops itself when leads run out)
 AGENT_MAX_PROBES="${AGENT_MAX_PROBES:-8}" # max GET probes the AI may fire per round
 AGENT_MAX_TIME="${AGENT_MAX_TIME:-240}"   # hard wall-clock cap (s) for the whole loop; 0 = unlimited
 DEFAULT_NUCLEI_TAGS="${DEFAULT_NUCLEI_TAGS:-cves,exposures,misconfiguration,tech,default-login,takeover}"
@@ -1818,27 +1818,42 @@ else
         awk -F'\t' '$1~/^(200|301|302|401|403)$/{print $1" "$3}' "$fuzz_findings_file" | grep -ivE 'google\.com|etc.{0,3}passwd' | head -25; }
     } | head -c 12000 )"
   astart=$SECONDS; round=0; results="(none yet - this is the first round)"
+  agent_notes="(none yet - first round; form your initial hypotheses from the situation)"
   while [ "$round" -lt "$AGENT_ROUNDS" ]; do
     round=$((round+1))
     budget_ok || { SUP_NOTE="agent: budget reached, stopping"; break; }
     [ "$AGENT_MAX_TIME" -gt 0 ] 2>/dev/null && [ $((SECONDS-astart)) -ge "$AGENT_MAX_TIME" ] && break
-    set_stage $S_AGENT running "round $round/$AGENT_ROUNDS: AI choosing probes"
+    set_stage $S_AGENT running "round $round/$AGENT_ROUNDS: AI thinking"
     aout="$(mktemp)"
-    ai_call "$LLM_MODEL_PLAN" 2000 \
-"You are an autonomous web-app pentester on an AUTHORIZED target. From the recon situation and prior probe results, pick the NEXT most valuable GET requests to CONFIRM or ESCALATE the juiciest issues:
-- Confirmed/possible LFI (e.g. Templatize.asp?item=): read ../web.config, ../../web.config, ../global.asa, ../../../windows/win.ini, ../../boot.ini
-- Empty/small 200 endpoints (e.g. db.asp): add likely params ?id=1 ?debug=1 ?action=list ?table=users ?cmd=test
-- Redirect params (RetURL/url/next): set value to //example.org/ and watch for a Location
-- IDOR: walk adjacent numeric ids; exposed admin/config/backup paths: fetch them
-Be decisive, breadth over depth, then stop. Output ONE absolute http(s) URL per line (target scope *.$domain only). You MAY append ' | why | success-regex' but a bare URL is fine. No prose before/after, no code fences." \
+    ai_call "$LLM_MODEL_PLAN" 2200 \
+"You are an autonomous web-app pentester on an AUTHORIZED target, working in rounds. You keep a running NOTES block (your hypotheses: what you suspect, why, and what is confirmed / refuted / still-unconfirmed), update it each round from the latest probe results, then fire the next GET probes to chase the hottest lead. Then you decide whether to keep going.
+Ideas: confirmed/possible LFI (e.g. Templatize.asp?item=) -> read ../web.config, ../../web.config, ../global.asa, ../../../windows/win.ini; empty/small 200 endpoints (e.g. db.asp) -> add likely params ?id=1 ?debug=1 ?action=list ?table=users; redirect params (RetURL/url/next) -> set value to //example.org/ and watch for a Location; IDOR -> walk adjacent numeric ids; exposed admin/config/backup paths -> fetch them.
+Respond in EXACTLY this structure and nothing else:
+NOTES:
+<2-6 short lines: your updated hypotheses and their status>
+PROBES:
+<one absolute http(s) URL per line, target scope *.$domain only; optional ' | why | success-regex'>
+DECISION: CONTINUE
+(use 'DECISION: STOP' instead when your leads are exhausted or everything promising is already confirmed)" \
 "SITUATION:
 $situation
 
-PRIOR PROBE RESULTS:
+YOUR NOTES SO FAR:
+$agent_notes
+
+LATEST PROBE RESULTS:
 $results" > "$aout" 2>>"$llm_log" || true
-    # Robust extraction: take every line that carries an in-scope http(s) URL, whatever
-    # wrapping the model used (bare, 'GET ...', '1. ...', '- ...', or inside prose).
-    probes="$(grep -iE 'https?://' "$aout" | head -n $((AGENT_MAX_PROBES * 3)))"; rm -f "$aout"
+    # --- parse the structured reply (robust to reasoning-model wrapping) ---
+    # NOTES: text between a NOTES marker and the PROBES/DECISION marker.
+    new_notes="$(awk 'BEGIN{p=0} /^[[:space:]]*NOTES[[:space:]]*:/{p=1;next} /^[[:space:]]*(PROBES|DECISION)[[:space:]]*:/{p=0} p' "$aout" | sed '/^[[:space:]]*$/d' | head -n 8)"
+    [ -n "$new_notes" ] && agent_notes="$new_notes"
+    # DECISION: explicit STOP only (default is to continue while leads/probes remain).
+    decision="$(grep -ioE 'DECISION[[:space:]]*:[[:space:]]*(CONTINUE|STOP)' "$aout" | head -1 | grep -ioE '(CONTINUE|STOP)' | tr 'a-z' 'A-Z')"
+    # PROBES: prefer URLs under the PROBES section; fall back to any in-scope URL in the reply.
+    probes="$(awk 'BEGIN{p=0} /^[[:space:]]*PROBES[[:space:]]*:/{p=1;next} /^[[:space:]]*DECISION[[:space:]]*:/{p=0} p' "$aout" | grep -iE 'https?://')"
+    [ -n "$probes" ] || probes="$(grep -iE 'https?://' "$aout")"
+    probes="$(printf '%s\n' "$probes" | head -n $((AGENT_MAX_PROBES * 3)))"; rm -f "$aout"
+    printf '=== round %s notes ===\n%s\n' "$round" "$agent_notes" >> "$agent_log"
     [ -n "$probes" ] || { [ "$round" -eq 1 ] && SUP_NOTE="agent: no probes proposed"; break; }
     # Default "looks sensitive" markers so a probe can confirm even when the model gives no regex.
     agent_default_rx='connectionString|<configuration|<\?xml|root:.{0,40}:0:0:|\[fonts\]|\[extensions\]|16-bit app support|BEGIN [A-Z ]*PRIVATE KEY|DB_PASSWORD|SA_PASSWORD|Microsoft OLE DB|ODBC|SQL syntax.*MySQL|ORA-[0-9]{4,}|Directory of |<web-app|runtime error'
@@ -1865,7 +1880,11 @@ $results" > "$aout" 2>>"$llm_log" || true
       [ "$hit" = HIT ] && printf '[CONFIRMED] %s | %s\n' "$url" "$why" >> "$agent_file"
     done <<< "$probes"
     [ -n "$results" ] || break
+    # The AI chases a hot lead across rounds, but stops itself when exhausted.
+    if [ "$decision" = STOP ]; then SUP_NOTE="agent: stopping (leads exhausted)"; break; fi
   done
+  # Persist the agent's final reasoning for the report/transcript.
+  { echo "=== final hypotheses ==="; printf '%s\n' "$agent_notes"; } >> "$agent_log"
   set_stage $S_AGENT done "$(nlines "$agent_file") confirmed · $(nlines "$agent_seen") probes · ${round}r"
 fi
 
@@ -1884,9 +1903,10 @@ fi
   echo "- **AI models:** $([ "$AI_ENABLED" = 1 ] && echo "plan=$LLM_MODEL_PLAN, triage=$LLM_MODEL_TRIAGE" || echo "disabled")"
   [ "$AI_ENABLED" = 1 ] && echo "- **Estimated AI spend:** $(cost_fmt)$([ "${LLM_BUDGET_USD:-0}" != 0 ] && echo " (budget \$$LLM_BUDGET_USD)")"
   echo "- **SecLists:** ${SECLISTS_DIR:-not found} | **Base wordlist:** \`$WORDLIST\`"; echo
-  if [ -s "$agent_file" ]; then
-    echo "## 🤖 Agent-confirmed (autonomous probe loop)"; echo
-    echo '```'; cat "$agent_file"; echo '```'; echo
+  if [ "$AGENT" = 1 ] && { [ -s "$agent_file" ] || [ -n "${agent_notes:-}" ]; }; then
+    echo "## 🤖 Agent (autonomous probe loop)"; echo
+    if [ -s "$agent_file" ]; then echo "**Confirmed / escalated:**"; echo '```'; cat "$agent_file"; echo '```'; echo; fi
+    if [ -n "${agent_notes:-}" ]; then echo "**Final hypotheses:**"; echo '```'; printf '%s\n' "$agent_notes"; echo '```'; echo; fi
   fi
   if [ -s "$fuzz_findings_file" ]; then
     echo "## Content discovery hits (ffuf, top 100)"

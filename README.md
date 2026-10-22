@@ -284,8 +284,16 @@ Agent-confirmed` section at the top of the report.
 AGENT_ROUNDS=4 AGENT_MAX_TIME=360 ./4tail.sh -C -A example.com
 ```
 
-**Bounded by design so it never camps on one host:** `AGENT_ROUNDS` (default 3)
-observe→decide→act rounds, `AGENT_MAX_PROBES` (8) GET requests per round, and a hard
+**It reasons with continuity (a "self-brain").** Each round the AI rewrites a running
+**NOTES block of its hypotheses** — what it suspects, why, and what's confirmed / refuted /
+still-unconfirmed — and that memory is fed back in, so it chases a hot lead across rounds
+(e.g. *LFI confirmed → suspect `web.config` readable → machineKey → RCE*) instead of
+starting cold each time. It also decides for itself when to keep going (`DECISION: CONTINUE`)
+or quit (`DECISION: STOP`), and the final hypotheses are written to the report and
+`agent_log.txt`.
+
+**Bounded by design so it never camps on one host:** `AGENT_ROUNDS` (default 6, but the AI
+usually stops itself earlier), `AGENT_MAX_PROBES` (8) GET requests per round, and a hard
 `AGENT_MAX_TIME` wall-clock cap (240s). **Hard guardrails:** GET-only, every probe
 scope-locked to the target domain (off-scope/non-http URLs are dropped), duplicate probes
 skipped, and secrets (passwords, connection strings, keys, tokens) redacted before anything
