@@ -1079,10 +1079,15 @@ wordpress,wp-plugin,joomla,drupal,magento,laravel,django,spring,struts,\
 apache,nginx,tomcat,iis,php,jira,confluence,jenkins,gitlab,grafana,kibana,\
 elasticsearch,kubernetes,docker,aws,azure,gcp,ssl,tls,cors,headers,\
 oauth,jwt,api,graphql,swagger,firebase,s3,redis,mongodb,mysql,postgres"
-sanitize_tags() {
+# Curated base kept separate from the runtime-widened list: explicit JSON tag choices
+# are checked against the (wide) NUCLEI_TAG_ALLOWLIST, but loose prose salvage is checked
+# against this strict base only, so reasoning words (target/dreamweaver/eol/...) can't leak.
+NUCLEI_TAG_ALLOWLIST_BASE="$NUCLEI_TAG_ALLOWLIST"
+sanitize_tags() {  # [allowlist]  (reads tags on stdin; defaults to the widened allowlist)
+  local allow="${1:-$NUCLEI_TAG_ALLOWLIST}"
   tr ',[:space:]' '\n\n' | tr 'A-Z' 'a-z' | grep -oE '[a-z0-9._-]+' \
     | while read -r t; do
-        case ",${NUCLEI_TAG_ALLOWLIST//[[:space:]]/}," in *",$t,"*) echo "$t";; esac
+        case ",${allow//[[:space:]]/}," in *",$t,"*) echo "$t";; esac
       done | awk '!seen[$0]++' | paste -sd, -
 }
 # Index the REAL category tags present in the installed templates, dropping the
@@ -1219,10 +1224,13 @@ $(head -c 12000 "$tech_brief")" "$plan_out"
   [ -z "$plan_json" ] && plan_json="$(printf '%s' "$flat" | grep -oE '\{.*\}' | head -1)"
   [ -z "$plan_json" ] && plan_json="$(cat "$plan_out")"
 
-  # --- parse nuclei tags (JSON first, then salvage raw text) ---
+  # --- parse nuclei tags ---
+  # Explicit JSON tags are trusted against the WIDE allowlist (so the AI can pick real
+  # installed tags like weblogic). If JSON is absent, salvage from prose against the
+  # STRICT base only, so reasoning words (target/dreamweaver/eol/json/legacy) can't leak in.
   ai_tags="$(printf '%s' "$plan_json" | jq -r '.nuclei_tags[]?' 2>/dev/null | paste -sd, -)"
-  [ -z "$ai_tags" ] && ai_tags="$(cat "$plan_out")"
-  ai_extra="$(printf '%s' "$ai_tags" | sanitize_tags)"
+  if [ -n "$ai_tags" ]; then ai_extra="$(printf '%s' "$ai_tags" | sanitize_tags)"
+  else ai_extra="$(cat "$plan_out" | sanitize_tags "$NUCLEI_TAG_ALLOWLIST_BASE")"; fi
   # AI tags are ADDITIVE on top of the strong defaults, so a thin/unparseable reply
   # degrades to good defaults instead of discarding the core (cves/exposures/...).
   clean_plan="$(printf '%s,%s' "$DEFAULT_NUCLEI_TAGS" "$ai_extra" | sanitize_tags)"
@@ -1682,15 +1690,21 @@ else
   : > "$dast_file"; : > "$findings_dir/dalfox.txt"; : > "$findings_dir/kxss.txt"; : > "$findings_dir/sqlmap.txt"
   set_stage $S_CRAWL running "dispatching specialists ($active_total urls)"
   declare -a SPIDS=()
-  # XSS reflection: kxss / Gxss  (fast, pairs into dalfox)
+  # XSS reflection FIRST (fast): kxss/Gxss flags params that reflect unfiltered chars.
+  # Run it synchronously so its output can actually feed dalfox (the real pairing).
   if { has_spec kxss && { have kxss || have Gxss; }; } && [ -s "$targets_active_file" ]; then
+    set_stage $S_CRAWL running "kxss: probing reflection"; render
     xtool="kxss"; have kxss || xtool="Gxss"
-    ( head -n "$ACT_MAX_KXSS" "$targets_active_file" | "$xtool" 2>/dev/null > "$findings_dir/kxss.txt" ) & SPIDS+=($!)
+    head -n "$ACT_MAX_KXSS" "$targets_active_file" | "$xtool" 2>/dev/null > "$findings_dir/kxss.txt" || true
   fi
-  # XSS confirm: dalfox pipe
+  # XSS confirm: dalfox on the URLs kxss just flagged as reflecting (chained!) plus the
+  # gf xss-bucket; only if neither yields anything do we fall back to the full active set.
   if has_spec dalfox && have dalfox && [ -s "$targets_active_file" ]; then
-    xq="$findings_dir/.xssq.txt"; grep -iE '^xss\t' "$gf_file" 2>/dev/null | cut -f2 > "$xq"
-    [ -s "$xq" ] || cp "$targets_active_file" "$xq"
+    xq="$findings_dir/.xssq.txt"; : > "$xq"
+    grep -oiE 'https?://[^ ]+' "$findings_dir/kxss.txt" 2>/dev/null >> "$xq"   # kxss reflecting URLs (highest signal)
+    grep -iE '^xss\t' "$gf_file" 2>/dev/null | cut -f2 >> "$xq"                 # gf xss-bucket
+    sort -u -o "$xq" "$xq"
+    [ -s "$xq" ] || cp "$targets_active_file" "$xq"                             # fallback: whole active set
     dfx=(dalfox pipe --silence --skip-bav -o "$findings_dir/dalfox.txt"); [ "${#DALFOX_NET[@]}" -gt 0 ] && dfx+=("${DALFOX_NET[@]}")
     ( head -n "$ACT_MAX_DALFOX" "$xq" | "${dfx[@]}" >/dev/null 2>>"$llm_log" ) & SPIDS+=($!)
   fi
