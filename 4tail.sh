@@ -77,6 +77,11 @@ DEDUPE_ORIGINS="${DEDUPE_ORIGINS:-1}"    # 1 = one fuzz target per IP/CNAME + re
 USE_DNSX="${USE_DNSX:-1}"                # 1 = use dnsx (if installed) to resolve + drop wildcards
 JSMINE="${JSMINE:-0}"                    # 1 = JS/secret mining + param discovery (-j)
 CRAWL="${CRAWL:-0}"                       # 1 = active funnel: crawl -> cluster -> AI juicy -> specialists (-C)
+# Static assets never hold injection bugs - strip them before the slow tools (dalfox/
+# nuclei-dast/kxss/sqlmap) so caps and time are spent on real endpoints, not app.js?v=1.
+# Matched against the PATH only (query stripped first by drop_static), so a file-ish
+# VALUE like ?file=app.js is KEPT - that's an LFI lead, not a static asset.
+STATIC_URL_RE="${STATIC_URL_RE:-\.(js|css|png|jpe?g|gif|svg|ico|webp|avif|bmp|tiff?|woff2?|ttf|eot|otf|map|mp4|webm|mp3|ogg|wav|pdf|zip|t?gz|rar|7z|bz2|swf)$}"
 CRAWL_MAX_URLS="${CRAWL_MAX_URLS:-8000}" # cap collected URLs
 CRAWL_MAX_TIME="${CRAWL_MAX_TIME:-1200}" # hard cap on crawling (s); 0 = unlimited
 DAST="${DAST:-1}"                        # run nuclei -dast on selected URLs
@@ -607,6 +612,9 @@ budget_ok() { # 0 (true) if under budget or unlimited
 }
 cost_fmt() { awk -v c="$(cost_now)" 'BEGIN{printf "$%.4f", c}'; }
 nlines() { [ -f "$1" ] && wc -l < "$1" 2>/dev/null | tr -d ' ' || echo 0; }
+# Drop static-asset URLs (stdin->stdout), testing the extension on the PATH only so a
+# file-ish query value (?file=app.js) is kept. Used to clean input to the slow scanners.
+drop_static() { awk -v re="$STATIC_URL_RE" '{ p=tolower($0); sub(/[?#].*/,"",p); if (p !~ re) print }'; }
 
 # Find the installed nuclei template store (config -> common paths). Defined early
 # so `doctor` (which runs before the pipeline helpers) can call it too.
@@ -1577,7 +1585,9 @@ else
   fi
   grep -iE "^https?://([a-z0-9._-]+\.)?${esc_domain}([:/]|$)" "$urls_file" 2>/dev/null \
     | sort -u | head -n "$CRAWL_MAX_URLS" > "$urls_file.tmp" && mv "$urls_file.tmp" "$urls_file"
-  grep -E '\?[^=]+=' "$urls_file" 2>/dev/null | sort -u > "$urls_params_file" || : > "$urls_params_file"
+  # Only URLs with a real ?k=v, and NOT static assets - so clustering, AI selection and
+  # every downstream specialist work on genuine injectable endpoints.
+  grep -E '\?[^=]+=' "$urls_file" 2>/dev/null | drop_static | sort -u > "$urls_params_file" || : > "$urls_params_file"
   url_total="$(nlines "$urls_file")"; param_total="$(nlines "$urls_params_file")"
 
   # (B) Cluster parametered URLs into endpoint patterns (one exemplar per pattern).
@@ -1681,7 +1691,10 @@ else
       | while read -r h; do [ -n "$h" ] && arjun -u "$h" -q -oT /dev/stdout 2>/dev/null \
           | sed "s#^#${h}/?#; s#\$#=1#" ; done >> "$targets_active_file" 2>/dev/null || true
   fi
-  sort -u -o "$targets_active_file" "$targets_active_file"
+  # Final clean of the set that feeds every slow specialist: drop static assets that
+  # may have entered via params/API folding, then dedupe.
+  drop_static < "$targets_active_file" 2>/dev/null | sort -u > "$targets_active_file.tmp" \
+    && mv "$targets_active_file.tmp" "$targets_active_file"
   active_total="$(nlines "$targets_active_file")"
 
   # (E) gf bucketing on the active set (candidate classes for routing)
