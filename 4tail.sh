@@ -106,6 +106,8 @@ AUTH_COOKIE="${AUTH_COOKIE:-}"           # "name=val; name2=val2"  -> sent as Co
 PROXY="${PROXY:-}"                       # http(s)://host:port routed through httpx/nuclei/ffuf/katana/dalfox/curl
 UPDATE_TEMPLATES="${UPDATE_TEMPLATES:-0}" # 1 = nuclei -update-templates before scanning (self-heal)
 EMIT_SARIF="${EMIT_SARIF:-0}"            # 1 = also write findings.sarif
+NUCLEI_TAG_INDEX="${NUCLEI_TAG_INDEX:-1}" # 1 = index REAL category tags from the installed templates so the AI plan isn't limited to the hardcoded allowlist
+NUCLEI_TEMPLATES_DIR="${NUCLEI_TEMPLATES_DIR:-}" # override template store path; auto-located if empty
 
 # --- Staleness ranking + OAST (blind-bug confirmation) ----------------------
 STALE_RANK="${STALE_RANK:-1}"            # 1 = compute a per-host "legacy" score; AI funnels budget to older stacks first
@@ -324,6 +326,7 @@ if [ "$DOCTOR" != 1 ]; then
   llm_log="$OUTDIR/llm.log"
   tech_map_file="$OUTDIR/tech_wordlists.tsv"   # tech <TAB> seclists-relative-path
   seclists_index="$OUTDIR/.seclists_index.tsv" # basename <TAB> abs-path of real SecLists Web-Content lists
+  nuclei_tag_index="$OUTDIR/.nuclei_tags.txt"  # real category tags present in the installed nuclei templates
   fuzz_plan_file="$OUTDIR/fuzz_plan.txt"        # host <TAB> wordlists used
   nuclei_stats_file="$OUTDIR/nuclei_stats.jsonl"
   supervisor_log="$OUTDIR/supervisor.log"
@@ -859,6 +862,15 @@ run_doctor() {
   for t in subfinder httpx nuclei; do
     if have "$t"; then dr_pass "$t found ($(command -v "$t"))"; else dr_fail "$t MISSING (install from projectdiscovery.io)"; fi
   done
+  if have nuclei; then
+    local tpl; tpl="$(locate_nuclei_templates)"
+    if [ -n "$tpl" ]; then
+      local nt; nt="$(grep -rhoE '^[[:space:]]*tags:' "$tpl" 2>/dev/null | wc -l | tr -d ' ')"
+      dr_pass "nuclei templates: $tpl (~$nt tagged templates)"
+    else
+      dr_warn "nuclei templates not found - run 'nuclei -update-templates' (or UPDATE_TEMPLATES=1)"
+    fi
+  fi
 
   dr_head "Optional tools"
   for t in ffuf curl jq anew dnsx; do
@@ -1062,6 +1074,35 @@ sanitize_tags() {
         case ",${NUCLEI_TAG_ALLOWLIST//[[:space:]]/}," in *",$t,"*) echo "$t";; esac
       done | awk '!seen[$0]++' | paste -sd, -
 }
+# Find the installed nuclei template store (config -> common paths).
+locate_nuclei_templates() {
+  [ -n "$NUCLEI_TEMPLATES_DIR" ] && { [ -d "$NUCLEI_TEMPLATES_DIR" ] && printf '%s\n' "$NUCLEI_TEMPLATES_DIR"; return; }
+  local d; d="$(jq -r '."nuclei-templates-directory" // empty' "$HOME/.config/nuclei/.templates-config.json" 2>/dev/null)"
+  [ -n "$d" ] && [ -d "$d" ] && { printf '%s\n' "$d"; return; }
+  for d in "$HOME/nuclei-templates" "$HOME/.local/nuclei-templates" /root/nuclei-templates /root/.local/nuclei-templates; do
+    [ -d "$d" ] && { printf '%s\n' "$d"; return; }
+  done
+}
+# Index the REAL category tags present in the installed templates, dropping the
+# thousands of per-CVE id tags (cve-YYYY-N) so we keep the useful ~few-hundred
+# (iis, weblogic, rce, lfi, fortinet, ...). Then widen the tag allowlist with them,
+# so the AI plan can select any tag the user's template store actually supports -
+# grounded in what's installed, never hallucinated.
+build_nuclei_tag_index() {
+  [ "$NUCLEI_TAG_INDEX" = 1 ] && have nuclei && have grep || return 0
+  [ -s "$nuclei_tag_index" ] && return 0   # cached (e.g. resume)
+  local tpl; tpl="$(locate_nuclei_templates)"
+  [ -n "$tpl" ] || return 0
+  grep -rhoE '^[[:space:]]*tags:[[:space:]]*.*' "$tpl" 2>/dev/null \
+    | sed -E 's/^[[:space:]]*tags:[[:space:]]*//; s/["'"'"']//g' \
+    | tr ',' '\n' | sed 's/^[[:space:]]*//; s/[[:space:]]*$//' | tr 'A-Z' 'a-z' \
+    | grep -E '^[a-z0-9._-]{2,40}$' \
+    | grep -vE '^cve-[0-9]{4}-[0-9]+$|^[0-9]{4}$' \
+    | sort -u > "$nuclei_tag_index" 2>/dev/null || true
+  if [ -s "$nuclei_tag_index" ]; then
+    NUCLEI_TAG_ALLOWLIST="$NUCLEI_TAG_ALLOWLIST,$(paste -sd, "$nuclei_tag_index")"
+  fi
+}
 # Seed a built-in tech -> SecLists wordlist map. Every path below was verified to
 # exist in SecLists (github.com/danielmiessler/SecLists). Paths are still
 # existence-checked at fuzz time, so any that are absent in a given SecLists
@@ -1140,6 +1181,9 @@ if [ "$RESUME" = 1 ] && [ -s "$tech_map_file" ]; then :
 elif [ -n "$SECLISTS_DIR" ]; then seed_static_tech_map
 else : > "$tech_map_file"; fi
 
+# Ground the tag allowlist in the user's actually-installed templates before planning.
+build_nuclei_tag_index
+
 nuclei_tags="$DEFAULT_NUCLEI_TAGS"
 if [ "$RESUME" = 1 ] && [ -s "$OUTDIR/ai_scan_plan.txt" ]; then
   nuclei_tags="$(cat "$OUTDIR/ai_scan_plan.txt")"
@@ -1213,7 +1257,7 @@ build_seclists_index() {
   [ -s "$seclists_index" ] && return 0   # already built (e.g. resume)
   local root="$SECLISTS_DIR/Discovery/Web-Content"; [ -d "$root" ] || root="$SECLISTS_DIR"
   find "$root" -maxdepth 4 -type f \( -iname '*.txt' -o -iname '*.fuzz.txt' \) 2>/dev/null \
-    | grep -viE 'raft-|big\.txt|directory-list|combined_|dirbuster|/all\.txt|/common\.txt|/quickhits' \
+    | grep -viE 'raft-|big\.txt|directory-list|combined_|dirbuster|/all\.txt|/common\.txt' \
     | while IFS= read -r f; do printf '%s\t%s\n' "$(basename "$f" | tr 'A-Z' 'a-z')" "$f"; done \
     > "$seclists_index" 2>/dev/null || true
 }
@@ -1302,7 +1346,7 @@ elif [ "$RESUME" = 1 ] && [ -f "$OUTDIR/.done_fuzz" ]; then
 else
   set_stage $S_FUZZ running "indexing SecLists"
   build_seclists_index   # index real SecLists files once so tech matching is grounded in what's installed
-  set_stage $S_FUZZ running "0 hosts"
+  set_stage $S_FUZZ running "0 hosts ($(nlines "${seclists_index:-/dev/null}") lists indexed)"
   [ "$RESUME" = 1 ] || : > "$fuzz_plan_file"   # keep prior progress when resuming
   if [ "$DEDUPE_ORIGINS" = 1 ] && [ -s "$httpx_json" ]; then
     # One representative per (origin, response signature): origin = cname or first IP;

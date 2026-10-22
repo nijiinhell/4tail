@@ -19,10 +19,13 @@ The script calls the LLM to make two real decisions:
 1. **Adaptive scan planning** — after Httpx probes live hosts *with technology
    detection*, the model reads the detected stack (WordPress, nginx, Jira, PHP, …)
    and returns a JSON plan with **(a)** the most relevant Nuclei tags and **(b)** a
-   `tech → SecLists wordlist` mapping. Tags are validated against an allowlist and
-   wordlist paths are existence-checked on disk, so a bogus/hallucinated value can
-   never break the scan — anything unusable falls back to sane defaults. It's a
-   single API call, so adding wordlist intelligence costs nothing extra.
+   `tech → SecLists wordlist` mapping. The AI's tags are **added on top of** strong
+   defaults (`cves,exposures,misconfiguration,…`) — never replacing them — and are
+   validated against an allowlist that is **widened at runtime with the real category
+   tags found in your installed nuclei templates** (`NUCLEI_TAG_INDEX=1`), so the plan
+   can select any tag your template store actually supports (e.g. `weblogic`,
+   `fortinet`) without ever referencing one it doesn't have. Wordlist paths are
+   existence-checked on disk. A bogus/empty reply simply degrades to the defaults.
 2. **Finding triage** — after Nuclei runs, the model turns the raw output into a
    prioritized Markdown report (executive summary, severity-sorted table, and
    recommended manual follow-ups).
