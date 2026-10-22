@@ -38,7 +38,7 @@ LLM_RETRIES="${LLM_RETRIES:-2}"
 # --- Smart model routing (per-task "swarm"-style switching) -----------------
 LLM_MODEL_PLAN="${LLM_MODEL_PLAN:-}"        # scan planner; default = LLM_MODEL
 LLM_MODEL_TRIAGE="${LLM_MODEL_TRIAGE:-}"    # findings analyst; default = LLM_MODEL
-LLM_MAX_TOKENS_PLAN="${LLM_MAX_TOKENS_PLAN:-4000}"   # headroom for reasoning models (GLM/DeepSeek think first)
+LLM_MAX_TOKENS_PLAN="${LLM_MAX_TOKENS_PLAN:-6000}"   # headroom for reasoning models (GLM/DeepSeek think first)
 LLM_MAX_TOKENS_TRIAGE="${LLM_MAX_TOKENS_TRIAGE:-}"  # default = LLM_MAX_TOKENS
 LLM_FALLBACK_MODELS="${LLM_FALLBACK_MODELS:-}"       # tried in order if primary fails
 # AI supervisor: periodic plain-language status during the long nuclei stage.
@@ -1166,14 +1166,20 @@ SecLists root: ${SECLISTS_DIR:-<not installed>}
 $(head -c 12000 "$tech_brief")" "$plan_out"
 
   # Reasoning models (GLM/DeepSeek) often wrap JSON in ``` fences or prepend
-  # "thinking". Extract the first {...} object so jq gets clean JSON.
-  plan_json="$(tr -d '\r' < "$plan_out" | tr '\n' ' ' | grep -oE '\{.*\}' | head -1)"
+  # "thinking". Prefer a {...} span that actually contains nuclei_tags, else any
+  # {...}, else the whole reply (sanitize_tags salvages allowlisted words from prose).
+  flat="$(tr -d '\r' < "$plan_out" | tr '\n' ' ')"
+  plan_json="$(printf '%s' "$flat" | grep -oE '\{[^{}]*nuclei_tags.*\}' | head -1)"
+  [ -z "$plan_json" ] && plan_json="$(printf '%s' "$flat" | grep -oE '\{.*\}' | head -1)"
   [ -z "$plan_json" ] && plan_json="$(cat "$plan_out")"
 
   # --- parse nuclei tags (JSON first, then salvage raw text) ---
   ai_tags="$(printf '%s' "$plan_json" | jq -r '.nuclei_tags[]?' 2>/dev/null | paste -sd, -)"
   [ -z "$ai_tags" ] && ai_tags="$(cat "$plan_out")"
-  clean_plan="$(printf '%s' "$ai_tags" | sanitize_tags)"
+  ai_extra="$(printf '%s' "$ai_tags" | sanitize_tags)"
+  # AI tags are ADDITIVE on top of the strong defaults, so a thin/unparseable reply
+  # degrades to good defaults instead of discarding the core (cves/exposures/...).
+  clean_plan="$(printf '%s,%s' "$DEFAULT_NUCLEI_TAGS" "$ai_extra" | sanitize_tags)"
 
   # --- parse wordlist map (append to tech map; heavy generic lists filtered out,
   #     existence checked at fuzz time) ---
@@ -1185,12 +1191,10 @@ $(head -c 12000 "$tech_brief")" "$plan_out"
   fi
   rm -f "$plan_out"
 
-  if [ -n "$clean_plan" ] && [ "$(printf '%s' "$clean_plan" | tr ',' '\n' | grep -c .)" -ge 2 ]; then
-    nuclei_tags="$clean_plan"; printf '%s\n' "$nuclei_tags" > "$OUTDIR/ai_scan_plan.txt"
-    set_stage $S_PLAN done "$nuclei_tags"
-  else
-    set_stage $S_PLAN warn "unusable, using defaults"
-  fi
+  nuclei_tags="${clean_plan:-$DEFAULT_NUCLEI_TAGS}"
+  printf '%s\n' "$nuclei_tags" > "$OUTDIR/ai_scan_plan.txt"
+  if [ -n "$ai_extra" ]; then set_stage $S_PLAN done "$nuclei_tags"
+  else set_stage $S_PLAN done "$nuclei_tags (defaults; AI added none)"; fi
 else
   set_stage $S_PLAN skip "AI off (defaults)"
 fi
