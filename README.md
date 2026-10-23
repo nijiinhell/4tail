@@ -319,6 +319,24 @@ starting cold each time. It also decides for itself when to keep going (`DECISIO
 or quit (`DECISION: STOP`), and the final hypotheses are written to the report and
 `agent_log.txt`.
 
+**It drives real tools, not just GET** (`AGENT_TOOLS=1`, default on). Each round the agent
+can emit `TOOL <name> <url>` actions and 4tail runs the tool for it — turning it from a
+prober into an orchestrator. It's offered only the tools that are installed, every target is
+scope-locked, and runs are capped (`AGENT_MAX_TOOLCALLS`, `AGENT_TOOL_TIMEOUT`):
+
+| Tool | the agent uses it to… |
+|------|----------------------|
+| `sqlmap` | confirm SQLi on a suspicious param |
+| `dalfox` | confirm XSS on a reflecting param |
+| `nuclei` / `nuclei-dast` | run targeted templates / fuzz a URL |
+| `ffuf` / `arjun` / `katana` | dig a promising dir / find params / crawl deeper |
+| `git-dumper` → `trufflehog` | dump an exposed `/.git` and scan the source for secrets |
+| `crlfuzz` / `x8` | CRLF/header injection / fast hidden-param discovery |
+| `gau` / `waybackurls` / `curl` | pull history / fetch-and-read |
+
+`doctor` lists what's offered and prints install commands for the high-value optional ones
+(`crlfuzz`, `x8`, `git-dumper`, `trufflehog`). Missing tools are simply never offered.
+
 **Bounded by design so it never camps on one host:** `AGENT_ROUNDS` (default 6, but the AI
 usually stops itself earlier), `AGENT_MAX_PROBES` (8) GET requests per round, and a hard
 `AGENT_MAX_TIME` wall-clock cap (240s). **Hard guardrails:** GET-only, every probe

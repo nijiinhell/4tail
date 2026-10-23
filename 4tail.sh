@@ -139,7 +139,10 @@ OAST_MAX_INJECT="${OAST_MAX_INJECT:-40}" # cap URLs we inject an OOB payload int
 AGENT="${AGENT:-0}"                       # 1 = run the autonomous probe loop (-A)
 AGENT_ROUNDS="${AGENT_ROUNDS:-6}"         # max observe->decide->act rounds (AI stops itself when leads run out)
 AGENT_MAX_PROBES="${AGENT_MAX_PROBES:-8}" # max GET probes the AI may fire per round
-AGENT_MAX_TIME="${AGENT_MAX_TIME:-240}"   # hard wall-clock cap (s) for the whole loop; 0 = unlimited
+AGENT_MAX_TIME="${AGENT_MAX_TIME:-300}"   # hard wall-clock cap (s) for the whole loop; 0 = unlimited
+AGENT_TOOLS="${AGENT_TOOLS:-1}"           # 1 = agent may invoke real tools (sqlmap/nuclei/dalfox/...), not just GET
+AGENT_MAX_TOOLCALLS="${AGENT_MAX_TOOLCALLS:-10}" # cap tool invocations across the whole loop
+AGENT_TOOL_TIMEOUT="${AGENT_TOOL_TIMEOUT:-90}"   # per tool-call wall-clock cap (s)
 DEFAULT_NUCLEI_TAGS="${DEFAULT_NUCLEI_TAGS:-cves,exposures,misconfiguration,tech,default-login,takeover}"
 MAX_TAGS="${MAX_TAGS:-15}"                # cap nuclei tags (more tags = far more templates = much slower)
 NUCLEI_SEVERITY="${NUCLEI_SEVERITY:-critical,high,medium,low}"
@@ -708,6 +711,100 @@ idor_check() {
   done <<< "$cand"
 }
 
+# ---- Agent tool dispatch: the agent invokes REAL tools, not just GET -----------
+_cap() { if have timeout; then timeout "$AGENT_TOOL_TIMEOUT" "$@"; else "$@"; fi; }
+# Whitelisted tools, limited to those actually installed (offered to the agent).
+agent_tool_list() {
+  local t out=""
+  for t in curl sqlmap dalfox nuclei nuclei-dast ffuf arjun katana gau waybackurls crlfuzz x8 git-dumper trufflehog; do
+    case "$t" in
+      nuclei-dast) have nuclei && out="$out nuclei-dast" ;;
+      git-dumper)  { have git-dumper || have gitdumper; } && out="$out git-dumper" ;;
+      *)           have "$t" && out="$out $t" ;;
+    esac
+  done
+  printf '%s' "${out# }"
+}
+# Run ONE whitelisted tool against an in-scope target (capped + redacted). Prints a short
+# result line for the agent; records a [CONFIRMED]/[FINDING] in agent_file on a hit.
+agent_tool_run() {   # name  target  extra
+  local name="$1" tgt="$2" extra="${3:-}" raw="" res="" hit="" wl
+  case "$name" in
+    gau|waybackurls|subfinder)
+      printf '%s' "$tgt" | grep -qiE "^([a-z0-9._-]+\.)?${esc_domain}\$" || { echo "rejected: out-of-scope host"; return 0; } ;;
+    *)
+      printf '%s' "$tgt" | grep -qiE "^https?://([a-z0-9._-]+\.)?${esc_domain}([:/]|\$)" || { echo "rejected: out-of-scope url"; return 0; } ;;
+  esac
+  case "$name" in
+    curl)
+      raw="$(_cap curl -s -i -L --max-time 15 ${CURL_NET[@]+"${CURL_NET[@]}"} "$tgt" 2>/dev/null | head -c 6000)"
+      printf '%s' "$raw" | grep -qiE 'connectionString|<configuration|\[fonts\]|root:.{0,40}:0:0:|BEGIN [A-Z ]*PRIVATE KEY|SQL syntax.*(MySQL|ODBC|OLE DB)|ORA-[0-9]{4,}' && hit="FINDING"
+      res="$(printf '%s' "$raw" | head -1 | tr -d '\r')" ;;
+    sqlmap)
+      have sqlmap || { echo "sqlmap: not installed"; return 0; }
+      raw="$(_cap sqlmap -u "$tgt" --batch --smart --level=1 --risk=1 --technique=BEU --disable-coloring 2>/dev/null | tail -c 4000)"
+      printf '%s' "$raw" | grep -qiE 'is vulnerable|is injectable|Parameter:.*|Type: ' && hit="CONFIRMED sqli"
+      res="$(printf '%s' "$raw" | grep -iE 'vulnerable|injectable|Type:|back-end DBMS' | head -3 | tr '\n' ';')" ;;
+    dalfox)
+      have dalfox || { echo "dalfox: not installed"; return 0; }
+      raw="$(_cap dalfox url "$tgt" --silence --skip-bav 2>/dev/null | head -c 4000)"
+      printf '%s' "$raw" | grep -qiE '\[POC\]|triggered|\[VULN\]' && hit="CONFIRMED xss"
+      res="$(printf '%s' "$raw" | grep -iE 'POC|VULN|reflect' | head -3 | tr '\n' ';')" ;;
+    nuclei)
+      have nuclei || { echo "nuclei: not installed"; return 0; }
+      local nt=(); extra="$(printf '%s' "$extra" | grep -oiE 'tags=[a-z0-9,._-]+' | cut -d= -f2)"; [ -n "$extra" ] && nt=(-tags "$extra")
+      raw="$(_cap nuclei -u "$tgt" -silent "${nt[@]}" ${NUCLEI_NET[@]+"${NUCLEI_NET[@]}"} 2>/dev/null | head -c 4000)"
+      [ -n "$raw" ] && hit="FINDING"; res="$(printf '%s' "$raw" | head -3 | tr '\n' ';')" ;;
+    nuclei-dast)
+      have nuclei || { echo "nuclei: not installed"; return 0; }
+      raw="$(_cap nuclei -u "$tgt" -dast -silent ${NUCLEI_NET[@]+"${NUCLEI_NET[@]}"} 2>/dev/null | head -c 4000)"
+      [ -n "$raw" ] && hit="FINDING"; res="$(printf '%s' "$raw" | head -3 | tr '\n' ';')" ;;
+    ffuf)
+      have ffuf || { echo "ffuf: not installed"; return 0; }
+      wl="$WORDLIST"; [ -f "${SECLISTS_DIR:-}/Discovery/Web-Content/quickhits.txt" ] && wl="$SECLISTS_DIR/Discovery/Web-Content/quickhits.txt"
+      raw="$(_cap ffuf -u "${tgt%/}/FUZZ" -w "$wl" -ac -mc 200,204,301,302,401,403 -s ${FFUF_NET[@]+"${FFUF_NET[@]}"} 2>/dev/null | head -c 3000)"
+      [ -n "$raw" ] && hit="FINDING"; res="hits: $(printf '%s' "$raw" | head -8 | tr '\n' ' ')" ;;
+    arjun)
+      have arjun || { echo "arjun: not installed"; return 0; }
+      raw="$(_cap arjun -u "$tgt" -q -oT /dev/stdout 2>/dev/null | head -c 2000)"
+      res="params: $(printf '%s' "$raw" | tr '\n' ' ' | head -c 300)" ;;
+    katana)
+      have katana || { echo "katana: not installed"; return 0; }
+      raw="$(_cap katana -u "$tgt" -silent -d 1 -jc ${KATANA_NET[@]+"${KATANA_NET[@]}"} 2>/dev/null | head -c 3000)"
+      res="urls: $(printf '%s' "$raw" | tr '\n' ' ' | head -c 300)" ;;
+    gau|waybackurls)
+      raw="$(printf '%s\n' "$tgt" | _cap "$name" 2>/dev/null | head -c 3000)"
+      res="historical: $(printf '%s' "$raw" | tr '\n' ' ' | head -c 300)" ;;
+    crlfuzz)
+      have crlfuzz || { echo "crlfuzz: not installed (go install github.com/dwisiswant0/crlfuzz/cmd/crlfuzz@latest)"; return 0; }
+      raw="$(printf '%s\n' "$tgt" | _cap crlfuzz -s 2>/dev/null | head -c 2000)"
+      [ -n "$raw" ] && hit="CONFIRMED crlf"; res="$(printf '%s' "$raw" | head -3 | tr '\n' ';')" ;;
+    x8)
+      have x8 || { echo "x8: not installed (cargo install x8)"; return 0; }
+      raw="$(_cap x8 -u "$tgt" -w "$WORDLIST" 2>/dev/null | head -c 2000)"
+      res="x8: $(printf '%s' "$raw" | tr '\n' ' ' | head -c 300)" ;;
+    git-dumper|gitdumper)
+      { have git-dumper || have gitdumper; } || { echo "git-dumper: not installed (pipx install git-dumper)"; return 0; }
+      local gd="git-dumper"; have git-dumper || gd="gitdumper"; mkdir -p "$findings_dir/gitdump"
+      raw="$(_cap "$gd" "${tgt%/}/.git/" "$findings_dir/gitdump" 2>&1 | tail -c 1500)"
+      [ -n "$(ls -A "$findings_dir/gitdump" 2>/dev/null)" ] && hit="CONFIRMED source-disclosure"
+      res="$(printf '%s' "$raw" | tail -3 | tr '\n' ';')" ;;
+    trufflehog)
+      have trufflehog || { echo "trufflehog: not installed"; return 0; }
+      raw="$(_cap trufflehog --no-update filesystem "$findings_dir/gitdump" 2>/dev/null | head -c 2000)"
+      printf '%s' "$raw" | grep -qiE 'Found|verified' && hit="CONFIRMED secret"
+      res="$(printf '%s' "$raw" | head -3 | tr '\n' ';')" ;;
+    *) echo "unknown/unavailable tool: $name"; return 0 ;;
+  esac
+  res="$(printf '%s' "$res" | sed -E 's/((pass(word|wd)?|secret|api[-_]?key|token|connection[-_ ]?string)[^[:cntrl:]]{0,8}[:=])[^[:cntrl:]"'"'"']{1,}/\1<redacted>/Ig' | head -c 320)"
+  if [ -n "$hit" ]; then
+    printf '[%s] %s | via %s | %s\n' "${hit%% *}" "$tgt" "$name" "$res" >> "$agent_file"
+    printf 'TOOL %s %s => %s | %s' "$name" "$tgt" "$hit" "$res"
+  else
+    printf 'TOOL %s %s => %s' "$name" "$tgt" "${res:-no notable output}"
+  fi
+}
+
 # Find the installed nuclei template store (config -> common paths). Defined early
 # so `doctor` (which runs before the pipeline helpers) can call it too.
 locate_nuclei_templates() {
@@ -994,6 +1091,14 @@ run_doctor() {
   done
   if have interactsh-client; then dr_pass "interactsh-client found (OAST ready; enable with OAST=1)"
   else dr_warn "interactsh-client not found (OAST blind-bug confirmation disabled)"; fi
+
+  dr_head "Agent toolbox (-A, the agent invokes these itself)"
+  dr_pass "offered to agent: $(agent_tool_list)"
+  # high-value optional tools + how to install them
+  have crlfuzz    || dr_warn "crlfuzz missing - CRLF/header injection (go install github.com/dwisiswant0/crlfuzz/cmd/crlfuzz@latest)"
+  have x8         || dr_warn "x8 missing - fast hidden-param discovery (cargo install x8)"
+  { have git-dumper || have gitdumper; } || dr_warn "git-dumper missing - dump exposed /.git source (pipx install git-dumper)"
+  have trufflehog || dr_warn "trufflehog missing - verified secret scanning of dumped source (brew/apt/go install trufflehog)"
 
   dr_head "Wordlists"
   if [ -n "$SECLISTS_DIR" ]; then
@@ -2011,6 +2116,8 @@ else
     } | head -c 12000 )"
   astart=$SECONDS; round=0; results="(none yet - this is the first round)"
   agent_notes="(none yet - first round; form your initial hypotheses from the situation)"
+  toolcalls=0
+  agent_tools=""; [ "$AGENT_TOOLS" = 1 ] && agent_tools="$(agent_tool_list)"
   while [ "$round" -lt "$AGENT_ROUNDS" ]; do
     round=$((round+1))
     budget_ok || { SUP_NOTE="agent: budget reached, stopping"; break; }
@@ -2018,32 +2125,37 @@ else
     set_stage $S_AGENT running "round $round/$AGENT_ROUNDS: AI thinking"
     aout="$(mktemp)"
     ai_call "$LLM_MODEL_PLAN" 2200 \
-"You are an autonomous web-app pentester on an AUTHORIZED target, working in rounds. You keep a running NOTES block (your hypotheses: what you suspect, why, and what is confirmed / refuted / still-unconfirmed), update it each round from the latest probe results, then fire the next GET probes to chase the hottest lead. Then you decide whether to keep going.
-Ideas: confirmed/possible LFI (e.g. Templatize.asp?item=) -> read ../web.config, ../../web.config, ../global.asa, ../../../windows/win.ini; empty/small 200 endpoints (e.g. db.asp) -> add likely params ?id=1 ?debug=1 ?action=list ?table=users; redirect params (RetURL/url/next) -> set value to //example.org/ and watch for a Location; IDOR -> walk adjacent numeric ids; exposed admin/config/backup paths -> fetch them.
-Respond in EXACTLY this structure and nothing else:
+"You are an autonomous web-app pentester on an AUTHORIZED target, working in rounds. You keep a running NOTES block (your hypotheses: what you suspect, why, and what is confirmed / refuted / still-unconfirmed), update it each round from the latest results, then take the next ACTIONS to chase the hottest lead, then decide whether to keep going.
+Two kinds of action:
+  GET <url> | why | success-regex   -> a passive fetch you confirm by regex (LFI reads, redirects, param mining, IDOR id-walking).
+  TOOL <name> <url> | tags=...       -> run a real tool. ONLY these are installed: ${agent_tools:-none}. Use them to CONFIRM, e.g. sqlmap on a SQLi-looking param, dalfox on a reflecting param, nuclei <url> tags=iis,cve on a fingerprinted host, git-dumper on an exposed /.git, nuclei-dast to fuzz a param URL. Prefer a TOOL to prove a lead over guessing.
+Ideas: confirmed/possible LFI (Templatize.asp?item=) -> read ../web.config, ../global.asa, ../../../windows/win.ini; empty/small 200 endpoints -> add params ?id=1&debug=1; redirect params -> //example.org/ and watch Location; IDOR -> walk ids; exposed /.git -> git-dumper.
+All URLs MUST be on the target scope *.$domain. Respond in EXACTLY this structure, nothing else:
 NOTES:
-<2-6 short lines: your updated hypotheses and their status>
-PROBES:
-<one absolute http(s) URL per line, target scope *.$domain only; optional ' | why | success-regex'>
+<2-6 short lines: updated hypotheses + status>
+ACTIONS:
+<one GET or TOOL line each>
 DECISION: CONTINUE
-(use 'DECISION: STOP' instead when your leads are exhausted or everything promising is already confirmed)" \
+(use 'DECISION: STOP' when leads are exhausted or everything promising is already confirmed)" \
 "SITUATION:
 $situation
+
+AVAILABLE TOOLS: ${agent_tools:-none}
 
 YOUR NOTES SO FAR:
 $agent_notes
 
-LATEST PROBE RESULTS:
+LATEST RESULTS:
 $results" > "$aout" 2>>"$llm_log" || true
     # --- parse the structured reply (robust to reasoning-model wrapping) ---
     # NOTES: text between a NOTES marker and the PROBES/DECISION marker.
-    new_notes="$(awk 'BEGIN{p=0} /^[[:space:]]*NOTES[[:space:]]*:/{p=1;next} /^[[:space:]]*(PROBES|DECISION)[[:space:]]*:/{p=0} p' "$aout" | sed '/^[[:space:]]*$/d' | head -n 8)"
+    new_notes="$(awk 'BEGIN{p=0} /^[[:space:]]*NOTES[[:space:]]*:/{p=1;next} /^[[:space:]]*(ACTIONS|PROBES|DECISION)[[:space:]]*:/{p=0} p' "$aout" | sed '/^[[:space:]]*$/d' | head -n 8)"
     [ -n "$new_notes" ] && agent_notes="$new_notes"
     # DECISION: explicit STOP only (default is to continue while leads/probes remain).
     decision="$(grep -ioE 'DECISION[[:space:]]*:[[:space:]]*(CONTINUE|STOP)' "$aout" | head -1 | grep -ioE '(CONTINUE|STOP)' | tr 'a-z' 'A-Z')"
-    # PROBES: prefer URLs under the PROBES section; fall back to any in-scope URL in the reply.
-    probes="$(awk 'BEGIN{p=0} /^[[:space:]]*PROBES[[:space:]]*:/{p=1;next} /^[[:space:]]*DECISION[[:space:]]*:/{p=0} p' "$aout" | grep -iE 'https?://')"
-    [ -n "$probes" ] || probes="$(grep -iE 'https?://' "$aout")"
+    # ACTIONS: lines under the ACTIONS/PROBES section (GET or TOOL); fall back to any URL line.
+    probes="$(awk 'BEGIN{p=0} /^[[:space:]]*(ACTIONS|PROBES)[[:space:]]*:/{p=1;next} /^[[:space:]]*DECISION[[:space:]]*:/{p=0} p' "$aout" | grep -iE 'https?://|^[[:space:]]*TOOL ')"
+    [ -n "$probes" ] || probes="$(grep -iE 'https?://|^[[:space:]]*TOOL ' "$aout")"
     probes="$(printf '%s\n' "$probes" | head -n $((AGENT_MAX_PROBES * 3)))"; rm -f "$aout"
     printf '=== round %s notes ===\n%s\n' "$round" "$agent_notes" >> "$agent_log"
     [ -n "$probes" ] || { [ "$round" -eq 1 ] && SUP_NOTE="agent: no probes proposed"; break; }
@@ -2051,7 +2163,25 @@ $results" > "$aout" 2>>"$llm_log" || true
     agent_default_rx='connectionString|<configuration|<\?xml|root:.{0,40}:0:0:|\[fonts\]|\[extensions\]|16-bit app support|BEGIN [A-Z ]*PRIVATE KEY|DB_PASSWORD|SA_PASSWORD|Microsoft OLE DB|ODBC|SQL syntax.*MySQL|ORA-[0-9]{4,}|Directory of |<web-app|runtime error'
     results=""; np=0
     while IFS= read -r pline; do
-      [ "$np" -ge "$AGENT_MAX_PROBES" ] && break
+      # TOOL action: the agent runs a real tool itself (capped, scope-locked, whitelisted).
+      if [ "$AGENT_TOOLS" = 1 ] && printf '%s' "$pline" | grep -qiE '(^|[^a-z])TOOL[: ]+[a-z]'; then
+        [ "$toolcalls" -ge "$AGENT_MAX_TOOLCALLS" ] && continue
+        tname="$(printf '%s' "$pline" | sed -E 's/.*TOOL[: ]+//I' | awk '{print tolower($1)}')"
+        ttgt="$(printf '%s' "$pline" | grep -oiE 'https?://[^ "'"'"'`|<>]+' | head -1)"
+        [ -n "$ttgt" ] || ttgt="$(printf '%s' "$pline" | grep -oiE '([a-z0-9-]+\.)+[a-z]{2,}' | head -1)"
+        textra="$(printf '%s' "$pline" | grep -oiE 'tags=[a-z0-9,._-]+' | head -1)"
+        [ -n "$tname" ] && [ -n "$ttgt" ] || continue
+        case " $agent_tools " in *" $tname "*) ;; *) continue ;; esac   # only offered tools
+        grep -qxF "TOOL $tname $ttgt" "$agent_seen" 2>/dev/null && continue
+        printf 'TOOL %s %s\n' "$tname" "$ttgt" >> "$agent_seen"; toolcalls=$((toolcalls+1))
+        set_stage $S_AGENT running "round $round: TOOL $tname ($toolcalls/$AGENT_MAX_TOOLCALLS)"; render
+        tr_out="$(agent_tool_run "$tname" "$ttgt" "$textra")"
+        printf '[r%s] %s\n' "$round" "$tr_out" >> "$agent_log"
+        results="$results"$'\n'"$tr_out"
+        continue
+      fi
+      # GET probe (passive fetch, regex-confirmed).
+      [ "$np" -ge "$AGENT_MAX_PROBES" ] && continue
       url="$(printf '%s' "$pline" | grep -oiE 'https?://[^ "'"'"'`|<>]+' | head -1)"
       [ -n "$url" ] || continue
       why="$(printf '%s' "$pline" | awk -F'\\|' 'NF>=2{print $2}' | sed 's/^ *//;s/ *$//')"; [ -n "$why" ] || why="agent probe"
@@ -2077,7 +2207,7 @@ $results" > "$aout" 2>>"$llm_log" || true
   done
   # Persist the agent's final reasoning for the report/transcript.
   { echo "=== final hypotheses ==="; printf '%s\n' "$agent_notes"; } >> "$agent_log"
-  set_stage $S_AGENT done "$(nlines "$agent_file") confirmed · $(nlines "$agent_seen") probes · ${round}r"
+  set_stage $S_AGENT done "$(nlines "$agent_file") confirmed · $(nlines "$agent_seen") actions (${toolcalls:-0} tool runs) · ${round}r"
 fi
 
 # Report header
