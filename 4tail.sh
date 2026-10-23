@@ -90,8 +90,9 @@ DAST_MAX_URLS="${DAST_MAX_URLS:-1500}"   # cap URLs sent to DAST
 # --- Extra recon/surface tools (all optional; skipped if not installed) ------
 USE_TLSX="${USE_TLSX:-1}"                 # harvest cert SAN hostnames (more in-scope subs)
 USE_CDNCHECK="${USE_CDNCHECK:-1}"         # accurate CDN/WAF/cloud classification of live hosts
-USE_PERMUTE="${USE_PERMUTE:-1}"           # dnsgen/gotator permutation of known subs, resolved via dnsx
-PERMUTE_MAX="${PERMUTE_MAX:-5000}"        # cap generated permutations (bounded resolve)
+USE_PERMUTE="${USE_PERMUTE:-1}"           # dnsgen/gotator permutation of known subs (ONLY on big scopes - see below)
+PERMUTE_MIN_SUBS="${PERMUTE_MIN_SUBS:-25}" # skip permutation unless at least this many real subs exist (it's a wildcard-scope tool; pointless on a handful of hosts)
+PERMUTE_MAX="${PERMUTE_MAX:-2000}"        # hard cap on generated permutations to resolve
 CORS_SCAN="${CORS_SCAN:-1}"              # Corsy CORS-misconfig pass on live hosts
 CORS_MAX="${CORS_MAX:-50}"               # cap hosts sent to Corsy
 VERIFY="${VERIFY:-1}"                     # re-test each CONFIRMED finding (anti-false-positive) before reporting
@@ -1277,13 +1278,17 @@ else
       | grep -iE "(^|\.)${esc_domain}\$" | tr 'A-Z' 'a-z' >> "$subdomains_file" || true
     sort -u -o "$subdomains_file" "$subdomains_file"
   fi
-  # DNS permutation: dnsgen/gotator on known subs, resolved via dnsx (bounded).
-  if [ "$USE_PERMUTE" = 1 ] && have dnsx && { have dnsgen || have gotator; }; then
-    set_stage $S_SUBS running "permutation (dnsgen -> dnsx)"
+  # DNS permutation is a WILDCARD-SCOPE technique: on a handful of hosts it just generates
+  # thousands of dead names and bloats resolve/probe. Only run it when the seed set is big
+  # enough to be worth it, and cap generation hard.
+  _seed_subs="$(nlines "$subdomains_file")"
+  if [ "$USE_PERMUTE" = 1 ] && [ "${_seed_subs:-0}" -ge "$PERMUTE_MIN_SUBS" ] 2>/dev/null \
+     && have dnsx && { have dnsgen || have gotator; }; then
+    set_stage $S_SUBS running "permutation ($_seed_subs seeds -> dnsx, cap $PERMUTE_MAX)"
     perm="$OUTDIR/.perm.txt"
     if have dnsgen; then tmo 60 dnsgen "$subdomains_file" 2>/dev/null | head -n "$PERMUTE_MAX" > "$perm"
     else tmo 60 gotator -sub "$subdomains_file" -perm "$subdomains_file" -silent 2>/dev/null | head -n "$PERMUTE_MAX" > "$perm"; fi
-    [ -s "$perm" ] && tmo 180 dnsx -silent -l "$perm" 2>/dev/null | grep -iE "(^|\.)${esc_domain}\$" >> "$subdomains_file"
+    [ -s "$perm" ] && tmo 120 dnsx -silent -l "$perm" 2>/dev/null | grep -iE "(^|\.)${esc_domain}\$" >> "$subdomains_file"
     rm -f "$perm"; sort -u -o "$subdomains_file" "$subdomains_file"
   fi
   touch "$OUTDIR/.done_subs"
@@ -1325,8 +1330,9 @@ set_stage $S_LIVE done "$alive_count live$(done_marker httpx && echo ' (resumed)
 : > "$cdn_file"; cloud_hosts=""
 if [ "$USE_CDNCHECK" = 1 ] && have cdncheck && [ -s "$alive_file" ]; then
   set_stage $S_LIVE running "cdncheck: CDN/cloud classification"
-  sed -E 's#^[a-z]+://##; s#/.*$##' "$alive_file" | sort -u \
-    | tmo 90 cdncheck -silent -resp -cdn -waf -cloud 2>/dev/null > "$OUTDIR/.cdncheck.txt" || true
+  # classify ONLY the live hosts (a handful), by IP range - fast; hard 30s cap regardless.
+  sed -E 's#^[a-z]+://##; s#[:/].*$##' "$alive_file" | sort -u | head -n 200 \
+    | tmo 30 cdncheck -silent -resp -cdn -waf -cloud 2>/dev/null > "$OUTDIR/.cdncheck.txt" || true
   grep -iE '\[(cdn|waf)\]' "$OUTDIR/.cdncheck.txt" 2>/dev/null | awk '{print $1}' | sort -u > "$cdn_file" || true
   cloud_hosts="$(grep -iE '\[cloud\]' "$OUTDIR/.cdncheck.txt" 2>/dev/null | awk '{print $1}' | sort -u | head -20)"
   rm -f "$OUTDIR/.cdncheck.txt"
