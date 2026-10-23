@@ -87,6 +87,17 @@ CRAWL_MAX_TIME="${CRAWL_MAX_TIME:-1200}" # hard cap on crawling (s); 0 = unlimit
 DAST="${DAST:-1}"                        # run nuclei -dast on selected URLs
 DAST_MAX_URLS="${DAST_MAX_URLS:-1500}"   # cap URLs sent to DAST
 
+# --- Extra recon/surface tools (all optional; skipped if not installed) ------
+USE_TLSX="${USE_TLSX:-1}"                 # harvest cert SAN hostnames (more in-scope subs)
+USE_CDNCHECK="${USE_CDNCHECK:-1}"         # accurate CDN/WAF/cloud classification of live hosts
+USE_PERMUTE="${USE_PERMUTE:-1}"           # dnsgen/gotator permutation of known subs, resolved via dnsx
+PERMUTE_MAX="${PERMUTE_MAX:-5000}"        # cap generated permutations (bounded resolve)
+CORS_SCAN="${CORS_SCAN:-1}"              # Corsy CORS-misconfig pass on live hosts
+CORS_MAX="${CORS_MAX:-50}"               # cap hosts sent to Corsy
+VERIFY="${VERIFY:-1}"                     # re-test each CONFIRMED finding (anti-false-positive) before reporting
+DIFF_STATE="${DIFF_STATE:-1}"            # remember each target's surface and show what changed since last run
+STATE_DIR="${STATE_DIR:-$HOME/.4tail/state}"  # where per-target snapshots live
+
 # --- Blueprint (strategy profile) + active-phase caps -----------------------
 # BLUEPRINT: "auto" = AI picks from blueprints/ after recon; or a name / path.
 BLUEPRINT="${BLUEPRINT:-auto}"
@@ -374,6 +385,10 @@ if [ "$DOCTOR" != 1 ]; then
   bypass_file="$OUTDIR/findings/bypass.txt"        # 403/401 access-control bypasses
   prop_file="$OUTDIR/findings/propagated.txt"      # paths found on one host, live on another
   idor_file="$OUTDIR/findings/idor.txt"            # dual-identity IDOR / broken-authz candidates
+  corsy_file="$OUTDIR/findings/cors.txt"           # Corsy CORS-misconfig findings
+  cdn_file="$OUTDIR/.cdn_hosts.txt"                # hosts classified CDN/WAF by cdncheck (skip-fuzz)
+  verified_file="$OUTDIR/verified.txt"             # findings that survived the verification re-test
+  diff_file="$OUTDIR/changes.txt"                  # what changed since the last run of this target
   findings_dir="$OUTDIR/findings"; mkdir -p "$findings_dir"  # per-specialist output
   cost_ledger="${LLM_COST_LEDGER:-$OUTDIR/.llm_cost_usd}"
   [ -f "$cost_ledger" ] || printf '0\n' > "$cost_ledger"
@@ -542,6 +557,7 @@ loot_refresh() {
   loot_scan "${agent_file:-}"              agent   sqlmap
   loot_scan "${bypass_file:-}"             bypass  sqlmap
   loot_scan "${idor_file:-}"               idor    sqlmap
+  loot_scan "${corsy_file:-}"              cors    secret
 }
 
 # _draw_panel: emit the panel body at the current cursor position (no positioning).
@@ -676,7 +692,9 @@ try_403_bypass() {
 # host that doesn't already have them. Finds shared endpoints a per-host fuzz missed.
 propagate_paths() {
   [ "$PROPAGATE" = 1 ] || return 0
-  local hosts; hosts="$(awk -F/ 'NF>=3{print $1"//"$3}' "$alive_file" 2>/dev/null | sort -u | head -n 40)"
+  local hosts
+  if have unfurl; then hosts="$(unfurl -u format '%s://%d' < "$alive_file" 2>/dev/null | sort -u | head -n 40)"
+  else hosts="$(awk -F/ 'NF>=3{print $1"//"$3}' "$alive_file" 2>/dev/null | sort -u | head -n 40)"; fi
   [ "$(printf '%s\n' "$hosts" | grep -c .)" -ge 2 ] || return 0   # pointless with one host
   local paths; paths="$(awk -F'\t' '$1~/^(200|301|302|401|403)$/{print $3}' "$fuzz_findings_file" 2>/dev/null \
       | sed -E 's#^[a-z]+://[^/]+##' | grep -E '^/.' | drop_static | sort -u | head -n "$PROP_MAX_PATHS")"
@@ -716,6 +734,54 @@ idor_check() {
       [ "$cb" = 200 ] && _near "$sa" "$sb" && printf '[IDOR?] %s | user B gets the same resource as user A (A=200/%s B=200/%s) - verify object ownership\n' "$u" "$sa" "$sb" >> "$idor_file"
     fi
   done <<< "$cand"
+}
+
+# Verification pass (anti-false-positive, per 2026 AI-pentest research): re-test each
+# CONFIRMED finding and require it to be (a) stable across two fetches and (b) DIFFERENT
+# from a bogus-sibling control - which weeds out soft-404 / catch-all pages that answer
+# 200 to everything. Survivors go to verified_file; the rest stay as candidates.
+verify_findings() {
+  [ "$VERIFY" = 1 ] || return 0
+  : > "$verified_file"
+  local u r1 r2 rc s1 z1 s2 z2 sc zc cu
+  { [ -f "${agent_file:-}" ]  && grep -oiE 'https?://[^ |]+' "$agent_file"
+    [ -f "${bypass_file:-}" ] && grep -oiE 'https?://[^ |]+' "$bypass_file"
+    [ -f "${idor_file:-}" ]   && grep -oiE 'https?://[^ |]+' "$idor_file"
+    [ -f "${dast_file:-}" ]   && grep -oiE 'https?://[^ |]+' "$dast_file"
+    [ -f "${corsy_file:-}" ]  && grep -oiE 'https?://[^ |]+' "$corsy_file"
+  } 2>/dev/null | sort -u | head -n 60 | while IFS= read -r u; do
+    [ -n "$u" ] || continue
+    r1="$(curl -s -o /dev/null -w '%{http_code} %{size_download}' -L --max-time 12 ${CURL_NET[@]+"${CURL_NET[@]}"} "$u" 2>/dev/null || echo '000 0')"
+    r2="$(curl -s -o /dev/null -w '%{http_code} %{size_download}' -L --max-time 12 ${CURL_NET[@]+"${CURL_NET[@]}"} "$u" 2>/dev/null || echo '000 0')"
+    s1="${r1%% *}"; z1="${r1##* }"; s2="${r2%% *}"; z2="${r2##* }"
+    cu="$(printf '%s' "$u" | sed -E "s#(\?.*)?\$#/4tailctl${RANDOM}&#")"
+    rc="$(curl -s -o /dev/null -w '%{http_code} %{size_download}' -L --max-time 12 ${CURL_NET[@]+"${CURL_NET[@]}"} "$cu" 2>/dev/null || echo '000 0')"
+    sc="${rc%% *}"; zc="${rc##* }"
+    if [ "$s1" = "$s2" ] && _near "$z1" "$z2" && [ "$s1" != 000 ] && { [ "$s1" != "$sc" ] || ! _near "$z1" "$zc"; }; then
+      printf 'VERIFIED %s [%s, %sB] (bogus control -> %s/%sB, differs)\n' "$u" "$s1" "$z1" "$sc" "$zc" >> "$verified_file"
+    fi
+  done
+}
+
+# Change-detection: remember each target's attack surface + findings between runs and
+# show what's NEW this time (newly-deployed endpoints are disproportionately buggy).
+diff_state() {
+  [ "$DIFF_STATE" = 1 ] || return 0
+  mkdir -p "$STATE_DIR" 2>/dev/null || return 0
+  local snap="$STATE_DIR/$(printf '%s' "$domain" | tr -c 'A-Za-z0-9._-' '_').snapshot"
+  local cur="$OUTDIR/.surface.txt"
+  { [ -f "$alive_file" ] && sed 's#^#host #' "$alive_file"
+    [ -f "$fuzz_findings_file" ] && awk -F'\t' 'NF>=3{print "path "$3}' "$fuzz_findings_file"
+    [ -f "$targets_active_file" ] && sed 's#^#url #' "$targets_active_file"
+    [ -f "${findings_json:-}" ] && jq -r '.findings[]? | "finding "+.type+" "+(.url//"")' "$findings_json" 2>/dev/null
+  } 2>/dev/null | sort -u > "$cur"
+  : > "$diff_file"
+  if [ -s "$snap" ]; then
+    comm -13 "$snap" "$cur" > "$diff_file" 2>/dev/null || true
+  else
+    echo "(first run for $domain — baseline saved; nothing to diff yet)" > "$diff_file"
+  fi
+  cp "$cur" "$snap" 2>/dev/null; rm -f "$cur"
 }
 
 # ---- Agent tool dispatch: the agent invokes REAL tools, not just GET -----------
@@ -1102,6 +1168,15 @@ run_doctor() {
   dr_head "Agent toolbox (-A, the agent invokes these itself)"
   dr_pass "offered to agent: $(agent_tool_list)"
   # high-value optional tools + how to install them
+  dr_head "Recon / surface extras (optional)"
+  have tlsx      && dr_pass "tlsx found (cert-SAN subdomains)" || dr_warn "tlsx missing (go install github.com/projectdiscovery/tlsx/cmd/tlsx@latest)"
+  have cdncheck  && dr_pass "cdncheck found (CDN/WAF/cloud classify)" || dr_warn "cdncheck missing (go install github.com/projectdiscovery/cdncheck/cmd/cdncheck@latest)"
+  { have dnsgen || have gotator; } && dr_pass "permutation found (dnsgen/gotator)" || dr_warn "dnsgen missing (go install github.com/ProjectAnte/dnsgen@latest)"
+  have qsreplace && dr_pass "qsreplace found (value-dedup)" || dr_warn "qsreplace missing (go install github.com/tomnomnom/qsreplace@latest)"
+  have unfurl    && dr_pass "unfurl found (url parsing)" || dr_warn "unfurl missing (go install github.com/tomnomnom/unfurl@latest)"
+  have corsy     && dr_pass "corsy found (CORS misconfig)" || dr_warn "corsy missing (pipx install corsy)"
+
+  dr_head "Agent optional tools"
   have crlfuzz    || dr_warn "crlfuzz missing - CRLF/header injection (go install github.com/dwisiswant0/crlfuzz/cmd/crlfuzz@latest)"
   have x8         || dr_warn "x8 missing - fast hidden-param discovery (cargo install x8)"
   { have git-dumper || have gitdumper; } || dr_warn "git-dumper missing - dump exposed /.git source (pipx install git-dumper)"
@@ -1195,6 +1270,22 @@ else
   # include it (and www.) so a specific host like testasp.vulnweb.com is actually probed.
   { printf '%s\n' "$domain" "www.$domain"; cat "$subdomains_file" 2>/dev/null; } | sort -u > "$subdomains_file.tmp" \
     && mv "$subdomains_file.tmp" "$subdomains_file"
+  # TLS cert SANs: pull in-scope hostnames from the certificates (passive, fast).
+  if [ "$USE_TLSX" = 1 ] && have tlsx; then
+    set_stage $S_SUBS running "tlsx: harvesting cert SANs"
+    tmo 120 tlsx -silent -san -resp-only -l "$subdomains_file" 2>/dev/null \
+      | grep -iE "(^|\.)${esc_domain}\$" | tr 'A-Z' 'a-z' >> "$subdomains_file" || true
+    sort -u -o "$subdomains_file" "$subdomains_file"
+  fi
+  # DNS permutation: dnsgen/gotator on known subs, resolved via dnsx (bounded).
+  if [ "$USE_PERMUTE" = 1 ] && have dnsx && { have dnsgen || have gotator; }; then
+    set_stage $S_SUBS running "permutation (dnsgen -> dnsx)"
+    perm="$OUTDIR/.perm.txt"
+    if have dnsgen; then tmo 60 dnsgen "$subdomains_file" 2>/dev/null | head -n "$PERMUTE_MAX" > "$perm"
+    else tmo 60 gotator -sub "$subdomains_file" -perm "$subdomains_file" -silent 2>/dev/null | head -n "$PERMUTE_MAX" > "$perm"; fi
+    [ -s "$perm" ] && tmo 180 dnsx -silent -l "$perm" 2>/dev/null | grep -iE "(^|\.)${esc_domain}\$" >> "$subdomains_file"
+    rm -f "$perm"; sort -u -o "$subdomains_file" "$subdomains_file"
+  fi
   touch "$OUTDIR/.done_subs"
 fi
 sub_count=$(wc -l < "$subdomains_file" 2>/dev/null || echo 0)
@@ -1229,6 +1320,18 @@ if [ "$alive_count" -eq 0 ]; then
 fi
 set_stage $S_LIVE done "$alive_count live$(done_marker httpx && echo ' (resumed)')"
 
+# cdncheck: accurately classify CDN/WAF/cloud so we skip fuzzing edges and flag cloud
+# hosts (SSRF-to-metadata context) - more reliable than a static banner regex.
+: > "$cdn_file"; cloud_hosts=""
+if [ "$USE_CDNCHECK" = 1 ] && have cdncheck && [ -s "$alive_file" ]; then
+  set_stage $S_LIVE running "cdncheck: CDN/cloud classification"
+  sed -E 's#^[a-z]+://##; s#/.*$##' "$alive_file" | sort -u \
+    | tmo 90 cdncheck -silent -resp -cdn -waf -cloud 2>/dev/null > "$OUTDIR/.cdncheck.txt" || true
+  grep -iE '\[(cdn|waf)\]' "$OUTDIR/.cdncheck.txt" 2>/dev/null | awk '{print $1}' | sort -u > "$cdn_file" || true
+  cloud_hosts="$(grep -iE '\[cloud\]' "$OUTDIR/.cdncheck.txt" 2>/dev/null | awk '{print $1}' | sort -u | head -20)"
+  rm -f "$OUTDIR/.cdncheck.txt"
+fi
+
 # Aggregated, cost-frugal brief for the AI
 {
   echo "== technologies (count) =="
@@ -1241,6 +1344,7 @@ set_stage $S_LIVE done "$alive_count live$(done_marker httpx && echo ' (resumed)
   jq -r '.url' "$httpx_json" 2>/dev/null \
     | grep -iE 'admin|login|portal|api|dev|staging|test|git|jenkins|grafana|kibana|vpn' \
     | sort -u | head -25
+  [ -n "$cloud_hosts" ] && { echo "== cloud-hosted (SSRF-to-metadata candidates) =="; printf '%s\n' "$cloud_hosts"; }
 } > "$tech_brief" 2>/dev/null
 [ -s "$tech_brief" ] || cp "$alive_file" "$tech_brief"
 
@@ -1617,8 +1721,11 @@ else
     [ -z "$url" ] && continue
     safe="$(printf '%s' "$url" | tr -c 'A-Za-z0-9._-' '_')"
     if [ "$RESUME" = 1 ] && [ -f "$fuzz_dir/${safe}.json" ]; then resumed=$((resumed + 1)); continue; fi
-    if [ "$SKIP_CDN_FUZZ" = 1 ] && printf '%s' "$techs" | grep -qiE "$CDN_RE"; then
-      skipped_cdn=$((skipped_cdn + 1)); continue
+    if [ "$SKIP_CDN_FUZZ" = 1 ]; then
+      _h="$(printf '%s' "$url" | sed -E 's#^[a-z]+://##; s#[:/].*$##')"
+      if printf '%s' "$techs" | grep -qiE "$CDN_RE" || { [ -s "$cdn_file" ] && grep -qxiF "$_h" "$cdn_file"; }; then
+        skipped_cdn=$((skipped_cdn + 1)); continue
+      fi
     fi
     if [ "$MAX_FUZZ_HOSTS" -gt 0 ] 2>/dev/null && [ "$fuzzed" -ge "$MAX_FUZZ_HOSTS" ]; then break; fi
     mapfile -t wls < <(host_wordlists "$techs" | awk 'NF' | awk '!seen[$0]++')
@@ -1895,8 +2002,7 @@ else
       | while read -r h; do [ -n "$h" ] && tmo "$ARJUN_MAX_TIME" arjun -u "$h" -q -oT /dev/stdout 2>/dev/null \
           | sed "s#^#${h}/?#; s#\$#=1#" ; done >> "$targets_active_file" 2>/dev/null || true
   fi
-  # Final clean of the set that feeds every slow specialist: drop static assets that
-  # may have entered via params/API folding, then dedupe.
+  # Final clean of the set that feeds every slow specialist: drop static assets, then dedupe.
   drop_static < "$targets_active_file" 2>/dev/null | sort -u > "$targets_active_file.tmp" \
     && mv "$targets_active_file.tmp" "$targets_active_file"
   active_total="$(nlines "$targets_active_file")"
@@ -1927,7 +2033,8 @@ else
     xq="$findings_dir/.xssq.txt"; : > "$xq"
     grep -oiE 'https?://[^ ]+' "$findings_dir/kxss.txt" 2>/dev/null >> "$xq"   # kxss reflecting URLs (highest signal)
     grep -iE '^xss\t' "$gf_file" 2>/dev/null | cut -f2 >> "$xq"                 # gf xss-bucket
-    sort -u -o "$xq" "$xq"
+    # collapse value-variants (/s?q=1 /s?q=2 -> one) so dalfox tests each endpoint once
+    if have qsreplace; then qsreplace FUZZ < "$xq" 2>/dev/null | sort -u | qsreplace 1 2>/dev/null | sort -u -o "$xq"; else sort -u -o "$xq" "$xq"; fi
     [ -s "$xq" ] || cp "$targets_active_file" "$xq"                             # fallback: whole active set
     dfx=(dalfox pipe --silence --skip-bav -o "$findings_dir/dalfox.txt"); [ "${#DALFOX_NET[@]}" -gt 0 ] && dfx+=("${DALFOX_NET[@]}")
     ( head -n "$ACT_MAX_DALFOX" "$xq" | tmo "$DALFOX_MAX_TIME" "${dfx[@]}" >/dev/null 2>>"$llm_log" ) & SPIDS+=($!)
@@ -1969,13 +2076,20 @@ else
   rm -f "$OUTDIR/.dast_targets.txt" "$findings_dir/.xssq.txt" "$findings_dir/.sqliq.txt"
 
   # (G) Correlation / exploitation passes that connect findings into verdicts.
-  : > "$bypass_file"; : > "$prop_file"; : > "$idor_file"
-  set_stage $S_CRAWL running "403 bypass · path propagation · authz diff"
+  : > "$bypass_file"; : > "$prop_file"; : > "$idor_file"; : > "$corsy_file"
+  set_stage $S_CRAWL running "403 bypass · path propagation · authz diff · CORS"
   awk -F'\t' '$1==401||$1==403' "$fuzz_findings_file" 2>/dev/null \
     | grep -viE 'google\.com|%2e%2e|\\\.\\\.|etc.{0,3}passwd' \
     | awk -F'\t' '!seen[$1"\t"$2]++' | try_403_bypass; render
   propagate_paths; render
   idor_check; render
+  # CORS misconfiguration (Corsy) on the live hosts + juicy URLs (bug class we don't cover elsewhere).
+  if [ "$CORS_SCAN" = 1 ] && have corsy; then
+    { sort -u "$alive_file" 2>/dev/null; head -n 30 "$targets_active_file" 2>/dev/null; } | sort -u | head -n "$CORS_MAX" > "$OUTDIR/.cors_in.txt"
+    [ -s "$OUTDIR/.cors_in.txt" ] && tmo 180 corsy -i "$OUTDIR/.cors_in.txt" 2>/dev/null \
+      | grep -iE 'vulnerab|misconfig|origin reflected|wildcard|null origin' > "$corsy_file" || true
+    rm -f "$OUTDIR/.cors_in.txt"
+  fi; render
 
   touch "$OUTDIR/.done_crawl"
   set_stage $S_CRAWL done "$url_total urls -> $active_total active | dast:$(nlines "$dast_file") dalfox:$(nlines "$findings_dir/dalfox.txt") kxss:$(nlines "$findings_dir/kxss.txt") sqlmap:$(nlines "$findings_dir/sqlmap.txt") bypass:$(nlines "$bypass_file") prop:$(nlines "$prop_file") idor:$(nlines "$idor_file")"
@@ -2217,6 +2331,9 @@ $results" > "$aout" 2>>"$llm_log" || true
   set_stage $S_AGENT done "$(nlines "$agent_file") confirmed · $(nlines "$agent_seen") actions (${toolcalls:-0} tool runs) · ${round}r"
 fi
 
+# Verification: re-test confirmed findings so the report/triage lead with proven ones.
+if [ "$VERIFY" = 1 ]; then set_stage $S_TRIAGE running "verifying findings"; verify_findings; fi
+
 # Report header
 {
   echo "# 4tail recon report"; echo
@@ -2232,6 +2349,12 @@ fi
   echo "- **AI models:** $([ "$AI_ENABLED" = 1 ] && echo "plan=$LLM_MODEL_PLAN, triage=$LLM_MODEL_TRIAGE" || echo "disabled")"
   [ "$AI_ENABLED" = 1 ] && echo "- **Estimated AI spend:** $(cost_fmt)$([ "${LLM_BUDGET_USD:-0}" != 0 ] && echo " (budget \$$LLM_BUDGET_USD)")"
   echo "- **SecLists:** ${SECLISTS_DIR:-not found} | **Base wordlist:** \`$WORDLIST\`"; echo
+  if [ -s "${verified_file:-/dev/null}" ]; then
+    echo "## ✅ Verified findings (survived an independent re-test)"; echo; echo '```'; cat "$verified_file"; echo '```'; echo
+  fi
+  if [ -s "${corsy_file:-/dev/null}" ]; then
+    echo "## CORS misconfiguration (Corsy)"; echo; echo '```'; cat "$corsy_file"; echo '```'; echo
+  fi
   if [ "$AGENT" = 1 ] && { [ -s "$agent_file" ] || [ -n "${agent_notes:-}" ]; }; then
     echo "## 🤖 Agent (autonomous probe loop)"; echo
     if [ -s "$agent_file" ]; then echo "**Confirmed / escalated:**"; echo '```'; cat "$agent_file"; echo '```'; echo; fi
@@ -2275,7 +2398,7 @@ fi
 } > "$report_file"
 
 # Step 6: AI triage  (analyses nuclei + content-discovery + JS + crawl/DAST)
-have_extra=0; { [ -s "$js_secrets_file" ] || [ -s "$params_file" ] || [ -s "$fuzz_findings_file" ] || [ -s "$dast_file" ] || [ -s "$gf_file" ] || [ -s "$findings_dir/dalfox.txt" ] || [ -s "$findings_dir/sqlmap.txt" ] || [ -s "$agent_file" ] || [ -s "${bypass_file:-/dev/null}" ] || [ -s "${idor_file:-/dev/null}" ]; } && have_extra=1
+have_extra=0; { [ -s "$js_secrets_file" ] || [ -s "$params_file" ] || [ -s "$fuzz_findings_file" ] || [ -s "$dast_file" ] || [ -s "$gf_file" ] || [ -s "$findings_dir/dalfox.txt" ] || [ -s "$findings_dir/sqlmap.txt" ] || [ -s "$agent_file" ] || [ -s "${bypass_file:-/dev/null}" ] || [ -s "${idor_file:-/dev/null}" ] || [ -s "${corsy_file:-/dev/null}" ] || [ -s "${verified_file:-/dev/null}" ]; } && have_extra=1
 if [ "$AI_ENABLED" = "1" ] && { [ "$find_count" -gt 0 ] || [ "$have_extra" = 1 ]; } && ! budget_ok; then
   { echo "## Findings (budget reached, no AI triage)"; echo '```'; cat "$nuclei_file" 2>/dev/null
     [ -s "$js_secrets_file" ] && { echo; echo "# JS secret candidates:"; cat "$js_secrets_file"; }; echo '```'; } >> "$report_file"
@@ -2343,7 +2466,13 @@ $(head -c 4000 "$agent_file" 2>/dev/null)
 $(head -c 2000 "${bypass_file:-/dev/null}" 2>/dev/null)
 
 === IDOR / broken-authz candidates (A/B/anon diff; verify object ownership) ===
-$(head -c 2000 "${idor_file:-/dev/null}" 2>/dev/null)" "$triage_out"
+$(head -c 2000 "${idor_file:-/dev/null}" 2>/dev/null)
+
+=== VERIFIED findings (survived independent re-test; rank these highest) ===
+$(head -c 2000 "${verified_file:-/dev/null}" 2>/dev/null)
+
+=== CORS misconfiguration (Corsy) ===
+$(head -c 1500 "${corsy_file:-/dev/null}" 2>/dev/null)" "$triage_out"
   if [ -s "$triage_out" ]; then
     # Drop any leading reasoning: keep from the LAST "## Executive summary" to the end
     # (reasoning models may restate the section names earlier while thinking).
@@ -2400,6 +2529,7 @@ if have jq; then
     [ -f "${bypass_file:-}" ] && while IFS= read -r l; do [ -n "$l" ] && emit_f access-control-bypass high bypass "$(nurl "$l")" "$l"; done < "$bypass_file"
     [ -f "${idor_file:-}" ] && while IFS= read -r l; do [ -n "$l" ] && emit_f idor-authz high idor "$(nurl "$l")" "$l"; done < "$idor_file"
     [ -f "${prop_file:-}" ] && while IFS=$'\t' read -r c u; do [ -n "$u" ] && emit_f content-discovery info cross-host "$u" "status=$c (found on a sibling host)"; done < "$prop_file"
+    [ -f "${corsy_file:-}" ] && while IFS= read -r l; do [ -n "$l" ] && emit_f cors-misconfig medium corsy "$(nurl "$l")" "$l"; done < "$corsy_file"
     true   # force group exit 0: a trailing false [ -f ] test must not (via pipefail) trip the || fallback and clobber jq's output
   } | jq -s "{target:\"$domain\", generated:\"$(date -u +%FT%TZ)\", blueprint:\"${BLUEPRINT_NAME:-}\", count:length, findings:.}" > "$findings_json" 2>/dev/null
   [ -s "$findings_json" ] || echo '{}' > "$findings_json"
@@ -2414,18 +2544,24 @@ if have jq; then
   fi
 fi
 
+# Change-detection vs the last run of this target (must come after findings.json exists).
+diff_state
+diff_new="$(grep -c . "$diff_file" 2>/dev/null || echo 0)"
+
 # Final summary
 spend_note=""; [ "$AI_ENABLED" = 1 ] && spend_note="  ·  AI spend ~$(cost_fmt)"
-tally="nuclei:$find_count  fuzz-hits:${fuzz_hits:-0}$([ "$JSMINE" = 1 ] && echo "  js-secrets:$(nlines "$js_secrets_file")  params:$(nlines "$params_file")")$([ "$CRAWL" = 1 ] && echo "  active:$(nlines "$targets_active_file")  api-specs:$(nlines "${api_specs_file:-/dev/null}")  dast:$(nlines "$dast_file")  dalfox:$(nlines "$findings_dir/dalfox.txt")  sqlmap:$(nlines "$findings_dir/sqlmap.txt")")$([ "$OAST" = 1 ] && echo "  oast-confirmed:$(nlines "${oast_hits_file:-/dev/null}")")$([ "$AGENT" = 1 ] && echo "  agent-confirmed:$(nlines "${agent_file:-/dev/null}")")$([ "$CRAWL" = 1 ] && echo "  bypass:$(nlines "${bypass_file:-/dev/null}")  idor:$(nlines "${idor_file:-/dev/null}")")"
+tally="nuclei:$find_count  fuzz-hits:${fuzz_hits:-0}$([ "$JSMINE" = 1 ] && echo "  js-secrets:$(nlines "$js_secrets_file")  params:$(nlines "$params_file")")$([ "$CRAWL" = 1 ] && echo "  active:$(nlines "$targets_active_file")  api-specs:$(nlines "${api_specs_file:-/dev/null}")  dast:$(nlines "$dast_file")  dalfox:$(nlines "$findings_dir/dalfox.txt")  sqlmap:$(nlines "$findings_dir/sqlmap.txt")")$([ "$OAST" = 1 ] && echo "  oast-confirmed:$(nlines "${oast_hits_file:-/dev/null}")")$([ "$AGENT" = 1 ] && echo "  agent-confirmed:$(nlines "${agent_file:-/dev/null}")")$([ "$CRAWL" = 1 ] && echo "  bypass:$(nlines "${bypass_file:-/dev/null}")  idor:$(nlines "${idor_file:-/dev/null}")  cors:$(nlines "${corsy_file:-/dev/null}")")  verified:$(nlines "${verified_file:-/dev/null}")"
 if [ "$TUI" = 1 ]; then
   tui_end    # leave alt screen, reprint final panel into normal scrollback
   printf '\n %s✔ done in %ss%s%s\n   %s%s%s\n   report → %s%s%s\n' \
     "$c_green" "$((SECONDS-started))" "$c_reset" "$spend_note" \
     "$c_dim" "$tally" "$c_reset" "$c_cyan" "$report_file" "$c_reset"
   [ -f "$findings_json" ] && printf '   %sJSON   → %s%s%s\n' "$c_dim" "$c_cyan" "$findings_json" "$c_reset"
+  [ "$DIFF_STATE" = 1 ] && printf '   %schanges since last run: %s new items%s%s\n' "$c_dim" "${diff_new:-0}" "$([ "${diff_new:-0}" -gt 0 ] 2>/dev/null && echo "  → $diff_file")" "$c_reset"
 else
   ok "Done in $((SECONDS-started))s.$spend_note"
   ok "$tally"
   ok "Report: $report_file"
   [ -f "$findings_json" ] && ok "JSON:   $findings_json$([ "$EMIT_SARIF" = 1 ] && echo "  (+ findings.sarif)")"
+  [ "$DIFF_STATE" = 1 ] && ok "Changes since last run: ${diff_new:-0} new items$([ "${diff_new:-0}" -gt 0 ] 2>/dev/null && echo " ($diff_file)")"
 fi

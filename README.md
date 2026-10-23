@@ -270,6 +270,27 @@ OAST_SERVER=oast.mine.net ./4tail.sh -C -O example.com   # self-hosted interacts
 Needs `interactsh-client` (ProjectDiscovery). It sends target-derived callbacks to the
 collaborator server, so keep it to authorized targets; off by default.
 
+### Extra recon + verification (all optional, auto-skipped if the tool is absent)
+
+- **`tlsx`** — harvests in-scope hostnames from TLS cert SANs (more subdomains, passive).
+- **`cdncheck`** — accurate CDN/WAF/**cloud** classification: skip fuzzing WAF edges, and the
+  AI gets a "cloud-hosted (SSRF-to-metadata)" list.
+- **`dnsgen`/`gotator` + `dnsx`** — DNS permutation of known subs (bounded by `PERMUTE_MAX`).
+- **`qsreplace`/`unfurl`** — collapse value-variants in the XSS queue, cleaner origin parsing.
+- **`Corsy`** — CORS-misconfiguration pass on live hosts (a bug class nothing else covered).
+- **Verification pass** (`VERIFY=1`, default on) — every CONFIRMED finding is re-tested and
+  kept only if it's stable across two fetches **and** differs from a bogus-sibling control,
+  which drops soft-404 / catch-all false positives. Survivors land in `verified.txt`, lead
+  the report (`✅ Verified findings`), and are ranked highest by the AI triage. This matches
+  the 2026 AI-pentest research consensus (verify before you report).
+- **Change detection** (`DIFF_STATE=1`, default on) — each target's attack surface + findings
+  are snapshotted under `~/.4tail/state/`, and every run ends with **what's new since last
+  time** (`changes.txt`) — newly-deployed endpoints are disproportionately buggy.
+
+New blueprints: **`spa`** (JS-heavy React/Vue/Next) and **`graphql`**, on top of
+webapp_bounty / api_bounty / wordpress / stealth / deep. `doctor` lists every optional tool
+with its install command.
+
 ### Correlation passes — connecting findings into verdicts (`-C`)
 
 Beyond collecting findings, the active funnel now turns them into action:
