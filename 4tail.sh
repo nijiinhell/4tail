@@ -101,6 +101,10 @@ ACT_SPECIALISTS="${ACT_SPECIALISTS:-nuclei-dast,dalfox,kxss,arjun,sqlmap}"
 ACT_FOCUS="${ACT_FOCUS:-idor,sqli,xss,ssrf,lfi,redirect,ssti}"
 ACT_DAST_TAGS="${ACT_DAST_TAGS:-}"        # empty = all nuclei fuzzing (DAST) templates
 SQLMAP_CONFIRM="${SQLMAP_CONFIRM:-1}"     # allow sqlmap when the blueprint lists it (0 to hard-disable)
+SQLMAP_MAX_TIME="${SQLMAP_MAX_TIME:-180}" # per funnel-sqlmap run cap (s) - sqlmap can run for hours otherwise
+DALFOX_MAX_TIME="${DALFOX_MAX_TIME:-180}" # dalfox pipe cap (s)
+GAU_MAX_TIME="${GAU_MAX_TIME:-120}"       # gau / waybackurls each (s) - historical fetch can hang on big domains
+ARJUN_MAX_TIME="${ARJUN_MAX_TIME:-60}"    # per-host arjun cap (s, JS stage)
 API_SPECS="${API_SPECS:-1}"               # 1 = detect Swagger/OpenAPI/GraphQL specs -> AI builds targeted tests (part of -C)
 API_MAX_SPECS="${API_MAX_SPECS:-5}"       # cap spec documents fetched + fed to the AI
 API_MAX_TESTS="${API_MAX_TESTS:-60}"      # cap AI-generated API test URLs folded into the active set
@@ -633,6 +637,9 @@ budget_ok() { # 0 (true) if under budget or unlimited
 }
 cost_fmt() { awk -v c="$(cost_now)" 'BEGIN{printf "$%.4f", c}'; }
 nlines() { [ -f "$1" ] && wc -l < "$1" 2>/dev/null | tr -d ' ' || echo 0; }
+# Run a command under a wall-clock cap (no-op if `timeout` is unavailable). Keeps any
+# single external tool from stalling the whole scan for hours.
+tmo() { local s="$1"; shift; if have timeout; then timeout "$s" "$@"; else "$@"; fi; }
 # Drop static-asset URLs (stdin->stdout), testing the extension on the PATH only so a
 # file-ish query value (?file=app.js) is kept. Used to clean input to the slow scanners.
 drop_static() { awk -v re="$STATIC_URL_RE" '{ p=tolower($0); sub(/[?#].*/,"",p); if (p !~ re) print }'; }
@@ -1724,7 +1731,7 @@ else
       [ -z "$u" ] && continue
       pi=$((pi + 1)); [ "$pi" -gt "$PARAM_HOSTS" ] && break
       ptmp="$(mktemp)"
-      ( arjun -u "$u" -q -oT "$ptmp" 2>/dev/null ) & apid=$!
+      ( tmo "$ARJUN_MAX_TIME" arjun -u "$u" -q -oT "$ptmp" 2>/dev/null ) & apid=$!
       ps=$SECONDS
       while kill -0 "$apid" 2>/dev/null; do
         ST_DETAIL[$S_JS]="param discovery $pi/$ptotal  $((SECONDS-ps))s"
@@ -1765,8 +1772,8 @@ else
   esc_domain="$(printf '%s' "$domain" | sed 's/\./\\./g')"
   : > "$urls_file"
   # (A) Broad / passive URL collection - run exhaustively, it's cheap and WAF-safe.
-  have gau         && { printf '%s\n' "$domain" | gau --subs 2>>"$llm_log" >> "$urls_file" || true; }
-  have waybackurls && { printf '%s\n' "$domain" | waybackurls 2>>"$llm_log" >> "$urls_file" || true; }
+  have gau         && { printf '%s\n' "$domain" | tmo "$GAU_MAX_TIME" gau --subs 2>>"$llm_log" >> "$urls_file" || true; }
+  have waybackurls && { printf '%s\n' "$domain" | tmo "$GAU_MAX_TIME" waybackurls 2>>"$llm_log" >> "$urls_file" || true; }
   if have katana; then
     set_stage $S_CRAWL running "katana crawling…"
     kcmd=(katana -silent -list "$alive_file" -d 2 -jc -kf all -c 15 -o "$OUTDIR/.katana.txt")
@@ -1885,7 +1892,7 @@ else
   elif has_spec arjun && have arjun && [ "${ACT_MAX_ARJUN:-0}" -gt 0 ] 2>/dev/null && [ "$active_total" -gt 0 ]; then
     set_stage $S_CRAWL running "arjun param discovery"
     awk -F/ '{print $1"//"$3}' "$targets_active_file" | sort -u | head -n "$ACT_MAX_ARJUN" \
-      | while read -r h; do [ -n "$h" ] && arjun -u "$h" -q -oT /dev/stdout 2>/dev/null \
+      | while read -r h; do [ -n "$h" ] && tmo "$ARJUN_MAX_TIME" arjun -u "$h" -q -oT /dev/stdout 2>/dev/null \
           | sed "s#^#${h}/?#; s#\$#=1#" ; done >> "$targets_active_file" 2>/dev/null || true
   fi
   # Final clean of the set that feeds every slow specialist: drop static assets that
@@ -1923,7 +1930,7 @@ else
     sort -u -o "$xq" "$xq"
     [ -s "$xq" ] || cp "$targets_active_file" "$xq"                             # fallback: whole active set
     dfx=(dalfox pipe --silence --skip-bav -o "$findings_dir/dalfox.txt"); [ "${#DALFOX_NET[@]}" -gt 0 ] && dfx+=("${DALFOX_NET[@]}")
-    ( head -n "$ACT_MAX_DALFOX" "$xq" | "${dfx[@]}" >/dev/null 2>>"$llm_log" ) & SPIDS+=($!)
+    ( head -n "$ACT_MAX_DALFOX" "$xq" | tmo "$DALFOX_MAX_TIME" "${dfx[@]}" >/dev/null 2>>"$llm_log" ) & SPIDS+=($!)
   fi
   # Broad DAST: nuclei -dast across all classes (or ACT_DAST_TAGS)
   if has_spec nuclei-dast && have nuclei && [ -s "$targets_active_file" ]; then
@@ -1945,7 +1952,7 @@ else
   if has_spec sqlmap && [ "$SQLMAP_CONFIRM" = 1 ] && have sqlmap && [ "${ACT_MAX_SQLMAP:-0}" -gt 0 ] 2>/dev/null; then
     sq="$findings_dir/.sqliq.txt"; grep -iE '^sqli\t' "$gf_file" 2>/dev/null | cut -f2 | head -n "$ACT_MAX_SQLMAP" > "$sq"
     if [ -s "$sq" ]; then
-      ( sqlmap -m "$sq" --batch --smart --level=1 --risk=1 --technique=BEU \
+      ( tmo "$SQLMAP_MAX_TIME" sqlmap -m "$sq" --batch --smart --level=1 --risk=1 --technique=BEU \
           --output-dir="$findings_dir/sqlmap" >/dev/null 2>>"$llm_log"
         grep -rhiE 'parameter .* is vulnerable|is injectable|Type: ' "$findings_dir/sqlmap" 2>/dev/null \
           | sort -u > "$findings_dir/sqlmap.txt" ) & SPIDS+=($!)
