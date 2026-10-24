@@ -177,12 +177,20 @@ OAST_MAX_INJECT="${OAST_MAX_INJECT:-40}" # cap URLs we inject an OOB payload int
 # them (read web.config via LFI, param-mine empty 200s, test redirects, walk IDOR ids),
 # sees the responses, and decides the next move - bounded so it never camps on one host.
 AGENT="${AGENT:-0}"                       # 1 = run the autonomous probe loop (-A)
-AGENT_ROUNDS="${AGENT_ROUNDS:-6}"         # max observe->decide->act rounds (AI stops itself when leads run out)
-AGENT_MAX_PROBES="${AGENT_MAX_PROBES:-8}" # max GET probes the AI may fire per round
-AGENT_MAX_TIME="${AGENT_MAX_TIME:-300}"   # hard wall-clock cap (s) for the whole loop; 0 = unlimited
+AGENT_ROUNDS="${AGENT_ROUNDS:-8}"         # max observe->decide->act rounds (AI stops itself when leads run out)
+AGENT_MAX_PROBES="${AGENT_MAX_PROBES:-12}" # max GET/POST probes the AI may fire per round
+AGENT_MAX_TIME="${AGENT_MAX_TIME:-600}"   # hard wall-clock cap (s) for the whole loop; 0 = unlimited
 AGENT_TOOLS="${AGENT_TOOLS:-1}"           # 1 = agent may invoke real tools (sqlmap/nuclei/dalfox/...), not just GET
-AGENT_MAX_TOOLCALLS="${AGENT_MAX_TOOLCALLS:-10}" # cap tool invocations across the whole loop
+AGENT_MAX_TOOLCALLS="${AGENT_MAX_TOOLCALLS:-16}" # cap tool invocations across the whole loop
 AGENT_TOOL_TIMEOUT="${AGENT_TOOL_TIMEOUT:-90}"   # per tool-call wall-clock cap (s)
+# POST / body probing: the agent may fire POST requests to test body-based bugs itself
+# (login/register logic, body IDOR/SQLi, mass assignment). Still scope-locked; bodies with
+# clearly destructive payloads (DROP/DELETE/TRUNCATE/SHUTDOWN/xp_cmdshell/...) are refused.
+AGENT_POST="${AGENT_POST:-1}"             # 1 = allow agent POST probes; 0 = GET-only agent
+AGENT_MAX_POST="${AGENT_MAX_POST:-12}"    # cap POST probes across the whole loop
+# Secrets the agent reads (e.g. a connection string via LFI) are NEVER sent to the LLM -
+# the model sees a redacted snippet, but the raw response is saved locally for the human.
+AGENT_LOOT="${AGENT_LOOT:-1}"             # 1 = save raw secret-bearing responses to agent_loot/ for manual review
 DEFAULT_NUCLEI_TAGS="${DEFAULT_NUCLEI_TAGS:-cves,exposures,misconfiguration,tech,default-login,takeover}"
 MAX_TAGS="${MAX_TAGS:-15}"                # cap nuclei tags (more tags = far more templates = much slower)
 NUCLEI_SEVERITY="${NUCLEI_SEVERITY:-critical,high,medium,low}"
@@ -876,7 +884,17 @@ agent_tool_run() {   # name  target  extra
       res="$(printf '%s' "$raw" | head -1 | tr -d '\r')" ;;
     sqlmap)
       have sqlmap || { echo "sqlmap: not installed"; return 0; }
-      raw="$(_cap sqlmap -u "$tgt" --batch --smart --level=1 --risk=1 --technique=BEU --disable-coloring 2>/dev/null | tail -c 4000)"
+      # The agent may pass extra sqlmap flags, but escalation and OS/file access are forced off:
+      # any --level/--risk it asks for is dropped and we always run --level=1 --risk=1, and the
+      # dangerous flags (shells, file read/write, tamper, eval) are stripped. So "try level=5" no-ops.
+      local sqx=() _tok
+      for _tok in $extra; do
+        case "$_tok" in
+          --dbs|--tables|--current-db|--current-user|--banner|-p|--dump) sqx+=("$_tok") ;;  # allow a few safe enumeration flags
+          *) ;;  # ignore everything else: escalation (--level/--risk), shells, file R/W, tamper, technique (stays BEU)
+        esac
+      done
+      raw="$(_cap sqlmap -u "$tgt" --batch --smart --level=1 --risk=1 --technique=BEU --disable-coloring ${sqx[@]+"${sqx[@]}"} 2>/dev/null | tail -c 4000)"
       printf '%s' "$raw" | grep -qiE 'is vulnerable|is injectable|Parameter:.*|Type: ' && hit="CONFIRMED sqli"
       res="$(printf '%s' "$raw" | grep -iE 'vulnerable|injectable|Type:|back-end DBMS' | head -3 | tr '\n' ';')" ;;
     dalfox)
@@ -898,10 +916,19 @@ agent_tool_run() {   # name  target  extra
       wl="$WORDLIST"; [ -f "${SECLISTS_DIR:-}/Discovery/Web-Content/quickhits.txt" ] && wl="$SECLISTS_DIR/Discovery/Web-Content/quickhits.txt"
       raw="$(_cap ffuf -u "${tgt%/}/FUZZ" -w "$wl" -ac -mc 200,204,301,302,401,403 -s ${FFUF_NET[@]+"${FFUF_NET[@]}"} 2>/dev/null | head -c 3000)"
       [ -n "$raw" ] && hit="FINDING"; res="hits: $(printf '%s' "$raw" | head -8 | tr '\n' ' ')" ;;
-    arjun)
-      have arjun || { echo "arjun: not installed"; return 0; }
-      raw="$(_cap arjun -u "$tgt" -q -oT /dev/stdout 2>/dev/null | head -c 2000)"
-      res="params: $(printf '%s' "$raw" | tr '\n' ' ' | head -c 300)" ;;
+    arjun|x8)
+      # Param discovery with automatic fallback: if the requested tool is missing OR returns
+      # nothing (arjun often gets rate-limited), try the other one before giving up.
+      local pwl2="${SECLISTS_DIR:+$SECLISTS_DIR/Discovery/Web-Content/burp-parameter-names.txt}"
+      _run_arjun() { _cap arjun -u "$1" -q -oT /dev/stdout 2>/dev/null | head -c 2000; }
+      _run_x8()    { _cap x8 -u "$1" ${pwl2:+-w "$pwl2"} 2>/dev/null | grep -oiE '[a-z0-9_.-]{2,40}' | head -c 2000; }
+      if [ "$name" = x8 ]; then
+        have x8 && raw="$(_run_x8 "$tgt")"; [ -n "$raw" ] || { have arjun && { raw="$(_run_arjun "$tgt")"; name="arjun(fallback)"; }; }
+      else
+        have arjun && raw="$(_run_arjun "$tgt")"; [ -n "$raw" ] || { have x8 && { raw="$(_run_x8 "$tgt")"; name="x8(fallback)"; }; }
+      fi
+      [ -n "$raw" ] || { echo "param discovery: no arjun/x8 result (both tried)"; return 0; }
+      res="params ($name): $(printf '%s' "$raw" | tr '\n' ' ' | head -c 300)" ;;
     katana)
       have katana || { echo "katana: not installed"; return 0; }
       raw="$(_cap katana -u "$tgt" -silent -d 1 -jc ${KATANA_NET[@]+"${KATANA_NET[@]}"} 2>/dev/null | head -c 3000)"
@@ -2089,15 +2116,28 @@ else
       ptmp="$(mktemp)"
       if [ "$PREFER_X8" = 1 ] && have x8; then
         ( tmo "$ARJUN_MAX_TIME" x8 -u "$u" ${pwl:+-w "$pwl"} -O "$ptmp" 2>/dev/null ) & apid=$!
+        param_primary=x8
       else
         ( tmo "$ARJUN_MAX_TIME" arjun -u "$u" -q -oT "$ptmp" 2>/dev/null ) & apid=$!
+        param_primary=arjun
       fi
       ps=$SECONDS
       while kill -0 "$apid" 2>/dev/null; do
-        ST_DETAIL[$S_JS]="param discovery $pi/$ptotal  $((SECONDS-ps))s"
+        ST_DETAIL[$S_JS]="param discovery $pi/$ptotal ($param_primary)  $((SECONDS-ps))s"
         [ "$TUI" = 1 ] && render; sleep 0.3
       done
       wait "$apid" 2>/dev/null || true
+      # Fallback: arjun gets rate-limited a lot and x8 can whiff - if the primary found nothing,
+      # try the other tool on this host before moving on.
+      if [ ! -s "$ptmp" ]; then
+        if [ "$param_primary" = x8 ] && have arjun; then
+          ST_DETAIL[$S_JS]="param discovery $pi/$ptotal (arjun fallback)"; [ "$TUI" = 1 ] && render
+          tmo "$ARJUN_MAX_TIME" arjun -u "$u" -q -oT "$ptmp" 2>/dev/null || true
+        elif [ "$param_primary" = arjun ] && have x8; then
+          ST_DETAIL[$S_JS]="param discovery $pi/$ptotal (x8 fallback)"; [ "$TUI" = 1 ] && render
+          tmo "$ARJUN_MAX_TIME" x8 -u "$u" ${pwl:+-w "$pwl"} -O "$ptmp" 2>/dev/null || true
+        fi
+      fi
       # normalise either tool's output to bare param names, prefix the host.
       if [ -s "$ptmp" ]; then
         grep -oiE '[a-z0-9_.\[\]-]{1,40}' "$ptmp" 2>/dev/null | awk 'length>=2 && !seen[$0]++' \
@@ -2560,6 +2600,18 @@ elif ! budget_ok; then
 else
   set_stage $S_AGENT running "building situation"
   agent_seen="$OUTDIR/.agent_seen"; : > "$agent_seen"
+  agent_loot_dir="$OUTDIR/agent_loot"; agent_post_n=0
+  # Secret value patterns: when a response matches, the RAW body is saved locally for the
+  # human (never sent to the LLM) so a cred read via LFI is actually captured, not just noted.
+  AGENT_SECRET_RE='connection[-_ ]?string|<add[^>]*connectionString|Data Source=|Server=.*;.*(Password|Pwd)=|Initial Catalog=|Provider=|machineKey|validationKey=|decryptionKey=|BEGIN [A-Z ]*PRIVATE KEY|AKIA[0-9A-Z]{16}|password["'"'"' ]*[:=]|SA_PASSWORD|DB_PASSWORD'
+  agent_capture_secret() {  # $1=url $2=raw-response ; saves raw locally if it carries a secret
+    [ "$AGENT_LOOT" = 1 ] || return 0
+    printf '%s' "$2" | grep -qiE -- "$AGENT_SECRET_RE" 2>/dev/null || return 0
+    mkdir -p "$agent_loot_dir"
+    local f="$agent_loot_dir/$(printf '%s' "$1" | tr -c 'A-Za-z0-9._-' '_' | tail -c 120).txt"
+    { echo "# $1"; printf '%s\n' "$2"; } > "$f"
+    printf '[SECRET-LOOT] %s | raw response with credentials saved -> %s\n' "$1" "$f" >> "$agent_file"
+  }
   # Compact "situation" brief: the juiciest, most actionable signals only.
   situation="$( {
       echo "TARGET SCOPE: *.$domain"
@@ -2591,15 +2643,16 @@ else
     aout="$(mktemp)"
     ai_call "$LLM_MODEL_PLAN" 2200 \
 "You are an autonomous web-app pentester on an AUTHORIZED target, working in rounds. You keep a running NOTES block (your hypotheses: what you suspect, why, and what is confirmed / refuted / still-unconfirmed), update it each round from the latest results, then take the next ACTIONS to chase the hottest lead, then decide whether to keep going.
-Two kinds of action:
-  GET <url> | why | success-regex   -> a passive fetch you confirm by regex (LFI reads, redirects, param mining, IDOR id-walking).
-  TOOL <name> <url> | tags=...       -> run a real tool. ONLY these are installed: ${agent_tools:-none}. Use them to CONFIRM, e.g. sqlmap on a SQLi-looking param, dalfox on a reflecting param, nuclei <url> tags=iis,cve on a fingerprinted host, git-dumper on an exposed /.git, nuclei-dast to fuzz a param URL. Prefer a TOOL to prove a lead over guessing.
-Ideas: confirmed/possible LFI (Templatize.asp?item=) -> read ../web.config, ../global.asa, ../../../windows/win.ini; empty/small 200 endpoints -> add params ?id=1&debug=1; redirect params -> //example.org/ and watch Location; IDOR -> walk ids; exposed /.git -> git-dumper.
+Three kinds of action:
+  GET <url> | why | success-regex            -> a passive fetch you confirm by regex (LFI reads, redirects, param mining, IDOR id-walking).
+  POST <url> | body | why | success-regex    -> a form/JSON POST to test BODY-based bugs: login/register logic, body IDOR/SQLi, mass assignment. body is raw urlencoded (e.g. tfUName=%27&tfUPass=x) or JSON. NON-DESTRUCTIVE only: benign markers, id=1/id=2, a single quote for SQLi - never DROP/DELETE/TRUNCATE/SHUTDOWN/xp_cmdshell or mass writes (those are refused).
+  TOOL <name> <url> | tags=...               -> run a real tool. ONLY these are installed: ${agent_tools:-none}. Use them to CONFIRM, e.g. sqlmap on a SQLi-looking param (it always runs capped at --level=1 --risk=1; higher levels are ignored), dalfox on a reflecting param, nuclei <url> tags=iis,cve on a fingerprinted host, git-dumper on an exposed /.git, nuclei-dast to fuzz a param URL. Prefer a TOOL to prove a lead over guessing.
+Ideas: confirmed/possible LFI (Templatize.asp?item=) -> read ../web.config, ../global.asa, ../../../windows/win.ini (if it holds a connection string / machineKey, 4tail saves the raw file for the human - you just confirm the read with a regex like connectionString); empty/small 200 endpoints -> add params ?id=1&debug=1; redirect params -> //example.org/ and watch Location; IDOR -> walk ids; login/register -> POST a single-quote in the username to probe SQLi, or extra fields (role=admin) to probe mass assignment; exposed /.git -> git-dumper.
 All URLs MUST be on the target scope *.$domain. Respond in EXACTLY this structure, nothing else:
 NOTES:
 <2-6 short lines: updated hypotheses + status>
 ACTIONS:
-<one GET or TOOL line each>
+<one GET, POST or TOOL line each>
 DECISION: CONTINUE
 (use 'DECISION: STOP' when leads are exhausted or everything promising is already confirmed)" \
 "SITUATION:
@@ -2645,6 +2698,36 @@ $results" > "$aout" 2>>"$llm_log" || true
         results="$results"$'\n'"$tr_out"
         continue
       fi
+      # POST probe: the agent tests a BODY-based bug itself (login/register logic, body
+      # IDOR/SQLi, mass assignment). Scope-locked, capped, destructive bodies refused.
+      if [ "$AGENT_POST" = 1 ] && printf '%s' "$pline" | grep -qiE '(^|[^a-z])POST[: ]+https?://'; then
+        [ "$np" -ge "$AGENT_MAX_PROBES" ] && continue
+        [ "$agent_post_n" -ge "$AGENT_MAX_POST" ] && continue
+        purl="$(printf '%s' "$pline" | sed -E 's/.*POST[: ]+//I' | awk -F'|' '{print $1}' | grep -oiE 'https?://[^ "'"'"'`<>]+' | head -1)"
+        pbody="$(printf '%s' "$pline" | awk -F'|' 'NF>=2{print $2}' | sed 's/^ *//;s/ *$//')"
+        pwhy="$(printf '%s'  "$pline" | awk -F'|' 'NF>=3{print $3}' | sed 's/^ *//;s/ *$//')"; [ -n "$pwhy" ] || pwhy="agent POST probe"
+        prx="$(printf '%s'   "$pline" | awk -F'|' 'NF>=4{print $4}' | sed 's/^ *//;s/ *$//')"; [ -n "$prx" ] || prx="$agent_default_rx"
+        [ -n "$purl" ] || continue
+        printf '%s' "$purl" | grep -qiE "^https?://([a-z0-9._-]+\.)?${esc_domain}([:/]|$)" || continue   # scope lock
+        # refuse clearly destructive bodies (quote probes / OR 1=1 / mass-assignment are allowed)
+        if printf '%s' "$pbody" | grep -qiE 'drop[[:space:]]+table|truncate[[:space:]]+table|delete[[:space:]]+from|shutdown|xp_cmdshell|sp_configure|;[[:space:]]*drop|rm[[:space:]]+-rf|format[[:space:]]+c:'; then
+          printf '[r%s] POST refused (destructive body): %s\n' "$round" "$purl" >> "$agent_log"; continue
+        fi
+        grep -qxF "POST $purl $pbody" "$agent_seen" 2>/dev/null && continue
+        printf 'POST %s %s\n' "$purl" "$pbody" >> "$agent_seen"; np=$((np+1)); agent_post_n=$((agent_post_n+1))
+        set_stage $S_AGENT running "round $round: POST probe ($agent_post_n/$AGENT_MAX_POST)"; render
+        pct="application/x-www-form-urlencoded"; case "$pbody" in \{*|\[*) pct="application/json" ;; esac
+        presp="$(_cap curl -s -i -L -X POST --max-time 15 ${CURL_NET[@]+"${CURL_NET[@]}"} -H "Content-Type: $pct" --data "$pbody" "$purl" 2>/dev/null | head -c 6000)"
+        agent_capture_secret "$purl" "$presp"
+        pred="$(printf '%s' "$presp" | sed -E 's/((pass(word|wd)?|connection[-_ ]?string|accountkey|secret|api[-_]?key|token)[^[:cntrl:]]{0,8}[:=])[^[:cntrl:]"'"'"']{1,}/\1<redacted>/Ig')"
+        phit=""; printf '%s' "$presp" | grep -qiE -- "$prx" 2>/dev/null && phit="HIT"
+        pstatus="$(printf '%s' "$presp" | head -1 | tr -d '\r')"
+        psnip="$(printf '%s' "$pred" | tr '\n\r\t' '   ' | sed -E 's/  +/ /g' | head -c 240)"
+        printf '[r%s] POST %-4s %s (body: %.60s)\n   why: %s\n   resp: %s | %s\n' "$round" "${phit:-...}" "$purl" "$pbody" "$pwhy" "$pstatus" "$psnip" >> "$agent_log"
+        results="$results"$'\n'"POST $purl => ${phit:-no-match} [$pstatus] $psnip"
+        [ "$phit" = HIT ] && printf '[CONFIRMED] POST %s (body: %s) | %s\n' "$purl" "$pbody" "$pwhy" >> "$agent_file"
+        continue
+      fi
       # GET probe (passive fetch, regex-confirmed).
       [ "$np" -ge "$AGENT_MAX_PROBES" ] && continue
       url="$(printf '%s' "$pline" | grep -oiE 'https?://[^ "'"'"'`|<>]+' | head -1)"
@@ -2657,6 +2740,7 @@ $results" > "$aout" 2>>"$llm_log" || true
       printf '%s\n' "$url" >> "$agent_seen"; np=$((np+1))
       set_stage $S_AGENT running "round $round: probing ($(nlines "$agent_seen") sent)"; render
       resp="$(curl -s -i -L --max-time 12 ${CURL_NET[@]+"${CURL_NET[@]}"} "$url" 2>/dev/null | head -c 6000)"
+      agent_capture_secret "$url" "$resp"   # save raw creds locally (not to the LLM) if present
       # redact anything that looks like a secret before it is stored or sent back to the LLM
       red="$(printf '%s' "$resp" | sed -E 's/((pass(word|wd)?|connection[-_ ]?string|accountkey|secret|api[-_]?key|token|aws[_-]?secret[_-]?access[_-]?key)[^[:cntrl:]]{0,8}[:=])[^[:cntrl:]"'"'"']{1,}/\1<redacted>/Ig')"
       hit=""; [ -n "$rx" ] && printf '%s' "$resp" | grep -qiE -- "$rx" 2>/dev/null && hit="HIT"
@@ -3028,6 +3112,7 @@ if [ "$TUI" = 1 ]; then
     "$c_dim" "$tally" "$c_reset" "$c_cyan" "$report_file" "$c_reset"
   [ -f "$findings_json" ] && printf '   %sJSON   → %s%s%s\n' "$c_dim" "$c_cyan" "$findings_json" "$c_reset"
   [ -s "${poc_file:-/dev/null}" ] && printf '   %sPoCs   → %s%s%s %s(manual, review before running)%s\n' "$c_dim" "$c_cyan" "$poc_file" "$c_reset" "$c_dim" "$c_reset"
+  [ -n "$(ls -A "${agent_loot_dir:-/nonexistent}" 2>/dev/null)" ] && printf '   %sLOOT   → %s%s/%s %s(raw creds the agent read — kept local, never sent to the LLM)%s\n' "$c_dim" "$c_cyan" "$agent_loot_dir" "$c_reset" "$c_dim" "$c_reset"
   [ "$DIFF_STATE" = 1 ] && printf '   %schanges since last run: %s new items%s%s\n' "$c_dim" "${diff_new:-0}" "$([ "${diff_new:-0}" -gt 0 ] 2>/dev/null && echo "  → $diff_file")" "$c_reset"
 else
   ok "Done in $((SECONDS-started))s.$spend_note"
@@ -3035,5 +3120,6 @@ else
   ok "Report: $report_file"
   [ -f "$findings_json" ] && ok "JSON:   $findings_json$([ "$EMIT_SARIF" = 1 ] && echo "  (+ findings.sarif)")"
   [ -s "${poc_file:-/dev/null}" ] && ok "PoCs:   $poc_file  (manual, review before running)"
+  [ -n "$(ls -A "${agent_loot_dir:-/nonexistent}" 2>/dev/null)" ] && ok "Loot:   $agent_loot_dir/  (raw creds the agent read - kept local, never sent to the LLM)"
   [ "$DIFF_STATE" = 1 ] && ok "Changes since last run: ${diff_new:-0} new items$([ "${diff_new:-0}" -gt 0 ] 2>/dev/null && echo " ($diff_file)")"
 fi

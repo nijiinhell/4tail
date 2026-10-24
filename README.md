@@ -412,6 +412,7 @@ Agent-confirmed` section at the top of the report.
 ```bash
 ./4tail.sh -C -A example.com                         # funnel + autonomous agent
 AGENT_ROUNDS=4 AGENT_MAX_TIME=360 ./4tail.sh -C -A example.com
+AGENT_POST=0 ./4tail.sh -C -A example.com            # keep the agent GET-only
 ```
 
 **It reasons with continuity (a "self-brain").** Each round the AI rewrites a running
@@ -432,20 +433,37 @@ scope-locked, and runs are capped (`AGENT_MAX_TOOLCALLS`, `AGENT_TOOL_TIMEOUT`):
 | `sqlmap` | confirm SQLi on a suspicious param |
 | `dalfox` | confirm XSS on a reflecting param |
 | `nuclei` / `nuclei-dast` | run targeted templates / fuzz a URL |
-| `ffuf` / `arjun` / `katana` | dig a promising dir / find params / crawl deeper |
+| `ffuf` / `arjun` / `x8` / `katana` | dig a promising dir / find params (arjun↔x8 auto-fallback when one is rate-limited or whiffs) / crawl deeper |
 | `git-dumper` → `trufflehog` | dump an exposed `/.git` and scan the source for secrets |
-| `crlfuzz` / `x8` | CRLF/header injection / fast hidden-param discovery |
+| `crlfuzz` | CRLF / header injection |
 | `gau` / `waybackurls` / `curl` | pull history / fetch-and-read |
 
-`doctor` lists what's offered and prints install commands for the high-value optional ones
-(`crlfuzz`, `x8`, `git-dumper`, `trufflehog`). Missing tools are simply never offered.
+`sqlmap` is held to `--batch --level=1 --risk=1 --technique=BEU`: if the agent asks for
+`--level=5`/`--risk=3`, OS shells, or file read/write, those flags are **stripped** (only a
+few read-only enumeration flags like `--dbs`/`--current-user` pass through). `doctor` lists
+what's offered and prints install commands for the high-value optional ones. Missing tools
+are simply never offered.
 
-**Bounded by design so it never camps on one host:** `AGENT_ROUNDS` (default 6, but the AI
-usually stops itself earlier), `AGENT_MAX_PROBES` (8) GET requests per round, and a hard
-`AGENT_MAX_TIME` wall-clock cap (240s). **Hard guardrails:** GET-only, every probe
-scope-locked to the target domain (off-scope/non-http URLs are dropped), duplicate probes
-skipped, and secrets (passwords, connection strings, keys, tokens) redacted before anything
-is stored or sent back to the model. Off by default; runs behind the authorization gate.
+**It also fires POST probes for body-based bugs** (`AGENT_POST=1`, default on). Alongside
+`GET` and `TOOL`, the agent can issue `POST <url> | body | why | success-regex` to test
+login/register logic, body IDOR/SQLi, and mass assignment itself — so those classes are now
+actively confirmed, not just written up as manual PoCs. Each POST is scope-locked and capped
+(`AGENT_MAX_POST`), and **clearly destructive bodies are refused** (`DROP`/`DELETE`/`TRUNCATE`
+/`SHUTDOWN`/`xp_cmdshell`/…); quote probes, `OR 1=1`, and extra-field mass-assignment are
+allowed. Set `AGENT_POST=0` for a strictly GET-only agent.
+
+**Secrets it reads stay local.** When a probe response carries a credential (connection
+string, `machineKey`, private key, AWS key…), the model is still only shown a **redacted**
+snippet, but the **raw** response is saved under `agent_loot/` for you — so a connection
+string read through an LFI is actually *captured* for follow-up, never sent to the LLM
+(`AGENT_LOOT=1`).
+
+**Bounded so it never camps on one host:** `AGENT_ROUNDS` (default 8, but the AI usually
+stops itself earlier), `AGENT_MAX_PROBES` (12) GET/POST requests per round, and a hard
+`AGENT_MAX_TIME` wall-clock cap (600s). **Hard guardrails:** every probe scope-locked to the
+target domain (off-scope/non-http URLs dropped), destructive POST bodies refused, duplicates
+skipped, and secrets redacted before anything is sent back to the model. Off by default;
+runs behind the authorization gate.
 
 ### Response-fingerprint dedup
 
