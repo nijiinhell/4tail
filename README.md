@@ -564,7 +564,8 @@ export TOGETHER_API_KEY="your-together-ai-key"
 
 > The script checks its dependencies on startup and tells you exactly what's
 > missing, so you can install as you go. `subfinder`, `httpx`, `nuclei` are
-> required; `ffuf`, `jq`, `curl` and the API key are optional.
+> required (`subfinder` only for subdomain enumeration — not needed in single-host
+> mode, `-s`); `ffuf`, `jq`, `curl` and the API key are optional.
 
 ## Usage
 
@@ -580,7 +581,28 @@ TOGETHER_API_KEY=... ./4tail.sh -y -o run1 -S critical,high example.com
 
 # Plain output (no live dashboard), e.g. when logging to a file:
 ./4tail.sh -P example.com | tee run.log
+
+# Single host / local app (no subdomain enum; port + scheme honored):
+./4tail.sh -C -j -A http://localhost:3000    # a dev server on a custom port
+./4tail.sh -C 127.0.0.1:8080                 # a bare IP:port
+./4tail.sh -s -C example.com                 # force "just this host" on a real domain
 ```
+
+### Single-host / localhost mode (`-s`)
+
+By default 4tail treats the target as a **domain** and enumerates its subdomains. To test
+one specific host instead — a local dev server, an internal IP, or a single hostname — use
+`-s` (or just pass a URL/host that can't be a bounty scope and 4tail switches automatically).
+It is auto-enabled when the target is `localhost`, a bare IP, a single-label host, or carries
+an explicit port.
+
+In this mode 4tail **skips subdomain enumeration** (no `subfinder`/`tlsx`/permutation, so
+`subfinder` isn't even required) and probes **exactly** the host you gave — honoring the
+scheme and port (`http://localhost:3000`, `127.0.0.1:8080`, `https://10.0.0.5`). If you omit
+the scheme, httpx tries both `http` and `https`. Public-archive sources (gau/waybackurls/
+waymore) and the SPF/DMARC/zone-transfer checks are skipped for `localhost`/IPs/ports, since
+they only apply to internet-facing domains. Everything else — fuzzing, the active funnel,
+nuclei, the agent — runs normally against that one host.
 
 ### Resume an interrupted run
 
@@ -714,6 +736,7 @@ and (each ping uses `max_tokens: 16`) costs almost nothing.
 | `-t <tags>` | Fallback Nuclei tags (used when AI is off) | `DEFAULT_NUCLEI_TAGS` |
 | `-S <sev>`  | Nuclei severities | `NUCLEI_SEVERITY` (default `critical,high,medium,low`) |
 | `-m <model>`| LLM model id | `LLM_MODEL` (default `zai-org/GLM-5.3`) |
+| `-s`        | Single host: no subdomain enum; test exactly the given host (localhost/IP/port OK) | `SINGLE=1` |
 | `-y`        | Skip the authorization prompt | `ASSUME_YES=1` |
 | `-h`        | Show help | |
 

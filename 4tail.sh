@@ -78,6 +78,7 @@ DEDUPE_ORIGINS="${DEDUPE_ORIGINS:-1}"    # 1 = one fuzz target per IP/CNAME + re
 USE_DNSX="${USE_DNSX:-1}"                # 1 = use dnsx (if installed) to resolve + drop wildcards
 JSMINE="${JSMINE:-0}"                    # 1 = JS/secret mining + param discovery (-j)
 CRAWL="${CRAWL:-0}"                       # 1 = active funnel: crawl -> cluster -> AI juicy -> specialists (-C)
+SINGLE="${SINGLE:-0}"                     # 1 = single-host mode (-s): no subdomain enum; test exactly the given host:port (localhost/IP/port OK)
 # Static assets never hold injection bugs - strip them before the slow tools (dalfox/
 # nuclei-dast/kxss/sqlmap) so caps and time are spent on real endpoints, not app.js?v=1.
 # Matched against the PATH only (query stripped first by drop_static), so a file-ish
@@ -241,6 +242,7 @@ Options:
   -p <n>      Fuzz N hosts in parallel        (env FUZZ_PARALLEL, default 1; auto-backoff)
   -j          JS/secret mining + param discovery (env JSMINE=1)
   -C          Active funnel: crawl -> cluster -> AI juicy -> API specs -> specialists (env CRAWL=1)
+  -s          Single host: no subdomain enum; test exactly the given host incl. port/localhost/IP (env SINGLE=1)
   -B <name>   Blueprint/strategy (env BLUEPRINT; "auto"=AI picks; or webapp_bounty/api_bounty/wordpress/stealth/deep)
   -H <hdr>    Auth header, repeatable (e.g. -H "Authorization: Bearer X"); env AUTH_HEADER/AUTH_COOKIE
   -x <proxy>  Route tools through http(s) proxy (env PROXY)
@@ -271,7 +273,7 @@ EOF
 # `doctor` subcommand (before getopts, which doesn't parse bare words)
 if [ "${1:-}" = "doctor" ]; then DOCTOR=1; shift; fi
 
-while getopts ":w:o:t:S:m:M:p:b:B:H:x:OARqjCyPDh" opt; do
+while getopts ":w:o:t:S:m:M:p:b:B:H:x:OARqjsCyPDh" opt; do
   case "$opt" in
     w) WORDLIST="$OPTARG" ;;
     o) OUTDIR="$OPTARG" ;;
@@ -290,6 +292,7 @@ while getopts ":w:o:t:S:m:M:p:b:B:H:x:OARqjCyPDh" opt; do
     b) LLM_BUDGET_USD="$OPTARG" ;;
     R) RESUME=1 ;;
     q) SKIP_FUZZ=1 ;;
+    s) SINGLE=1 ;;
     y) ASSUME_YES=1 ;;
     P) NO_TUI=1 ;;
     D) DOCTOR=1 ;;
@@ -305,17 +308,46 @@ LLM_MODEL_PLAN="${LLM_MODEL_PLAN:-$LLM_MODEL}"
 LLM_MODEL_TRIAGE="${LLM_MODEL_TRIAGE:-$LLM_MODEL}"
 LLM_MAX_TOKENS_TRIAGE="${LLM_MAX_TOKENS_TRIAGE:-8000}"
 
-domain="${1:-}"
-# Normalize: strip scheme, any path/port, whitespace, and lowercase - so a pasted URL
-# or stray character can't turn into a different/invalid target.
-domain="$(printf '%s' "$domain" | tr -d '[:space:]' | sed -E 's#^[a-zA-Z]+://##; s#[/:].*$##' | tr 'A-Z' 'a-z')"
-esc_domain="$(printf '%s' "$domain" | sed 's/\./\\./g')"   # regex-safe domain, defined once for all scope filters
+raw_target="${1:-}"
+# Normalize but KEEP scheme + port so we can test a specific host:port (e.g. http://localhost:3000).
+# TARGET_SCHEME / TARGET_PORT are carried separately; $domain stays the bare host (used for scope
+# matching, subfinder and the output dir name). SEED_URL is the exact URL httpx will probe.
+TARGET_SCHEME="$(printf '%s' "$raw_target" | sed -nE 's#^([a-zA-Z]+)://.*#\1#p' | tr 'A-Z' 'a-z')"
+_hostport="$(printf '%s' "$raw_target" | tr -d '[:space:]' | sed -E 's#^[a-zA-Z]+://##; s#/.*$##' | tr 'A-Z' 'a-z')"
+TARGET_PORT="$(printf '%s' "$_hostport" | sed -nE 's#^[^:]+:([0-9]+)$#\1#p')"
+domain="$(printf '%s' "$_hostport" | sed -E 's#:[0-9]+$##')"
+esc_domain="$(printf '%s' "$domain" | sed 's/\./\\./g')"   # regex-safe host, defined once for all scope filters
+# Auto-enable single-host mode when subdomain enumeration is meaningless/impossible:
+# an explicit port, localhost, a bare IP, or a single-label host (no dot).
+if [ -n "$TARGET_PORT" ] || [ "$domain" = localhost ] \
+   || printf '%s' "$domain" | grep -qE '^([0-9]{1,3}\.){3}[0-9]{1,3}$' \
+   || ! printf '%s' "$domain" | grep -q '\.'; then
+  SINGLE=1
+fi
+# If the user gave a scheme, honor it exactly; if not, hand httpx a bare host[:port] so it
+# probes BOTH http and https (dev servers vary). SEED_URL is what httpx probes in single mode.
+if [ -n "$TARGET_SCHEME" ]; then
+  SEED_URL="${TARGET_SCHEME}://${domain}${TARGET_PORT:+:$TARGET_PORT}"
+else
+  SEED_URL="${domain}${TARGET_PORT:+:$TARGET_PORT}"
+fi
+# Public archives (gau/waybackurls/waymore) are keyed by internet domain - useless (and a time
+# sink) against localhost / a bare IP / a non-standard port, so skip them there.
+NO_ARCHIVE=0
+{ [ "$domain" = localhost ] || printf '%s' "$domain" | grep -qE '^([0-9]{1,3}\.){3}[0-9]{1,3}$' || [ -n "$TARGET_PORT" ]; } && NO_ARCHIVE=1
 if [ "$DOCTOR" != 1 ]; then
   if [ -z "$domain" ]; then err "No target domain provided."; usage; exit 1; fi
-  if ! printf '%s' "$domain" | grep -qE '^[a-z0-9.-]+\.[a-z]{2,}$'; then
-    err "That doesn't look like a bare domain (got: '$1' -> '$domain'). Use e.g. example.com"; exit 1
+  if [ "$SINGLE" = 1 ]; then
+    if ! printf '%s' "$domain" | grep -qE '^[a-z0-9._-]+$'; then
+      err "Invalid host (got: '$1' -> '$domain'). Single-host mode accepts e.g. localhost, 127.0.0.1, host:3000"; exit 1
+    fi
+    [ "$ASSUME_YES" = 1 ] || log "Parsed target: $SEED_URL  (single-host mode: no subdomain enumeration)"
+  else
+    if ! printf '%s' "$domain" | grep -qE '^[a-z0-9.-]+\.[a-z]{2,}$'; then
+      err "That doesn't look like a bare domain (got: '$1' -> '$domain'). Use e.g. example.com, or -s for a single host/localhost/IP:port"; exit 1
+    fi
+    [ "$ASSUME_YES" = 1 ] || log "Parsed target: $domain"
   fi
-  [ "$ASSUME_YES" = 1 ] || log "Parsed target: $domain"
 fi
 
 # Build auth header list + per-tool network (auth+proxy) argument arrays, cascaded to
@@ -347,7 +379,9 @@ CURL_NET=("${_hdr[@]}");   [ -n "$PROXY" ] && CURL_NET+=(-x "$PROXY")
 # ---------------------------------------------------------------------------
 have() { command -v "$1" >/dev/null 2>&1; }
 missing=()
-for tool in subfinder httpx nuclei; do have "$tool" || missing+=("$tool"); done
+for tool in httpx nuclei; do have "$tool" || missing+=("$tool"); done
+# subfinder is only needed to enumerate subdomains; single-host mode doesn't use it.
+[ "$SINGLE" = 1 ] || have subfinder || missing+=("subfinder")
 if [ "${#missing[@]}" -gt 0 ] && [ "$DOCTOR" != 1 ]; then
   err "Missing required tools: ${missing[*]} (see projectdiscovery.io)"; exit 1
 fi
@@ -1361,7 +1395,12 @@ oast_start
 done_marker() { [ "$RESUME" = 1 ] && [ -f "$OUTDIR/.done_$1" ]; }
 
 # Step 1: Subdomains
-if done_marker subs && [ -s "$subdomains_file" ]; then
+if [ "$SINGLE" = 1 ]; then
+  # Single-host mode: no enumeration - the one host is the whole scope.
+  printf '%s\n' "$domain" > "$subdomains_file"
+  touch "$OUTDIR/.done_subs"
+  set_stage $S_SUBS done "single host (subdomain enum skipped)"
+elif done_marker subs && [ -s "$subdomains_file" ]; then
   set_stage $S_SUBS done "$(wc -l <"$subdomains_file") subs (resumed)"
 else
   run_stage $S_SUBS "$subdomains_file" " subs" subfinder -silent -d "$domain" -o "$subdomains_file"
@@ -1395,7 +1434,7 @@ sub_count=$(wc -l < "$subdomains_file" 2>/dev/null || echo 0)
 if [ "$sub_count" -eq 0 ]; then
   set_stage $S_SUBS warn "none found"; [ "$TUI" = 1 ] || warn "No subdomains; stopping."; exit 0
 fi
-set_stage $S_SUBS done "$sub_count subs$(done_marker subs && echo ' (resumed)')"
+[ "$SINGLE" = 1 ] || set_stage $S_SUBS done "$sub_count subs$(done_marker subs && echo ' (resumed)')"
 
 # Step 2: Live hosts + tech detection
 if done_marker httpx && [ -s "$httpx_json" ]; then
@@ -1404,7 +1443,11 @@ else
   # Optional: resolve + drop wildcard DNS with dnsx (removes bogus subdomains that
   # all resolve to a catch-all record - a huge source of wasted work on big targets).
   probe_input="$subdomains_file"
-  if [ "$USE_DNSX" = 1 ] && have dnsx; then
+  if [ "$SINGLE" = 1 ]; then
+    # Probe EXACTLY the given scheme://host:port (httpx takes full URLs in its -l list), so a
+    # custom port like :3000 and the chosen scheme are honored; no DNS resolution needed.
+    printf '%s\n' "$SEED_URL" > "$OUTDIR/.seed_url.txt"; probe_input="$OUTDIR/.seed_url.txt"
+  elif [ "$USE_DNSX" = 1 ] && have dnsx; then
     resolved_file="$OUTDIR/resolved.txt"
     set_stage $S_LIVE running "resolving (dnsx, wildcard filter)"
     dnsx -silent -l "$subdomains_file" -wd "$domain" -o "$resolved_file" 2>>"$llm_log" || true
@@ -1439,7 +1482,7 @@ fi
 # an open zone transfer (AXFR) dumps the whole internal DNS map. Uses whatever resolver CLI
 # is installed (dig > dnsx > host); skipped silently if none can answer.
 : > "$dns_hygiene_file"
-if [ "$DNS_HYGIENE" = 1 ] && { have dig || have dnsx || have host; }; then
+if [ "$DNS_HYGIENE" = 1 ] && [ "$NO_ARCHIVE" != 1 ] && { have dig || have dnsx || have host; }; then
   set_stage $S_LIVE running "$alive_count live · DNS/email hygiene"
   _txt() { if have dig; then dig +short TXT "$1" 2>/dev/null | tr -d '"'
            elif have dnsx; then printf '%s\n' "$1" | dnsx -silent -txt -resp-only 2>/dev/null | tr -d '"'
@@ -2178,9 +2221,9 @@ else
   # (A) Broad / passive URL collection - WAF-safe. Run ALL available sources and UNION them
   # (waymore adds commoncrawl+alienvault+urlscan, but gau/waybackurls often surface URLs it
   # misses) - more coverage, deduped later anyway.
-  have gau         && { printf '%s\n' "$domain" | tmo "$GAU_MAX_TIME" gau --subs 2>>"$llm_log" >> "$urls_file" || true; }
-  have waybackurls && { printf '%s\n' "$domain" | tmo "$GAU_MAX_TIME" waybackurls 2>>"$llm_log" >> "$urls_file" || true; }
-  if [ "$USE_WAYMORE" = 1 ] && have waymore; then
+  [ "$NO_ARCHIVE" != 1 ] && have gau         && { printf '%s\n' "$domain" | tmo "$GAU_MAX_TIME" gau --subs 2>>"$llm_log" >> "$urls_file" || true; }
+  [ "$NO_ARCHIVE" != 1 ] && have waybackurls && { printf '%s\n' "$domain" | tmo "$GAU_MAX_TIME" waybackurls 2>>"$llm_log" >> "$urls_file" || true; }
+  if [ "$NO_ARCHIVE" != 1 ] && [ "$USE_WAYMORE" = 1 ] && have waymore; then
     set_stage $S_CRAWL running "waymore: aggregating more sources"
     tmo "$((GAU_MAX_TIME*2))" waymore -i "$domain" -mode U -oU "$OUTDIR/.waymore.txt" >/dev/null 2>>"$llm_log" || true
     [ -f "$OUTDIR/.waymore.txt" ] && cat "$OUTDIR/.waymore.txt" >> "$urls_file"; rm -f "$OUTDIR/.waymore.txt"
