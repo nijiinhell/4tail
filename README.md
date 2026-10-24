@@ -253,6 +253,49 @@ AUTH_COOKIE="session=abc; csrf=xyz" ./4tail.sh -C example.com
 
 `-H`/`AUTH_HEADER` (newline-separated for several), `AUTH_COOKIE`, and `-x`/`PROXY`.
 
+**One session covers both roles.** If you give the dual-identity IDOR an `AUTH_A` session but
+no general scan header, 4tail now reuses identity A as the scan auth too — so a single
+`AUTH_A="Cookie: …"` runs the whole crawl/fuzz/nuclei/agent pass **authenticated** *and* the
+A/B/anon authz diff, instead of crawling anonymously and only diffing afterward.
+
+### Source maps (`.js.map`) → original source
+
+For every first-party JS file, 4tail tries the `<file>.map` convention and the
+`//# sourceMappingURL=` directive. A served source map reconstructs the **original,
+pre-minification source** — so 4tail dumps the real files (skipping `node_modules`/vendor),
+mines them for **secrets** (trufflehog-verified, regex fallback) and **endpoints** (absolute
+same-origin URLs + relative API paths), folds those endpoints into the crawl pool, and records
+a `source-map` finding. The single highest-signal JS exposure on webpack/SPA builds. Toggle
+`SOURCEMAPS=0`; caps `SOURCEMAP_MAX` (files probed) / `SOURCEMAP_SRC_MAX` (sources per map).
+
+### Manual PoCs for body-based bugs (`-C`)
+
+4tail only ever *fires* GET requests, so POST-driven classes (auth/logic on login+register,
+body IDOR/SQLi, mass assignment, GraphQL mutations, CSRF) can't be actively tested. Instead it
+**harvests the real form fields** from auth/state-changing pages, then the AI writes a runnable
+`poc_requests.sh` of curl PoCs — each with a `# WHAT:` and `# CONFIRM:` line, same-origin,
+non-destructive, your session as `$SESSION`. **4tail never runs these** — you review and run
+them. They're also embedded in the report under *Manual PoC commands*. Toggle `POC_GEN=0`.
+
+### DNS / email hygiene + security headers (cheap, submittable lows)
+
+Two deterministic passes over the live surface:
+- **DNS/email** (`DNS_HYGIENE=1`, uses `dig`→`host`→`dnsx`): missing/weak **SPF** and **DMARC**
+  (`p=none`/`+all`) = email spoofing; an open **zone transfer (AXFR)** dumps the whole DNS zone
+  (flagged HIGH).
+- **Security headers** (`SEC_HEADERS=1`, capped by `SEC_HEADERS_MAX`): **clickjacking**
+  (no `X-Frame-Options`/`frame-ancestors`), missing **HSTS**/**CSP**, and weak cookie flags
+  (`Secure`/`HttpOnly`/`SameSite`).
+
+Both feed the report (*Infra & hardening*) and `findings.json`.
+
+### Known-CVE exposure
+
+4tail extracts **product:version** pairs from httpx tech-detect and `Server`/web-server banners
+(IIS 8.5, Apache 2.4.49, PHP 7.2, jQuery 1.7…) into `versioned_components.txt` and hands them to
+triage with an explicit instruction to map each to **specific public CVEs** (id + impact +
+likelihood), rather than guessing — turning a detected version into a concrete CVE lead.
+
 ### Structured output (JSON + SARIF)
 
 Every run writes `findings.json` — a normalized, deduped list of all findings (nuclei,

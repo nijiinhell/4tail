@@ -92,6 +92,9 @@ DAST_MAX_URLS="${DAST_MAX_URLS:-1500}"   # cap URLs sent to DAST
 USE_WAYMORE="${USE_WAYMORE:-1}"           # waymore (more sources) instead of gau+waybackurls
 PREFER_X8="${PREFER_X8:-1}"               # x8 (faster/accurate) instead of arjun for param discovery
 TRUFFLEHOG_JS="${TRUFFLEHOG_JS:-1}"       # trufflehog --only-verified on saved JS instead of brittle regex
+SOURCEMAPS="${SOURCEMAPS:-1}"             # 1 = recover .js.map source maps -> reconstruct original source for secrets + endpoints
+SOURCEMAP_MAX="${SOURCEMAP_MAX:-40}"      # cap JS files probed for a source map
+SOURCEMAP_SRC_MAX="${SOURCEMAP_SRC_MAX:-200}"  # cap reconstructed source files per map (skip giant vendor bundles)
 USE_KITERUNNER="${USE_KITERUNNER:-1}"     # kiterunner (kr) API-route discovery when installed
 FUZZ_ENGINE="${FUZZ_ENGINE:-ffuf}"        # 'ffuf' (default, tech-aware) or 'feroxbuster' (Rust+recursion)
 FEROX_DEPTH="${FEROX_DEPTH:-2}"           # feroxbuster recursion depth (bounded - recursion can balloon)
@@ -105,6 +108,9 @@ PERMUTE_MIN_SUBS="${PERMUTE_MIN_SUBS:-25}" # skip permutation unless at least th
 PERMUTE_MAX="${PERMUTE_MAX:-2000}"        # hard cap on generated permutations to resolve
 CORS_SCAN="${CORS_SCAN:-1}"              # Corsy CORS-misconfig pass on live hosts
 CORS_MAX="${CORS_MAX:-50}"               # cap hosts sent to Corsy
+DNS_HYGIENE="${DNS_HYGIENE:-1}"          # SPF/DMARC (email spoofing) + zone-transfer (AXFR) check on the apex
+SEC_HEADERS="${SEC_HEADERS:-1}"          # clickjacking / HSTS / CSP / cookie-flag checks on live hosts
+SEC_HEADERS_MAX="${SEC_HEADERS_MAX:-25}" # cap hosts checked for security headers
 VERIFY="${VERIFY:-1}"                     # re-test each CONFIRMED finding (anti-false-positive) before reporting
 DIFF_STATE="${DIFF_STATE:-1}"            # remember each target's surface and show what changed since last run
 STATE_DIR="${STATE_DIR:-$HOME/.4tail/state}"  # where per-target snapshots live
@@ -144,6 +150,12 @@ AUTH_A="${AUTH_A:-}"
 AUTH_B="${AUTH_B:-}"
 IDOR="${IDOR:-1}"                          # 1 = run the A/B/anon access-control diff when AUTH_A is set
 IDOR_MAX="${IDOR_MAX:-40}"                 # cap id-bearing URLs tested
+# PoC generation for body-based bug classes 4tail cannot safely fire itself (POST login/
+# register logic, body IDOR/SQLi, mass assignment, GraphQL mutations, CSRF). 4tail harvests
+# real form fields deterministically, then the AI writes runnable curl PoCs for the HUMAN to
+# review and run - 4tail never fires them, so the GET-only active invariant holds.
+POC_GEN="${POC_GEN:-1}"
+POC_FORM_HOSTS="${POC_FORM_HOSTS:-12}"     # cap pages scraped for <form> fields
 
 # --- Authentication + proxy (cascade to all active tools) -------------------
 AUTH_HEADER="${AUTH_HEADER:-}"            # one or more "Header: value" (newline-separated); also -H
@@ -289,6 +301,7 @@ domain="${1:-}"
 # Normalize: strip scheme, any path/port, whitespace, and lowercase - so a pasted URL
 # or stray character can't turn into a different/invalid target.
 domain="$(printf '%s' "$domain" | tr -d '[:space:]' | sed -E 's#^[a-zA-Z]+://##; s#[/:].*$##' | tr 'A-Z' 'a-z')"
+esc_domain="$(printf '%s' "$domain" | sed 's/\./\\./g')"   # regex-safe domain, defined once for all scope filters
 if [ "$DOCTOR" != 1 ]; then
   if [ -z "$domain" ]; then err "No target domain provided."; usage; exit 1; fi
   if ! printf '%s' "$domain" | grep -qE '^[a-z0-9.-]+\.[a-z]{2,}$'; then
@@ -299,6 +312,13 @@ fi
 
 # Build auth header list + per-tool network (auth+proxy) argument arrays, cascaded to
 # every active tool so scans can reach the logged-in surface and route through a proxy.
+# If the dual-identity IDOR already handed us a session (AUTH_A) but no general scan-auth
+# header was given, reuse identity A as the scan auth - so "hand it one session" means the
+# whole crawl/fuzz/nuclei/agent pass runs authenticated, not just the A/B/anon IDOR diff.
+if [ -z "$AUTH_HEADER" ] && [ -z "$AUTH_COOKIE" ] && [ -n "$AUTH_A" ]; then
+  AUTH_HEADER="$AUTH_A"
+  [ "$ASSUME_YES" != 1 ] && log "Auth: reusing IDOR identity A as the authenticated scan session"
+fi
 AUTH_H=()
 [ -n "$AUTH_COOKIE" ] && AUTH_H+=("Cookie: $AUTH_COOKIE")
 if [ -n "$AUTH_HEADER" ]; then
@@ -389,6 +409,8 @@ if [ "$DOCTOR" != 1 ]; then
   api_specs_file="$OUTDIR/api_specs.txt"           # discovered Swagger/OpenAPI/GraphQL spec URLs
   api_tests_file="$OUTDIR/api_tests.txt"           # AI-generated API test URLs (folded into active set)
   gql_schema_file="$OUTDIR/graphql_schema.txt"     # dumped GraphQL schema when introspection is open
+  sourcemap_file="$OUTDIR/sourcemaps.txt"          # recovered .js.map URLs (source leak)
+  smap_endpoints_file="$OUTDIR/sourcemap_endpoints.txt"  # endpoints reconstructed from source maps (folded into urls)
   stale_file="$OUTDIR/stale.tsv"                   # per-host legacy score: score<TAB>url<TAB>evidence
   oast_dir="$OUTDIR/oast"; mkdir -p "$oast_dir"    # interactsh output + injection map
   oast_log="$oast_dir/interactions.jsonl"          # raw interactsh interactions
@@ -404,6 +426,11 @@ if [ "$DOCTOR" != 1 ]; then
   verified_file="$OUTDIR/verified.txt"             # findings that survived the verification re-test
   diff_file="$OUTDIR/changes.txt"                  # what changed since the last run of this target
   findings_dir="$OUTDIR/findings"; mkdir -p "$findings_dir"  # per-specialist output
+  forms_file="$OUTDIR/forms.txt"                   # harvested POST/GET form fields (for PoC accuracy)
+  poc_file="$OUTDIR/poc_requests.sh"               # AI-written MANUAL curl PoCs (4tail never runs these)
+  dns_hygiene_file="$OUTDIR/dns_hygiene.txt"       # SPF/DMARC/zone-transfer findings
+  sec_headers_file="$OUTDIR/security_headers.txt"  # clickjacking / HSTS / CSP / cookie-flag findings
+  versions_file="$OUTDIR/versioned_components.txt" # product:version pairs for CVE matching
   cost_ledger="${LLM_COST_LEDGER:-$OUTDIR/.llm_cost_usd}"
   [ -f "$cost_ledger" ] || printf '0\n' > "$cost_ledger"
 fi
@@ -1214,6 +1241,7 @@ run_doctor() {
   have x8        && dr_pass "x8 found (fast param discovery; preferred over arjun)" || dr_warn "x8 missing (cargo install x8) - falls back to arjun"
   have kr        && dr_pass "kiterunner (kr) found (API route discovery)" || dr_warn "kiterunner missing (github.com/assetnote/kiterunner) - API route prediction skipped"
   have feroxbuster && dr_pass "feroxbuster found (set FUZZ_ENGINE=feroxbuster to use it)" || dr_warn "feroxbuster missing - using ffuf (default)"
+  { have dig || have host || have dnsx; } && dr_pass "DNS resolver found ($(have dig && echo dig || { have host && echo host || echo dnsx; })) - SPF/DMARC + zone-transfer checks on" || dr_warn "no dig/host/dnsx - DNS/email hygiene check skipped"
 
   dr_head "Agent optional tools"
   have crlfuzz    || dr_warn "crlfuzz missing - CRLF/header injection (go install github.com/dwisiswant0/crlfuzz/cmd/crlfuzz@latest)"
@@ -1379,6 +1407,63 @@ if [ "$USE_CDNCHECK" = 1 ] && have cdncheck && [ "${alive_count:-0}" -ge "$CDNCH
   cloud_hosts="$(grep -iE '\[cloud\]' "$OUTDIR/.cdncheck.txt" 2>/dev/null | awk '{print $1}' | sort -u | head -20)"
   rm -f "$OUTDIR/.cdncheck.txt"
 fi
+
+# DNS / email hygiene (cheap, high-signal recon): missing/weak SPF+DMARC = email spoofing;
+# an open zone transfer (AXFR) dumps the whole internal DNS map. Uses whatever resolver CLI
+# is installed (dig > dnsx > host); skipped silently if none can answer.
+: > "$dns_hygiene_file"
+if [ "$DNS_HYGIENE" = 1 ] && { have dig || have dnsx || have host; }; then
+  set_stage $S_LIVE running "$alive_count live · DNS/email hygiene"
+  _txt() { if have dig; then dig +short TXT "$1" 2>/dev/null | tr -d '"'
+           elif have dnsx; then printf '%s\n' "$1" | dnsx -silent -txt -resp-only 2>/dev/null | tr -d '"'
+           elif have host; then host -t TXT "$1" 2>/dev/null | sed -E 's/.*descriptive text //; s/"//g'; fi; }
+  _ns()  { if have dig; then dig +short NS "$1" 2>/dev/null
+           elif have dnsx; then printf '%s\n' "$1" | dnsx -silent -ns -resp-only 2>/dev/null
+           elif have host; then host -t NS "$1" 2>/dev/null | awk '/name server/{print $NF}'; fi; }
+  spf="$(_txt "$domain" | grep -i 'v=spf1' | head -1)"
+  if [ -z "$spf" ]; then echo "[email-spoofing] no SPF record on $domain - sender spoofing possible" >> "$dns_hygiene_file"
+  else case "$spf" in *'+all'*|*'?all'*) echo "[email-spoofing] weak SPF ('$(printf '%s' "$spf" | grep -oiE '[+?]all')') on $domain" >> "$dns_hygiene_file" ;; esac; fi
+  dmarc="$(_txt "_dmarc.$domain" | grep -i 'v=DMARC1' | head -1)"
+  if [ -z "$dmarc" ]; then echo "[email-spoofing] no DMARC record on $domain - spoofed mail not rejected" >> "$dns_hygiene_file"
+  else case "$dmarc" in *'p=none'*) echo "[email-spoofing] DMARC p=none on $domain (monitor-only, does not block spoofing)" >> "$dns_hygiene_file" ;; esac; fi
+  if have dig || have host; then
+    _ns "$domain" | sed 's/\.$//' | sort -u | head -4 | while IFS= read -r ns; do
+      [ -n "$ns" ] || continue
+      if have dig; then axfr="$(tmo 12 dig +short axfr "$domain" "@$ns" 2>/dev/null | head -c 2000)"
+      else axfr="$(tmo 12 host -l "$domain" "$ns" 2>/dev/null | grep -iv 'Transfer failed\|not found\|no servers' | head -c 2000)"; fi
+      [ -n "$axfr" ] && printf '%s\n' "$axfr" | grep -qiE '(IN[[:space:]]+(A|CNAME|MX|NS)|has address|name server)' \
+        && echo "[zone-transfer] AXFR allowed from $ns for $domain - full DNS zone disclosed (HIGH)" >> "$dns_hygiene_file"
+    done
+  fi
+fi
+
+# Security headers / clickjacking / cookie flags (deterministic, submittable lows). One GET
+# per host (capped); read the response headers and flag what's missing or weak.
+: > "$sec_headers_file"
+if [ "$SEC_HEADERS" = 1 ]; then
+  set_stage $S_LIVE running "$alive_count live · security headers"
+  sort -u "$alive_file" 2>/dev/null | head -n "$SEC_HEADERS_MAX" | while IFS= read -r u; do
+    [ -n "$u" ] || continue
+    hdrs="$(curl -s -D - -o /dev/null -L --max-time 8 ${CURL_NET[@]+"${CURL_NET[@]}"} "$u" 2>/dev/null | tr -d '\r')"
+    [ -n "$hdrs" ] || continue
+    lc="$(printf '%s' "$hdrs" | tr 'A-Z' 'a-z')"
+    miss=""
+    printf '%s' "$lc" | grep -q 'x-frame-options' || printf '%s' "$lc" | grep -q 'frame-ancestors' || miss="$miss clickjacking(no-XFO/frame-ancestors)"
+    printf '%s' "$lc" | grep -q 'content-security-policy' || miss="$miss no-CSP"
+    case "$u" in https://*) printf '%s' "$lc" | grep -q 'strict-transport-security' || miss="$miss no-HSTS" ;; esac
+    # cookie flags: inspect each Set-Cookie
+    printf '%s' "$hdrs" | grep -iE '^set-cookie:' | while IFS= read -r ck; do
+      cl="$(printf '%s' "$ck" | tr 'A-Z' 'a-z')"; cn="$(printf '%s' "$ck" | sed -E 's/^[Ss]et-[Cc]ookie:[[:space:]]*([^=]+)=.*/\1/')"
+      cf=""
+      case "$u" in https://*) printf '%s' "$cl" | grep -q 'secure' || cf="$cf Secure" ;; esac
+      printf '%s' "$cl" | grep -q 'httponly' || cf="$cf HttpOnly"
+      printf '%s' "$cl" | grep -q 'samesite' || cf="$cf SameSite"
+      [ -n "$cf" ] && echo "[cookie] $u cookie '$cn' missing:$cf" >> "$sec_headers_file"
+    done
+    [ -n "$miss" ] && echo "[headers] $u missing:$miss" >> "$sec_headers_file"
+  done
+fi
+
 set_stage $S_LIVE done "$alive_count live$(done_marker httpx && echo ' (resumed)')"
 
 # Aggregated, cost-frugal brief for the AI
@@ -1387,6 +1472,13 @@ set_stage $S_LIVE done "$alive_count live$(done_marker httpx && echo ' (resumed)
   jq -r '(.tech // [])[]' "$httpx_json" 2>/dev/null | sort | uniq -c | sort -rn | head -40
   echo "== web servers (count) =="
   jq -r '.webserver // empty' "$httpx_json" 2>/dev/null | sort | uniq -c | sort -rn | head -15
+  # Versioned components -> match to known CVEs. A product string carrying a version number
+  # (IIS 8.5, Apache 2.4.49, PHP 7.2, jQuery 1.7...) is the strongest CVE signal we have.
+  jq -r '((.tech // [])[], (.webserver // empty))' "$httpx_json" 2>/dev/null \
+    | grep -oiE '[a-z][a-z0-9 ._/+-]*[ :/-][0-9]+(\.[0-9]+){0,3}' \
+    | sed -E 's/^[ :/-]+//; s/[ :/-]+$//; s#[ :/]+# #g' \
+    | sort -u | head -40 > "$versions_file" 2>/dev/null || true
+  [ -s "$versions_file" ] && { echo "== versioned components (match to known CVEs) =="; cat "$versions_file"; }
   echo "== status codes (count) =="
   jq -r '.status_code // empty' "$httpx_json" 2>/dev/null | sort | uniq -c | sort -rn
   echo "== notable hosts =="
@@ -1916,6 +2008,70 @@ else
       | jq -r '[(.SourceMetadata.Data.Filesystem.file // "js"), (.DetectorName // "secret"), (.Raw // "")] | @tsv' 2>/dev/null \
       | sed -E 's#'"$js_dir"'/##' >> "$js_secrets_file" || true
   fi
+  # 2.5) Source maps: a .js.map reconstructs the ORIGINAL (pre-minify) source - full
+  #      endpoints, internal API shapes, and the secrets minification hides. Highest-signal
+  #      JS find on SPAs/webpack builds, and purely a GET fetch of a file the build shipped.
+  : > "$sourcemap_file"; : > "$smap_endpoints_file"
+  if [ "$SOURCEMAPS" = 1 ] && have jq && [ -s "$js_urls_file" ]; then
+    smap_dir="$OUTDIR/sourcemaps_src"; rm -rf "$smap_dir"; mkdir -p "$smap_dir"
+    smi=0; smaps=0
+    while read -r j; do
+      [ -z "$j" ] && continue
+      smi=$((smi+1)); [ "$smi" -gt "$SOURCEMAP_MAX" ] && break
+      ST_DETAIL[$S_JS]="source maps $smi: $(nlines "$sourcemap_file") recovered"; render
+      # candidate map URL: the convention <file>.map, else the //# sourceMappingURL directive.
+      mapurl="$j.map"
+      mbody="$(curl -s -L --max-time 12 ${CURL_NET[@]+"${CURL_NET[@]}"} "$mapurl" 2>/dev/null | head -c 8000000)"
+      if ! printf '%s' "$mbody" | jq -e '.sourcesContent | length > 0' >/dev/null 2>&1; then
+        ref="$(curl -s -L --max-time 12 ${CURL_NET[@]+"${CURL_NET[@]}"} "$j" 2>/dev/null \
+                | grep -aoiE 'sourceMappingURL=[^ "'"'"'*]+' | tail -1 | sed 's/^sourceMappingURL=//')"
+        case "$ref" in
+          "" ) continue ;;
+          data:* ) continue ;;                              # inline map, not a separate leak
+          http* ) mapurl="$ref" ;;
+          /* ) mapurl="$(printf '%s' "$j" | sed -E 's#(https?://[^/]+).*#\1#')$ref" ;;
+          * ) mapurl="${j%/*}/$ref" ;;
+        esac
+        mbody="$(curl -s -L --max-time 12 ${CURL_NET[@]+"${CURL_NET[@]}"} "$mapurl" 2>/dev/null | head -c 8000000)"
+        printf '%s' "$mbody" | jq -e '.sourcesContent | length > 0' >/dev/null 2>&1 || continue
+      fi
+      printf '%s\n' "$mapurl" >> "$sourcemap_file"; smaps=$((smaps+1))
+      origin="$(printf '%s' "$j" | sed -E 's#(https?://[^/]+).*#\1#')"
+      mtmp="$(mktemp)"; printf '%s' "$mbody" > "$mtmp"
+      mapglob="$smap_dir/${smaps}_"                   # this map's reconstructed files share this prefix
+      scount="$(jq '.sources | length' "$mtmp" 2>/dev/null || echo 0)"
+      [ "$scount" -gt "$SOURCEMAP_SRC_MAX" ] 2>/dev/null && scount="$SOURCEMAP_SRC_MAX"
+      si=0
+      while [ "$si" -lt "$scount" ]; do
+        name="$(jq -r ".sources[$si] // empty" "$mtmp" 2>/dev/null)"
+        jq -e ".sourcesContent[$si] != null" "$mtmp" >/dev/null 2>&1 || { si=$((si+1)); continue; }
+        case "$name" in *node_modules*|*webpack/bootstrap*|*/vendor*) si=$((si+1)); continue ;; esac   # skip library code we can't fix
+        safe="$(printf '%s_%s' "$smaps" "$name" | tr -c 'A-Za-z0-9._-' '_' | tail -c 140)"
+        jq -r ".sourcesContent[$si]" "$mtmp" > "$smap_dir/$safe" 2>/dev/null
+        si=$((si+1))
+      done
+      rm -f "$mtmp"
+      # endpoints out of THIS map's source (origin is correct per map) -> crawl URL pool
+      {
+        grep -rhaoiE "https?://([a-z0-9._-]+\.)?${esc_domain}[a-z0-9._/?=&%-]*" "$mapglob"* 2>/dev/null
+        grep -rhaoE '["'"'"'`](/[a-zA-Z0-9_./?=&%-]{2,})["'"'"'`]' "$mapglob"* 2>/dev/null \
+          | sed -E 's#^.(/[^"'"'"'`]*).$#\1#' | sed "s#^#${origin}#"
+      } 2>/dev/null >> "$smap_endpoints_file" || true
+    done < "$js_urls_file"
+    if [ "$smaps" -gt 0 ] && [ -n "$(ls -A "$smap_dir" 2>/dev/null)" ]; then
+      # secrets out of the reconstructed source (trufflehog verified, else regex fallback)
+      if [ "$TRUFFLEHOG_JS" = 1 ] && have trufflehog; then
+        tmo 180 trufflehog --no-update filesystem "$smap_dir" --only-verified --json 2>/dev/null \
+          | jq -r '[("sourcemap:"+(.SourceMetadata.Data.Filesystem.file // "src")), (.DetectorName // "secret"), (.Raw // "")] | @tsv' 2>/dev/null \
+          | sed -E 's#'"$smap_dir"'/##' >> "$js_secrets_file" || true
+      else
+        grep -rhaoE "$SECRET_RE" "$smap_dir" 2>/dev/null | sort -u | sed 's#^#sourcemap-src\t#' >> "$js_secrets_file" || true
+      fi
+      sort -u -o "$smap_endpoints_file" "$smap_endpoints_file"
+    fi
+    sort -u -o "$js_secrets_file" "$js_secrets_file"
+    [ "$smaps" -gt 0 ] && set_stage $S_JS running "source maps: $smaps recovered, $(nlines "$smap_endpoints_file") endpoints"
+  fi
   sort -u -o "$js_secrets_file" "$js_secrets_file"
   # 3) param discovery (arjun if available) - arjun is slow, so background each host
   #    and keep the dashboard ticking instead of freezing.
@@ -2002,6 +2158,8 @@ else
     wait "$kpid" 2>/dev/null || true
     [ -f "$OUTDIR/.katana.txt" ] && cat "$OUTDIR/.katana.txt" >> "$urls_file" && rm -f "$OUTDIR/.katana.txt"
   fi
+  # fold in endpoints reconstructed from source maps (scoped + deduped by the filter below)
+  [ -s "${smap_endpoints_file:-/dev/null}" ] && cat "$smap_endpoints_file" >> "$urls_file"
   grep -iE "^https?://([a-z0-9._-]+\.)?${esc_domain}([:/]|$)" "$urls_file" 2>/dev/null \
     | sort -u | head -n "$CRAWL_MAX_URLS" > "$urls_file.tmp" && mv "$urls_file.tmp" "$urls_file"
   # Only URLs with a real ?k=v, and NOT static assets - so clustering, AI selection and
@@ -2409,6 +2567,7 @@ else
       [ -s "$dast_file" ] && { echo "CONFIRMED DAST (nuclei):"; head -20 "$dast_file"; }
       [ -s "$nuclei_file" ] && { echo "CONFIRMED NUCLEI (cves/exposures/misconfig/tech):"; head -20 "$nuclei_file"; }
       [ -s "$js_secrets_file" ] && { echo "JS SECRET CANDIDATES (url<TAB>match):"; head -15 "$js_secrets_file"; }
+      [ -s "${sourcemap_file:-/dev/null}" ] && { echo "SOURCE MAPS RECOVERED (.js.map -> original source leaked; reconstructed source mined for secrets/endpoints above):"; head -10 "$sourcemap_file"; }
       [ -s "${api_specs_file:-/dev/null}" ] && { echo "EXPOSED API SPECS (fetch + inspect):"; head -10 "$api_specs_file"; }
       [ -s "${gql_schema_file:-/dev/null}" ] && { echo "GRAPHQL INTROSPECTION OPEN (full schema readable - map authz/IDOR per field):"; head -60 "$gql_schema_file"; }
       [ -s "${bypass_file:-/dev/null}" ] && { echo "ACCESS-CONTROL BYPASSES (403->200):"; head -10 "$bypass_file"; }
@@ -2525,7 +2684,7 @@ if [ "$VERIFY" = 1 ]; then set_stage $S_TRIAGE running "verifying findings"; ver
   echo "- **Target:** \`$domain\`"
   echo "- **Generated:** $(date -u '+%Y-%m-%d %H:%M UTC')"
   echo "- **Subdomains:** $sub_count | **Live:** $alive_count | **Nuclei findings:** $find_count | **Fuzz hits:** $(fuzz_distinct "$fuzz_findings_file") distinct (${fuzz_hits:-0} raw)"
-  [ "$JSMINE" = 1 ] && echo "- **JS mined:** $(nlines "$js_urls_file") files, $(nlines "$js_secrets_file") secret hits, $(nlines "$params_file") params"
+  [ "$JSMINE" = 1 ] && echo "- **JS mined:** $(nlines "$js_urls_file") files, $(nlines "$js_secrets_file") secret hits, $(nlines "$params_file") params, $(nlines "${sourcemap_file:-/dev/null}") source maps recovered"
   if [ "$CRAWL" = 1 ]; then
     echo "- **Active funnel (${BLUEPRINT_NAME:-defaults}):** $(nlines "$urls_file") urls → $(nlines "$url_patterns_file") patterns → **$(nlines "$targets_active_file") juicy**"
     echo "  - specialists → DAST:$(nlines "$dast_file") · dalfox:$(nlines "$findings_dir/dalfox.txt") · kxss:$(nlines "$findings_dir/kxss.txt") · sqlmap:$(nlines "$findings_dir/sqlmap.txt")"
@@ -2582,6 +2741,72 @@ if [ "$VERIFY" = 1 ]; then set_stage $S_TRIAGE running "verifying findings"; ver
   fi
 } > "$report_file"
 
+# Step 5.9: PoC generation for BODY-BASED bug classes (manual, never fired by 4tail).
+# 4tail is GET-only when it fires requests; POST-driven bugs (auth/logic on login+register,
+# body IDOR/SQLi, mass assignment, GraphQL mutations, CSRF) are detected but not exercised.
+# Here we harvest the real form fields deterministically, then have the AI write ready-to-run
+# curl PoCs for the HUMAN - keeping the firing invariant while closing the coverage gap.
+: > "$forms_file"; : > "$poc_file"
+if [ "$CRAWL" = 1 ] && [ "$POC_GEN" = 1 ] && [ "$AI_ENABLED" = 1 ] && budget_ok; then
+  set_stage $S_TRIAGE running "harvesting forms for PoCs"
+  # (a) deterministic form harvest from auth / state-changing pages
+  form_cand="$( { sort -u "$alive_file" 2>/dev/null; cat "$targets_active_file" 2>/dev/null; } \
+                 | grep -iE 'login|signin|sign-in|register|signup|sign-up|reset|password|forgot|account|profile|checkout|cart|upload|contact|comment|graphql' \
+                 | sort -u | head -n "$POC_FORM_HOSTS" )"
+  [ -n "$form_cand" ] || form_cand="$(sort -u "$alive_file" 2>/dev/null | head -n 3)"   # fall back to roots
+  while IFS= read -r pg; do
+    [ -n "$pg" ] || continue
+    html="$(curl -s -L --max-time 12 ${CURL_NET[@]+"${CURL_NET[@]}"} "$pg" 2>/dev/null | tr '\n' ' ' | head -c 200000)"
+    [ -n "$html" ] || continue
+    # Split into per-<form> chunks (awk RS on the opening tag) so multiple forms stay distinct;
+    # for each, pull method, action and the field names. grep ERE has no lazy match, hence awk.
+    printf '%s' "$html" | awk 'BEGIN{IGNORECASE=1; RS="<form"} NR>1{ e=index(tolower($0),"</form>"); print (e>0?substr($0,1,e):$0) }' 2>/dev/null \
+      | while IFS= read -r frm; do
+          [ -n "$frm" ] || continue
+          m="$(printf '%s' "$frm" | grep -oiE 'method=["'"'"']?[a-z]+' | head -1 | grep -oiE '[a-z]+$' | tr 'a-z' 'A-Z')"; [ -n "$m" ] || m=GET
+          a="$(printf '%s' "$frm" | grep -oiE 'action=["'"'"'][^"'"'"']*' | head -1 | sed -E 's/^action=["'"'"']//')"; [ -n "$a" ] || a="$pg"
+          names="$(printf '%s' "$frm" | grep -oiE 'name=["'"'"'][^"'"'"']+' | sed -E 's/^name=["'"'"']//' | sort -u | paste -sd, -)"
+          [ -n "$names" ] && printf '%s\t%s\t%s\t%s\n' "$pg" "$m" "$a" "$names" >> "$forms_file"
+        done
+  done <<< "$form_cand"
+  # (b) AI writes the PoCs from the harvested forms + the injectable/authz signals we already have
+  set_stage $S_TRIAGE running "AI writing manual PoCs"
+  poc_sys='You are a bug-bounty exploitation assistant on an AUTHORIZED engagement. Write a runnable bash script of curl PoCs for the BODY-BASED / state-changing bug classes a GET-only scanner cannot fire: POST auth & logic flaws (login, register, password-reset), body-based IDOR and SQLi, mass assignment (extra JSON fields like "role":"admin","isAdmin":true), GraphQL mutations, and CSRF (missing anti-CSRF token). Rules: one PoC per block; above each, a "# WHAT:" line (bug class + why this endpoint) and a "# CONFIRM:" line (the exact response signal that proves it). Use the real form fields and parameters given. Same-origin only. NON-DESTRUCTIVE: no DELETE/DROP/mass writes - use benign markers (e.g. value "4tailPoC"), id=1/id=2 for IDOR, a single quote for SQLi. Reference the session as the shell var $SESSION in a -H header so the human pastes their cookie/token. Output ONLY the bash script body (no markdown fences, no prose outside comments). If the data shows no plausible body-based test, output just: # no body-based PoC candidates from the collected data'
+  poc_out="$(mktemp)"
+  ai_call "$LLM_MODEL_TRIAGE" "${LLM_MAX_TOKENS_TRIAGE:-8000}" "$poc_sys" "Target: $domain
+
+=== harvested forms (page <TAB> method <TAB> action <TAB> field names) ===
+$(head -c 6000 "$forms_file")
+
+=== gf injection/authz candidate URLs (class <TAB> url) ===
+$(grep -iE '^(sqli|idor|redirect|ssrf|ssti|lfi)\b' "$gf_file" 2>/dev/null | head -n 60 | head -c 6000)
+
+=== discovered parameters (url <TAB> param) ===
+$(head -c 3000 "$params_file" 2>/dev/null)
+
+=== GraphQL schema (if introspection was open - write mutation PoCs) ===
+$(head -c 6000 "${gql_schema_file:-/dev/null}" 2>/dev/null)
+
+=== agent-confirmed / verified issues (anchor PoCs to these first) ===
+$(head -c 3000 "$agent_file" 2>/dev/null)
+$(head -c 2000 "${verified_file:-/dev/null}" 2>/dev/null)" >"$poc_out" 2>>"$llm_log" || true
+  if [ -s "$poc_out" ] && ! grep -q 'no body-based PoC candidates' "$poc_out"; then
+    {
+      echo "#!/usr/bin/env bash"
+      echo "# 4tail MANUAL PoCs for $domain - generated $(date -u +%FT%TZ)"
+      echo "# 4tail did NOT run these (it only fires GET). REVIEW every command, then set your"
+      echo "# session and run the ones you want:   export SESSION='Cookie: session=...'"
+      echo "# Authorized testing only."
+      echo "set -u"
+      echo
+      sed -E '/^```/d' "$poc_out"
+    } > "$poc_file"
+    chmod +x "$poc_file" 2>/dev/null || true
+  fi
+  rm -f "$poc_out"
+  [ -s "$poc_file" ] && set_stage $S_TRIAGE running "PoCs written ($(nlines "$forms_file") forms)" || set_stage $S_TRIAGE running "no body-based PoCs"
+fi
+
 # Step 6: AI triage  (analyses nuclei + content-discovery + JS + crawl/DAST)
 have_extra=0; { [ -s "$js_secrets_file" ] || [ -s "$params_file" ] || [ -s "$fuzz_findings_file" ] || [ -s "$dast_file" ] || [ -s "$gf_file" ] || [ -s "$findings_dir/dalfox.txt" ] || [ -s "$findings_dir/sqlmap.txt" ] || [ -s "$agent_file" ] || [ -s "${bypass_file:-/dev/null}" ] || [ -s "${idor_file:-/dev/null}" ] || [ -s "${corsy_file:-/dev/null}" ] || [ -s "${verified_file:-/dev/null}" ]; } && have_extra=1
 if [ "$AI_ENABLED" = "1" ] && { [ "$find_count" -gt 0 ] || [ "$have_extra" = 1 ]; } && ! budget_ok; then
@@ -2610,6 +2835,11 @@ and a concrete safe test),
 positive, impact, safe verification - flag private keys / cloud creds as critical),
 "## Interesting parameters to test" (map discovered params to bug classes: IDOR, SSRF,
 LFI, SQLi, open-redirect - concrete test idea each),
+"## Known-CVE exposure" (for each VERSIONED COMPONENT provided, name the specific public
+CVEs you are confident affect that exact product+version - CVE id, one-line impact, and
+whether it is likely exploitable here; say "no high-confidence CVE" rather than guessing),
+"## Infra & hardening" (assess the DNS/EMAIL HYGIENE and SECURITY-HEADER findings: SPF/DMARC
+spoofing, zone transfer, clickjacking, missing HSTS/CSP, weak cookie flags - impact + fix),
 "## Attack surface notes" and "## Recommended manual follow-ups".
 Use ONLY the provided data - do not invent findings.
 Output ONLY the final report starting exactly with the line "## Executive summary".
@@ -2657,7 +2887,16 @@ $(head -c 2000 "${idor_file:-/dev/null}" 2>/dev/null)
 $(head -c 2000 "${verified_file:-/dev/null}" 2>/dev/null)
 
 === CORS misconfiguration (Corsy) ===
-$(head -c 1500 "${corsy_file:-/dev/null}" 2>/dev/null)" "$triage_out"
+$(head -c 1500 "${corsy_file:-/dev/null}" 2>/dev/null)
+
+=== versioned components (map each to specific known CVEs) ===
+$(head -c 2000 "${versions_file:-/dev/null}" 2>/dev/null)
+
+=== DNS / email hygiene (SPF/DMARC spoofing, zone transfer) ===
+$(head -c 1500 "${dns_hygiene_file:-/dev/null}" 2>/dev/null)
+
+=== security headers / clickjacking / cookie flags ===
+$(head -c 3000 "${sec_headers_file:-/dev/null}" 2>/dev/null)" "$triage_out"
   if [ -s "$triage_out" ]; then
     # Drop any leading reasoning: keep from the LAST "## Executive summary" to the end
     # (reasoning models may restate the section names earlier while thinking).
@@ -2678,6 +2917,24 @@ else
     if [ -s "$params_file" ]; then echo; echo "## Discovered parameters"; echo '```'; cat "$params_file"; echo '```'; fi
   } >> "$report_file"
   set_stage $S_TRIAGE skip "$([ "$AI_ENABLED" = 1 ] && echo "nothing to triage" || echo "AI off")"
+fi
+
+# Manual-PoC section: point the human at the runnable body-based PoCs 4tail generated but
+# did not fire. Kept as its own report section + standalone script artifact.
+if [ -s "${poc_file:-/dev/null}" ]; then
+  {
+    echo
+    echo "## Manual PoC commands (body-based — 4tail did NOT run these)"
+    echo
+    echo "POST auth/logic, body IDOR/SQLi, mass assignment, GraphQL mutations and CSRF are"
+    echo "outside 4tail's GET-only firing. The script below was written from the harvested"
+    echo "form fields and injectable signals — **review each command, set \`\$SESSION\`, then"
+    echo "run only what you intend**. Saved as \`$(basename "$poc_file")\`."
+    echo
+    echo '```bash'
+    cat "$poc_file"
+    echo '```'
+  } >> "$report_file"
 fi
 
 # OOB: correlate any interactsh callbacks to the URLs we injected, then stop the listener.
@@ -2707,6 +2964,13 @@ if have jq; then
     [ -f "$findings_dir/dalfox.txt" ] && while IFS= read -r l; do [ -n "$l" ] && emit_f xss high dalfox "$(nurl "$l")" "$l"; done < "$findings_dir/dalfox.txt"
     [ -f "$findings_dir/sqlmap.txt" ] && while IFS= read -r l; do [ -n "$l" ] && emit_f sqli high sqlmap "" "$l"; done < "$findings_dir/sqlmap.txt"
     [ -f "$js_secrets_file" ] && while IFS=$'\t' read -r u m; do [ -n "$m" ] && emit_f secret medium js-mining "$u" "$m"; done < "$js_secrets_file"
+    [ -f "${sourcemap_file:-}" ] && while IFS= read -r l; do [ -n "$l" ] && emit_f source-map medium js-mining "$l" "source map exposed - original source reconstructed from $l"; done < "$sourcemap_file"
+    [ -f "${dns_hygiene_file:-}" ] && while IFS= read -r l; do [ -n "$l" ] || continue
+        case "$l" in *zone-transfer*) _s=high ;; *) _s=low ;; esac
+        emit_f "$(printf '%s' "$l" | grep -oE '^\[[a-z-]+\]' | tr -d '[]')" "$_s" dns-hygiene "$domain" "$l"; done < "$dns_hygiene_file"
+    [ -f "${sec_headers_file:-}" ] && while IFS= read -r l; do [ -n "$l" ] || continue
+        _u="$(printf '%s' "$l" | grep -oE 'https?://[^ ]+' | head -1)"
+        emit_f "$(printf '%s' "$l" | grep -oE '^\[[a-z-]+\]' | tr -d '[]')" low security-headers "${_u:-$domain}" "$l"; done < "$sec_headers_file"
     [ -f "$findings_dir/kxss.txt" ] && while IFS= read -r l; do [ -n "$l" ] && emit_f reflected-param low kxss "$(nurl "$l")" "$l"; done < "$findings_dir/kxss.txt"
     [ -f "${api_specs_file:-}" ] && while IFS= read -r l; do [ -n "$l" ] && emit_f api-spec info api-discovery "$l" "exposed API spec: $l"; done < "$api_specs_file"
     [ -f "${gql_schema_file:-}" ] && grep '^== GraphQL introspection OPEN: ' "$gql_schema_file" 2>/dev/null \
@@ -2752,6 +3016,10 @@ if [ "$CRAWL" = 1 ]; then
 fi
 [ "$OAST" = 1 ] && tally="$tally  $(cov oast interactsh-client 1 "$(nlines "${oast_hits_file:-/dev/null}")")"
 [ "$AGENT" = 1 ] && tally="$tally  agent:$(nlines "${agent_file:-/dev/null}")"
+[ "$DNS_HYGIENE" = 1 ] && tally="$tally  dns-hygiene:$(nlines "${dns_hygiene_file:-/dev/null}")"
+[ "$SEC_HEADERS" = 1 ] && tally="$tally  sec-headers:$(nlines "${sec_headers_file:-/dev/null}")"
+[ -s "${sourcemap_file:-/dev/null}" ] && tally="$tally  sourcemaps:$(nlines "$sourcemap_file")"
+[ -s "${poc_file:-/dev/null}" ] && tally="$tally  pocs:yes"
 tally="$tally  verified:$(nlines "${verified_file:-/dev/null}")"
 if [ "$TUI" = 1 ]; then
   tui_end    # leave alt screen, reprint final panel into normal scrollback
@@ -2759,11 +3027,13 @@ if [ "$TUI" = 1 ]; then
     "$c_green" "$((SECONDS-started))" "$c_reset" "$spend_note" \
     "$c_dim" "$tally" "$c_reset" "$c_cyan" "$report_file" "$c_reset"
   [ -f "$findings_json" ] && printf '   %sJSON   → %s%s%s\n' "$c_dim" "$c_cyan" "$findings_json" "$c_reset"
+  [ -s "${poc_file:-/dev/null}" ] && printf '   %sPoCs   → %s%s%s %s(manual, review before running)%s\n' "$c_dim" "$c_cyan" "$poc_file" "$c_reset" "$c_dim" "$c_reset"
   [ "$DIFF_STATE" = 1 ] && printf '   %schanges since last run: %s new items%s%s\n' "$c_dim" "${diff_new:-0}" "$([ "${diff_new:-0}" -gt 0 ] 2>/dev/null && echo "  → $diff_file")" "$c_reset"
 else
   ok "Done in $((SECONDS-started))s.$spend_note"
   ok "$tally"
   ok "Report: $report_file"
   [ -f "$findings_json" ] && ok "JSON:   $findings_json$([ "$EMIT_SARIF" = 1 ] && echo "  (+ findings.sarif)")"
+  [ -s "${poc_file:-/dev/null}" ] && ok "PoCs:   $poc_file  (manual, review before running)"
   [ "$DIFF_STATE" = 1 ] && ok "Changes since last run: ${diff_new:-0} new items$([ "${diff_new:-0}" -gt 0 ] 2>/dev/null && echo " ($diff_file)")"
 fi
