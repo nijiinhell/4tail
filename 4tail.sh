@@ -2305,7 +2305,13 @@ error sample: $(grep -iv '^{' "$nuclei_stats_file" | grep -iE 'error|timeout|ref
     [ -s "$sup_out" ] && { SUP_NOTE="$(grep -v '^[[:space:]]*$' "$sup_out" | tail -1 | head -c 400)"; printf '[%s] %s\n' "$(date +%H:%M:%S)" "$SUP_NOTE" >>"$supervisor_log"; }
     rm -f "$sup_out"
   fi
-  [ "$nrc" = 124 ] && SUP_NOTE="nuclei hit the ${NUCLEI_MAX_TIME}s time cap - partial results kept"
+  # Replace the mid-scan supervisor note so the finished dashboard never shows a
+  # stale "X% … ETA …" line (it was captured early and would otherwise linger).
+  if [ "$nrc" = 124 ]; then
+    SUP_NOTE="nuclei hit the ${NUCLEI_MAX_TIME}s time cap - partial results kept"
+  else
+    SUP_NOTE="nuclei finished: $(wc -l <"$nuclei_file" 2>/dev/null || echo 0) findings in $((SECONDS-ns))s"
+  fi
   render
   touch "$OUTDIR/.done_nuclei"
 fi
