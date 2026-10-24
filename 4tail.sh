@@ -1195,14 +1195,19 @@ run_doctor() {
   { have git-dumper || have gitdumper; } || dr_warn "git-dumper missing - dump exposed /.git source (pipx install git-dumper)"
   have trufflehog || dr_warn "trufflehog missing - verified secret scanning of dumped source (brew/apt/go install trufflehog)"
 
-  dr_head "Wordlists"
+  dr_head "Wordlists (per-host lists are chosen at runtime from the detected tech)"
   if [ -n "$SECLISTS_DIR" ]; then
     dr_pass "SecLists: $SECLISTS_DIR"
+    # how many content-discovery lists the dynamic matcher can actually draw from:
+    local _idx; _idx="$(find "$SECLISTS_DIR/Discovery/Web-Content" -maxdepth 4 -type f \( -iname '*.txt' -o -iname '*.fuzz.txt' \) 2>/dev/null \
+      | grep -viE 'raft-|big\.txt|directory-list|combined_|dirbuster|/all\.txt|/common\.txt' | wc -l | tr -d ' ')"
+    dr_pass "  dynamic index: ~${_idx:-?} tech lists matchable by detected stack (CMS/*, api/*, *.fuzz.txt, jenkins/grafana/weblogic/...)"
     local rel
     for rel in Discovery/Web-Content/common.txt Discovery/Web-Content/CMS/wordpress.fuzz.txt \
                Discovery/Web-Content/api/api-endpoints.txt Discovery/Web-Content/JavaServlets-Common.fuzz.txt; do
-      if [ -f "$SECLISTS_DIR/$rel" ]; then dr_pass "  $rel"; else dr_warn "  missing: $rel"; fi
+      if [ -f "$SECLISTS_DIR/$rel" ]; then dr_pass "  sample present: $rel"; else dr_warn "  sample missing: $rel"; fi
     done
+    dr_pass "  (actual per-host selection is logged to fuzz_plan.txt each run)"
   else
     dr_warn "SecLists not found (apt install seclists, or set SECLISTS_DIR)"
   fi
