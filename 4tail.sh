@@ -1340,13 +1340,12 @@ alive_count=$(wc -l < "$alive_file" 2>/dev/null || echo 0)
 if [ "$alive_count" -eq 0 ]; then
   set_stage $S_LIVE warn "none live"; [ "$TUI" = 1 ] || warn "No live hosts; stopping."; exit 0
 fi
-set_stage $S_LIVE done "$alive_count live$(done_marker httpx && echo ' (resumed)')"
-
 # cdncheck: accurately classify CDN/WAF/cloud so we skip fuzzing edges and flag cloud
 # hosts (SSRF-to-metadata context) - more reliable than a static banner regex.
+# Runs BEFORE the stage is marked done, so the Live-hosts spinner can't get stuck.
 : > "$cdn_file"; cloud_hosts=""
 if [ "$USE_CDNCHECK" = 1 ] && have cdncheck && [ -s "$alive_file" ]; then
-  set_stage $S_LIVE running "cdncheck: CDN/cloud classification"
+  set_stage $S_LIVE running "$alive_count live · cdncheck classifying…"
   # classify ONLY the live hosts (a handful), by IP range - fast; hard 30s cap regardless.
   sed -E 's#^[a-z]+://##; s#[:/].*$##' "$alive_file" | sort -u | head -n 200 \
     | tmo 30 cdncheck -silent -resp -cdn -waf -cloud 2>/dev/null > "$OUTDIR/.cdncheck.txt" || true
@@ -1354,6 +1353,7 @@ if [ "$USE_CDNCHECK" = 1 ] && have cdncheck && [ -s "$alive_file" ]; then
   cloud_hosts="$(grep -iE '\[cloud\]' "$OUTDIR/.cdncheck.txt" 2>/dev/null | awk '{print $1}' | sort -u | head -20)"
   rm -f "$OUTDIR/.cdncheck.txt"
 fi
+set_stage $S_LIVE done "$alive_count live$(done_marker httpx && echo ' (resumed)')"
 
 # Aggregated, cost-frugal brief for the AI
 {
@@ -2170,8 +2170,12 @@ else
   # CORS misconfiguration (Corsy) on the live hosts + juicy URLs (bug class we don't cover elsewhere).
   if [ "$CORS_SCAN" = 1 ] && have corsy; then
     { sort -u "$alive_file" 2>/dev/null; head -n 30 "$targets_active_file" 2>/dev/null; } | sort -u | head -n "$CORS_MAX" > "$OUTDIR/.cors_in.txt"
+    # Strip Corsy's ANSI colors, drop its "No misconfigurations found" banner, and keep only
+    # lines that are an actual finding (carry a URL or a named misconfig class).
     [ -s "$OUTDIR/.cors_in.txt" ] && tmo 180 corsy -i "$OUTDIR/.cors_in.txt" 2>/dev/null \
-      | grep -iE 'vulnerab|misconfig|origin reflected|wildcard|null origin' > "$corsy_file" || true
+      | sed -E 's/\x1b\[[0-9;]*m//g' \
+      | grep -viE 'no misconfig|not vulnerable|^[[:space:]]*-?[[:space:]]*$' \
+      | grep -iE 'https?://|reflect|wildcard|null origin|arbitrary origin|credentials|trusted' > "$corsy_file" || true
     rm -f "$OUTDIR/.cors_in.txt"
   fi; render
 
