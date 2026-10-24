@@ -1072,7 +1072,21 @@ $(head -c 4000 "$tech_brief")" >"$out" 2>>"$llm_log" || true
 # kill background children (nuclei/ffuf/arjun/supervisor) so nothing lingers after
 # a Ctrl-C and pollutes a later resumed run's stats.
 kill_children() { local p; for p in $(jobs -p 2>/dev/null); do kill "$p" 2>/dev/null; pkill -P "$p" 2>/dev/null; done; }
-cleanup() { [ "$TUI" = 1 ] && printf '\033[?25h\033[?1049l'; }   # restore cursor + leave alt screen (abnormal exit)
+cleanup() {   # restore terminal, and if we died mid-run with the dashboard up, show WHY
+  local rc=$?
+  [ "$TUI" = 1 ] && printf '\033[?25h\033[?1049l'
+  if [ "${STAGES_BEGAN:-0}" = 1 ] && [ "${_FINISHED:-0}" != 1 ] && [ "$rc" -ne 0 ] && [ "$rc" -ne 130 ]; then
+    # Write to fd 3 (the real terminal) since fd 2 may be redirected to the log in TUI mode.
+    printf '\n\033[1;31m[!]\033[0m 4tail stopped early (exit %s) before finishing.\n' "$rc" >&3 2>/dev/null
+    if [ -s "${OUTDIR:-}/run_stderr.log" ]; then
+      printf '    last error output:\n' >&3 2>/dev/null
+      grep -viE 'nuclei\.txt: No such file' "${OUTDIR}/run_stderr.log" 2>/dev/null | tail -8 | sed 's/^/      /' >&3 2>/dev/null
+      printf '    (full log: %s/run_stderr.log)\n' "$OUTDIR" >&3 2>/dev/null
+    else
+      printf '    Re-run with -P (plain output, no dashboard) to see the error inline.\n' >&3 2>/dev/null
+    fi
+  fi
+}
 trap cleanup EXIT
 trap 'kill_children; oast_stop; cleanup; err "interrupted"; exit 130' INT TERM
 
@@ -1379,10 +1393,15 @@ if [ "$DOCTOR" = 1 ]; then run_doctor; exit $?; fi
 
 # Enter the alternate screen buffer (like htop/less): a dedicated viewport the panel
 # owns and redraws from home each frame, so nothing can scroll-duplicate or orphan it.
+exec 3>&2   # keep a handle to the real terminal stderr so cleanup() can report even after the redirect below
 if [ "$TUI" = 1 ]; then
   printf '\033[?1049h\033[?25l\033[2J\033[H'   # alt screen, hide cursor, clear, home
   render
+  # In TUI mode stderr would corrupt the dashboard, so send it to a log. This also means an
+  # abnormal exit (a crash hidden by the alt screen) can be surfaced by cleanup() below.
+  [ -n "${OUTDIR:-}" ] && exec 2>>"$OUTDIR/run_stderr.log"
 fi
+STAGES_BEGAN=1
 
 # Bring the OOB listener up now so it's live for the whole run (callbacks can land
 # at any point once we start injecting payloads in the active funnel).
@@ -3187,3 +3206,4 @@ else
   [ -n "$(ls -A "${agent_loot_dir:-/nonexistent}" 2>/dev/null)" ] && ok "Loot:   $agent_loot_dir/  (raw creds the agent read - kept local, never sent to the LLM)"
   [ "$DIFF_STATE" = 1 ] && ok "Changes since last run: ${diff_new:-0} new items$([ "${diff_new:-0}" -gt 0 ] 2>/dev/null && echo " ($diff_file)")"
 fi
+_FINISHED=1   # reached the end normally - the EXIT trap won't report a failure
