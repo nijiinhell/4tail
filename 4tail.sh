@@ -83,7 +83,7 @@ SINGLE="${SINGLE:-0}"                     # 1 = single-host mode (-s): no subdom
 # nuclei-dast/kxss/sqlmap) so caps and time are spent on real endpoints, not app.js?v=1.
 # Matched against the PATH only (query stripped first by drop_static), so a file-ish
 # VALUE like ?file=app.js is KEPT - that's an LFI lead, not a static asset.
-STATIC_URL_RE="${STATIC_URL_RE:-\.(js|css|png|jpe?g|gif|svg|ico|webp|avif|bmp|tiff?|woff2?|ttf|eot|otf|map|mp4|webm|mp3|ogg|wav|pdf|zip|t?gz|rar|7z|bz2|swf)$}"
+STATIC_URL_RE="${STATIC_URL_RE:-[.](js|css|png|jpe?g|gif|svg|ico|webp|avif|bmp|tiff?|woff2?|ttf|eot|otf|map|mp4|webm|mp3|ogg|wav|pdf|zip|t?gz|rar|7z|bz2|swf)$}"
 CRAWL_MAX_URLS="${CRAWL_MAX_URLS:-8000}" # cap collected URLs
 CRAWL_MAX_TIME="${CRAWL_MAX_TIME:-1200}" # hard cap on crawling (s); 0 = unlimited
 DAST="${DAST:-1}"                        # run nuclei -dast on selected URLs
@@ -2073,6 +2073,22 @@ else
         esac; done
   done >> "$js_urls_file"
   sort -u -o "$js_urls_file" "$js_urls_file"
+  # SPA fallback: if scraping + subjs/getJS came up nearly empty (some SPAs inject their
+  # scripts dynamically, so there's nothing to scrape), probe common entry-bundle names on
+  # each host root directly and keep the ones that are actually served as JS. This is what
+  # finds an Angular/Vue/React app's main/vendor/runtime/polyfills bundles reliably.
+  if [ "$(nlines "$js_urls_file")" -lt 3 ]; then
+    JS_COMMON="${JS_COMMON:-main.js vendor.js runtime.js polyfills.js app.js bundle.js index.js scripts.js common.js chunk-vendors.js app.bundle.js runtime-main.js}"
+    printf '%s\n' "$scan_targets" | head -n 10 | while read -r u; do
+      base="$(printf '%s' "$u" | sed -E 's#(https?://[^/]+).*#\1#')"
+      for b in $JS_COMMON; do
+        hdr="$(curl -s -D - -o /dev/null -L --max-time 8 ${CURL_NET[@]+"${CURL_NET[@]}"} "$base/$b" 2>/dev/null)"
+        printf '%s' "$hdr" | head -1 | grep -q ' 200' || continue
+        printf '%s' "$hdr" | grep -qiE 'content-type:[[:space:]]*(application|text)/(javascript|ecmascript|x-javascript)' && echo "$base/$b" >> "$js_urls_file"
+      done
+    done
+    sort -u -o "$js_urls_file" "$js_urls_file"
+  fi
   # Keep only FIRST-PARTY JS (hosted on the target's own domain). Third-party scripts
   # (google-analytics, gtag, cloudflare, jquery cdn...) carry public keys and produce
   # false positives that aren't the target's to fix. Override with JS_FIRST_PARTY=0.
