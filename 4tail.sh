@@ -98,6 +98,7 @@ FEROX_DEPTH="${FEROX_DEPTH:-2}"           # feroxbuster recursion depth (bounded
 # --- Extra recon/surface tools (all optional; skipped if not installed) ------
 USE_TLSX="${USE_TLSX:-1}"                 # harvest cert SAN hostnames (more in-scope subs)
 USE_CDNCHECK="${USE_CDNCHECK:-1}"         # accurate CDN/WAF/cloud classification of live hosts
+CDNCHECK_MIN_HOSTS="${CDNCHECK_MIN_HOSTS:-10}"  # only worth it on bigger scopes (it refreshes CDN ranges + resolves); the regex skip covers small ones
 USE_PERMUTE="${USE_PERMUTE:-1}"           # dnsgen/gotator permutation of known subs (ONLY on big scopes - see below)
 PERMUTE_MIN_SUBS="${PERMUTE_MIN_SUBS:-25}" # skip permutation unless at least this many real subs exist (it's a wildcard-scope tool; pointless on a handful of hosts)
 PERMUTE_MAX="${PERMUTE_MAX:-2000}"        # hard cap on generated permutations to resolve
@@ -1364,11 +1365,11 @@ fi
 # hosts (SSRF-to-metadata context) - more reliable than a static banner regex.
 # Runs BEFORE the stage is marked done, so the Live-hosts spinner can't get stuck.
 : > "$cdn_file"; cloud_hosts=""
-if [ "$USE_CDNCHECK" = 1 ] && have cdncheck && [ -s "$alive_file" ]; then
+if [ "$USE_CDNCHECK" = 1 ] && have cdncheck && [ "${alive_count:-0}" -ge "$CDNCHECK_MIN_HOSTS" ] 2>/dev/null; then
   set_stage $S_LIVE running "$alive_count live · cdncheck classifying…"
-  # classify ONLY the live hosts (a handful), by IP range - fast; hard 30s cap regardless.
+  # classify the live hosts by IP range; hard 20s cap (first run refreshes CDN ranges).
   sed -E 's#^[a-z]+://##; s#[:/].*$##' "$alive_file" | sort -u | head -n 200 \
-    | tmo 30 cdncheck -silent -resp -cdn -waf -cloud 2>/dev/null > "$OUTDIR/.cdncheck.txt" || true
+    | tmo 20 cdncheck -silent -resp -cdn -waf -cloud 2>/dev/null > "$OUTDIR/.cdncheck.txt" || true
   grep -iE '\[(cdn|waf)\]' "$OUTDIR/.cdncheck.txt" 2>/dev/null | awk '{print $1}' | sort -u > "$cdn_file" || true
   cloud_hosts="$(grep -iE '\[cloud\]' "$OUTDIR/.cdncheck.txt" 2>/dev/null | awk '{print $1}' | sort -u | head -20)"
   rm -f "$OUTDIR/.cdncheck.txt"
