@@ -87,6 +87,14 @@ CRAWL_MAX_TIME="${CRAWL_MAX_TIME:-1200}" # hard cap on crawling (s); 0 = unlimit
 DAST="${DAST:-1}"                        # run nuclei -dast on selected URLs
 DAST_MAX_URLS="${DAST_MAX_URLS:-1500}"   # cap URLs sent to DAST
 
+# --- Preferred faster tools (used when installed; else the classic falls back) ---
+USE_WAYMORE="${USE_WAYMORE:-1}"           # waymore (more sources) instead of gau+waybackurls
+PREFER_X8="${PREFER_X8:-1}"               # x8 (faster/accurate) instead of arjun for param discovery
+TRUFFLEHOG_JS="${TRUFFLEHOG_JS:-1}"       # trufflehog --only-verified on saved JS instead of brittle regex
+USE_KITERUNNER="${USE_KITERUNNER:-1}"     # kiterunner (kr) API-route discovery when installed
+FUZZ_ENGINE="${FUZZ_ENGINE:-ffuf}"        # 'ffuf' (default, tech-aware) or 'feroxbuster' (Rust+recursion)
+FEROX_DEPTH="${FEROX_DEPTH:-2}"           # feroxbuster recursion depth (bounded - recursion can balloon)
+
 # --- Extra recon/surface tools (all optional; skipped if not installed) ------
 USE_TLSX="${USE_TLSX:-1}"                 # harvest cert SAN hostnames (more in-scope subs)
 USE_CDNCHECK="${USE_CDNCHECK:-1}"         # accurate CDN/WAF/cloud classification of live hosts
@@ -1176,6 +1184,10 @@ run_doctor() {
   have qsreplace && dr_pass "qsreplace found (value-dedup)" || dr_warn "qsreplace missing (go install github.com/tomnomnom/qsreplace@latest)"
   have unfurl    && dr_pass "unfurl found (url parsing)" || dr_warn "unfurl missing (go install github.com/tomnomnom/unfurl@latest)"
   have corsy     && dr_pass "corsy found (CORS misconfig)" || dr_warn "corsy missing (pipx install corsy)"
+  have waymore   && dr_pass "waymore found (multi-source URLs; preferred over gau+wayback)" || dr_warn "waymore missing (pipx install waymore) - falls back to gau+waybackurls"
+  have x8        && dr_pass "x8 found (fast param discovery; preferred over arjun)" || dr_warn "x8 missing (cargo install x8) - falls back to arjun"
+  have kr        && dr_pass "kiterunner (kr) found (API route discovery)" || dr_warn "kiterunner missing (github.com/assetnote/kiterunner) - API route prediction skipped"
+  have feroxbuster && dr_pass "feroxbuster found (set FUZZ_ENGINE=feroxbuster to use it)" || dr_warn "feroxbuster missing - using ffuf (default)"
 
   dr_head "Agent optional tools"
   have crlfuzz    || dr_warn "crlfuzz missing - CRLF/header injection (go install github.com/dwisiswant0/crlfuzz/cmd/crlfuzz@latest)"
@@ -1752,14 +1764,31 @@ else
     printf '%s\t%s\t(%s words) exts:[%s]\n' "$url" "$names" "$(wc -l < "$combined")" "$ext_flag" >> "$fuzz_plan_file"
     # -ac auto-calibration filters soft-404 / catch-all responses (huge quality boost:
     # without it a host that answers 200 to everything floods the results with junk).
-    ffuf_args=(-u "$url/FUZZ" -w "$combined" -ac -mc 200,204,301,302,307,401,403,405,500
-               -of json -o "$fuzz_dir/${safe}.json" -s)
-    [ "${#FFUF_NET[@]}" -gt 0 ] && ffuf_args+=("${FFUF_NET[@]}")
-    [ -n "$ext_flag" ] && ffuf_args+=(-e "$ext_flag")
-    [ "$FFUF_RATE" -gt 0 ] 2>/dev/null && ffuf_args+=(-rate "$FFUF_RATE")
-    [ "$FUZZ_MAX_TIME" -gt 0 ] 2>/dev/null && ffuf_args+=(-maxtime "$FUZZ_MAX_TIME")  # stop a slow host after N s
     [ "$TUI" = 1 ] || log "Fuzzing $fuzzed/$cap: $url"
-    ffuf "${ffuf_args[@]}" >/dev/null 2>>"$llm_log" & JOB[$!]="$safe"
+    if [ "$FUZZ_ENGINE" = feroxbuster ] && have feroxbuster; then
+      # feroxbuster (Rust, recursive) - bounded depth + time so recursion can't balloon.
+      # Convert its JSONL to the ffuf-shaped {results:[{status,length,url}]} the aggregator reads.
+      fx_ext="$(printf '%s' "$ext_flag" | tr -d '.')"   # feroxbuster wants exts without dots
+      fcmd=(feroxbuster -u "$url" -w "$combined" -q --json --no-state -d "$FEROX_DEPTH"
+            -s 200,204,301,302,307,401,403,405,500 -o "$fuzz_dir/.fx_${safe}.jsonl")
+      [ -n "$fx_ext" ] && fcmd+=(-x "$fx_ext")
+      [ -n "$AUTH_HEADER" ] && while IFS= read -r _hl; do [ -n "$_hl" ] && fcmd+=(-H "$_hl"); done <<< "$AUTH_HEADER"
+      [ -n "$AUTH_COOKIE" ] && fcmd+=(-b "$AUTH_COOKIE")
+      [ -n "$PROXY" ] && fcmd+=(-p "$PROXY")
+      [ "$FUZZ_MAX_TIME" -gt 0 ] 2>/dev/null && fcmd+=(--time-limit "${FUZZ_MAX_TIME}s")
+      ( "${fcmd[@]}" >/dev/null 2>>"$llm_log"
+        jq -s '{results:[.[]?|select(.type=="response")|{status:.status,length:.content_length,url:.url}]}' \
+           "$fuzz_dir/.fx_${safe}.jsonl" 2>/dev/null > "$fuzz_dir/${safe}.json" || echo '{"results":[]}' > "$fuzz_dir/${safe}.json"
+        rm -f "$fuzz_dir/.fx_${safe}.jsonl" ) & JOB[$!]="$safe"
+    else
+      ffuf_args=(-u "$url/FUZZ" -w "$combined" -ac -mc 200,204,301,302,307,401,403,405,500
+                 -of json -o "$fuzz_dir/${safe}.json" -s)
+      [ "${#FFUF_NET[@]}" -gt 0 ] && ffuf_args+=("${FFUF_NET[@]}")
+      [ -n "$ext_flag" ] && ffuf_args+=(-e "$ext_flag")
+      [ "$FFUF_RATE" -gt 0 ] 2>/dev/null && ffuf_args+=(-rate "$FFUF_RATE")
+      [ "$FUZZ_MAX_TIME" -gt 0 ] 2>/dev/null && ffuf_args+=(-maxtime "$FUZZ_MAX_TIME")  # stop a slow host after N s
+      ffuf "${ffuf_args[@]}" >/dev/null 2>>"$llm_log" & JOB[$!]="$safe"
+    fi
     fuzz_status; render
     [ "$backoff" = 1 ] && sleep "$BACKOFF_SLEEP"
   done <<< "$hosts_tsv"
@@ -1823,20 +1852,35 @@ else
     mv "$js_urls_file.fp" "$js_urls_file"
   fi
   js_total="$(nlines "$js_urls_file")"
-  # 2) fetch each JS and scan for secrets
+  # 2) fetch each JS and scan for secrets. If trufflehog is present, save the JS and let it
+  #    do entropy + verification (far fewer false positives than regex); else regex fallback.
   : > "$js_secrets_file"; ji=0
+  js_dir=""; [ "$TRUFFLEHOG_JS" = 1 ] && have trufflehog && { js_dir="$OUTDIR/jsfiles"; mkdir -p "$js_dir"; }
   while read -r j; do
     [ -z "$j" ] && continue
     ji=$((ji + 1)); [ "$ji" -gt "$JS_MAX" ] && break
     ST_DETAIL[$S_JS]="scanning JS $ji/$js_total  hits:$(nlines "$js_secrets_file")"; render
-    curl -s -L --max-time 15 ${CURL_NET[@]+"${CURL_NET[@]}"} "$j" 2>/dev/null | grep -aoE "$SECRET_RE" 2>/dev/null \
-      | sort -u | sed "s#^#${j}\t#" >> "$js_secrets_file"
+    if [ -n "$js_dir" ]; then
+      curl -s -L --max-time 15 ${CURL_NET[@]+"${CURL_NET[@]}"} "$j" 2>/dev/null > "$js_dir/$(printf '%s' "$j" | tr -c 'A-Za-z0-9._-' '_' | tail -c 120).js"
+    else
+      curl -s -L --max-time 15 ${CURL_NET[@]+"${CURL_NET[@]}"} "$j" 2>/dev/null | grep -aoE "$SECRET_RE" 2>/dev/null \
+        | sort -u | sed "s#^#${j}\t#" >> "$js_secrets_file"
+    fi
   done < "$js_urls_file"
+  if [ -n "$js_dir" ] && [ -n "$(ls -A "$js_dir" 2>/dev/null)" ]; then
+    ST_DETAIL[$S_JS]="trufflehog verifying JS secrets"; render
+    tmo 180 trufflehog --no-update filesystem "$js_dir" --only-verified --json 2>/dev/null \
+      | jq -r '[(.SourceMetadata.Data.Filesystem.file // "js"), (.DetectorName // "secret"), (.Raw // "")] | @tsv' 2>/dev/null \
+      | sed -E 's#'"$js_dir"'/##' >> "$js_secrets_file" || true
+  fi
   sort -u -o "$js_secrets_file" "$js_secrets_file"
   # 3) param discovery (arjun if available) - arjun is slow, so background each host
   #    and keep the dashboard ticking instead of freezing.
   : > "$params_file"
-  if have arjun; then
+  # Param discovery: prefer x8 (Rust, faster/accurate) when installed, else arjun. Both
+  # emit one "host<TAB>param" line per finding so downstream (params folding) is unchanged.
+  pwl="${SECLISTS_DIR:+$SECLISTS_DIR/Discovery/Web-Content/burp-parameter-names.txt}"
+  if { { [ "$PREFER_X8" = 1 ] && have x8; } || have arjun; }; then
     PARAM_HOSTS="${PARAM_HOSTS:-20}"
     ptotal="$(printf '%s\n' "$scan_targets" | head -n "$PARAM_HOSTS" | grep -c .)"
     pi=0
@@ -1844,14 +1888,22 @@ else
       [ -z "$u" ] && continue
       pi=$((pi + 1)); [ "$pi" -gt "$PARAM_HOSTS" ] && break
       ptmp="$(mktemp)"
-      ( tmo "$ARJUN_MAX_TIME" arjun -u "$u" -q -oT "$ptmp" 2>/dev/null ) & apid=$!
+      if [ "$PREFER_X8" = 1 ] && have x8; then
+        ( tmo "$ARJUN_MAX_TIME" x8 -u "$u" ${pwl:+-w "$pwl"} -O "$ptmp" 2>/dev/null ) & apid=$!
+      else
+        ( tmo "$ARJUN_MAX_TIME" arjun -u "$u" -q -oT "$ptmp" 2>/dev/null ) & apid=$!
+      fi
       ps=$SECONDS
       while kill -0 "$apid" 2>/dev/null; do
         ST_DETAIL[$S_JS]="param discovery $pi/$ptotal  $((SECONDS-ps))s"
         [ "$TUI" = 1 ] && render; sleep 0.3
       done
       wait "$apid" 2>/dev/null || true
-      [ -s "$ptmp" ] && sed "s#^#${u}\t#" "$ptmp" >> "$params_file"
+      # normalise either tool's output to bare param names, prefix the host.
+      if [ -s "$ptmp" ]; then
+        grep -oiE '[a-z0-9_.\[\]-]{1,40}' "$ptmp" 2>/dev/null | awk 'length>=2 && !seen[$0]++' \
+          | sed "s#^#${u}\t#" >> "$params_file"
+      fi
       rm -f "$ptmp"
     done <<< "$(printf '%s\n' "$scan_targets" | head -n "$PARAM_HOSTS")"
   fi
@@ -1884,9 +1936,16 @@ else
   set_stage $S_CRAWL running "collecting URLs"
   esc_domain="$(printf '%s' "$domain" | sed 's/\./\\./g')"
   : > "$urls_file"
-  # (A) Broad / passive URL collection - run exhaustively, it's cheap and WAF-safe.
-  have gau         && { printf '%s\n' "$domain" | tmo "$GAU_MAX_TIME" gau --subs 2>>"$llm_log" >> "$urls_file" || true; }
-  have waybackurls && { printf '%s\n' "$domain" | tmo "$GAU_MAX_TIME" waybackurls 2>>"$llm_log" >> "$urls_file" || true; }
+  # (A) Broad / passive URL collection - WAF-safe. Prefer waymore (wayback + commoncrawl +
+  # alienvault + urlscan in one) when installed; else gau + waybackurls.
+  if [ "$USE_WAYMORE" = 1 ] && have waymore; then
+    set_stage $S_CRAWL running "waymore: aggregating historical URLs"
+    tmo "$((GAU_MAX_TIME*2))" waymore -i "$domain" -mode U -oU "$OUTDIR/.waymore.txt" >/dev/null 2>>"$llm_log" || true
+    [ -f "$OUTDIR/.waymore.txt" ] && cat "$OUTDIR/.waymore.txt" >> "$urls_file"; rm -f "$OUTDIR/.waymore.txt"
+  else
+    have gau         && { printf '%s\n' "$domain" | tmo "$GAU_MAX_TIME" gau --subs 2>>"$llm_log" >> "$urls_file" || true; }
+    have waybackurls && { printf '%s\n' "$domain" | tmo "$GAU_MAX_TIME" waybackurls 2>>"$llm_log" >> "$urls_file" || true; }
+  fi
   if have katana; then
     set_stage $S_CRAWL running "katana crawling…"
     kcmd=(katana -silent -list "$alive_file" -d 2 -jc -kf all -c 15 -o "$OUTDIR/.katana.txt")
@@ -1992,6 +2051,20 @@ else
       active_total="$(nlines "$targets_active_file")"
     fi
     set_stage $S_CRAWL running "api specs: $(nlines "$api_specs_file") found, $(nlines "$api_tests_file") tests built"
+  fi
+
+  # (C3) kiterunner: API-route discovery with API-specific wordlists + route prediction -
+  # finds /api/v1/users/{id}/roles style endpoints ffuf can't guess. Routes feed the active set.
+  if [ "$USE_KITERUNNER" = 1 ] && have kr; then
+    set_stage $S_CRAWL running "kiterunner: API route discovery"
+    kapi="${SECLISTS_DIR:+$SECLISTS_DIR/Discovery/Web-Content/api/api-endpoints.txt}"
+    if [ -n "$kapi" ] && [ -f "$kapi" ]; then
+      sort -u "$alive_file" 2>/dev/null | head -n 20 \
+        | tmo 300 kr scan - -w "$kapi" -q 2>/dev/null \
+        | grep -oE 'https?://[^ ]+' | grep -iE "^https?://([a-z0-9._-]+\.)?${esc_domain}([:/]|$)" \
+        | sort -u | head -n 200 >> "$targets_active_file" || true
+      sort -u -o "$targets_active_file" "$targets_active_file"
+    fi
   fi
 
   # (D) Hidden parameters -> real test URLs in the active set.

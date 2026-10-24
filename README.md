@@ -270,6 +270,22 @@ OAST_SERVER=oast.mine.net ./4tail.sh -C -O example.com   # self-hosted interacts
 Needs `interactsh-client` (ProjectDiscovery). It sends target-derived callbacks to the
 collaborator server, so keep it to authorized targets; off by default.
 
+### Faster tool swaps (used when installed, classic falls back)
+
+4tail auto-prefers the faster/better tool when it's on PATH, and falls back to the original
+otherwise — nothing to configure:
+
+| Prefer | over | why |
+|--------|------|-----|
+| `waymore` | gau + waybackurls | wayback **+** commoncrawl **+** alienvault **+** urlscan in one |
+| `x8` | arjun | Rust, faster + more accurate hidden-param discovery |
+| `trufflehog --only-verified` | regex secret-mining | entropy + verification = far fewer false positives (JS saved to disk, then scanned) |
+| `kr` (kiterunner) | — (additive) | API-route prediction: finds `/api/v1/users/{id}/roles` ffuf can't guess; routes join the active set |
+| `feroxbuster` | ffuf | Rust + recursion — **opt-in** via `FUZZ_ENGINE=feroxbuster` (recursion is bounded by `FEROX_DEPTH=2` + `FUZZ_MAX_TIME` so it can't balloon) |
+
+ffuf stays the **default** engine because its per-host tech-aware wordlists are a core feature;
+set `FUZZ_ENGINE=feroxbuster` if you want recursion/speed instead.
+
 ### Extra recon + verification (all optional, auto-skipped if the tool is absent)
 
 - **`tlsx`** — harvests in-scope hostnames from TLS cert SANs (more subdomains, passive).
