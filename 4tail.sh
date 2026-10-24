@@ -665,6 +665,26 @@ nlines() { [ -f "$1" ] && wc -l < "$1" 2>/dev/null | tr -d ' ' || echo 0; }
 # Run a command under a wall-clock cap (no-op if `timeout` is unavailable). Keeps any
 # single external tool from stalling the whole scan for hours.
 tmo() { local s="$1"; shift; if have timeout; then timeout "$s" "$@"; else "$@"; fi; }
+# Capability-aware counter: a 0 should mean "ran, found nothing", never silently hide
+# "tool not installed" or "phase off". Prints  name:N  |  name:off  |  name:n/a(no <bin>).
+cov() {  # name  bin(or "")  enabled(0/1)  count
+  local name="$1" bin="$2" en="$3" n="$4"
+  if [ "$en" != 1 ]; then printf '%s:off' "$name"
+  elif [ -n "$bin" ] && ! have "$bin"; then printf '%s:n/a(no %s)' "$name" "$bin"
+  else printf '%s:%s' "$name" "$n"; fi
+}
+# Distinct content-discovery hits (fingerprint-grouped), vs the raw line count.
+fuzz_distinct() { [ -f "$1" ] && awk -F'\t' 'NF>=2 && !s[$1"-"$2]++{c++} END{print c+0}' "$1" || echo 0; }
+# Severity for an agent-confirmed line: HIGH only for real secret/exec reads; public/known
+# files (robots/sitemap/about/favicon) are not high just because traversal reached them.
+agent_sev() {
+  local l; l="$(printf '%s' "$1" | tr 'A-Z' 'a-z')"
+  case "$l" in
+    *web.config*|*global.asa*|*machinekey*|*connectionstring*|*/.git*|*id_rsa*|*.env*|*win.ini*|*/etc/passwd*|*boot.ini*|*.sql*|*wp-config*|*application.properties*|*.pem*) printf 'high' ;;
+    *robots.txt*|*sitemap*|*about.htm*|*favicon*|*.css*|*.png*|*.jpg*|*.svg*|*humans.txt*) printf 'low' ;;
+    *) printf 'medium' ;;
+  esac
+}
 # Drop static-asset URLs (stdin->stdout), testing the extension on the PATH only so a
 # file-ish query value (?file=app.js) is kept. Used to clean input to the slow scanners.
 drop_static() { awk -v re="$STATIC_URL_RE" '{ p=tolower($0); sub(/[?#].*/,"",p); if (p !~ re) print }'; }
@@ -1941,15 +1961,15 @@ else
   set_stage $S_CRAWL running "collecting URLs"
   esc_domain="$(printf '%s' "$domain" | sed 's/\./\\./g')"
   : > "$urls_file"
-  # (A) Broad / passive URL collection - WAF-safe. Prefer waymore (wayback + commoncrawl +
-  # alienvault + urlscan in one) when installed; else gau + waybackurls.
+  # (A) Broad / passive URL collection - WAF-safe. Run ALL available sources and UNION them
+  # (waymore adds commoncrawl+alienvault+urlscan, but gau/waybackurls often surface URLs it
+  # misses) - more coverage, deduped later anyway.
+  have gau         && { printf '%s\n' "$domain" | tmo "$GAU_MAX_TIME" gau --subs 2>>"$llm_log" >> "$urls_file" || true; }
+  have waybackurls && { printf '%s\n' "$domain" | tmo "$GAU_MAX_TIME" waybackurls 2>>"$llm_log" >> "$urls_file" || true; }
   if [ "$USE_WAYMORE" = 1 ] && have waymore; then
-    set_stage $S_CRAWL running "waymore: aggregating historical URLs"
+    set_stage $S_CRAWL running "waymore: aggregating more sources"
     tmo "$((GAU_MAX_TIME*2))" waymore -i "$domain" -mode U -oU "$OUTDIR/.waymore.txt" >/dev/null 2>>"$llm_log" || true
     [ -f "$OUTDIR/.waymore.txt" ] && cat "$OUTDIR/.waymore.txt" >> "$urls_file"; rm -f "$OUTDIR/.waymore.txt"
-  else
-    have gau         && { printf '%s\n' "$domain" | tmo "$GAU_MAX_TIME" gau --subs 2>>"$llm_log" >> "$urls_file" || true; }
-    have waybackurls && { printf '%s\n' "$domain" | tmo "$GAU_MAX_TIME" waybackurls 2>>"$llm_log" >> "$urls_file" || true; }
   fi
   if have katana; then
     set_stage $S_CRAWL running "katana crawling…"
@@ -2427,7 +2447,7 @@ if [ "$VERIFY" = 1 ]; then set_stage $S_TRIAGE running "verifying findings"; ver
   echo "# 4tail recon report"; echo
   echo "- **Target:** \`$domain\`"
   echo "- **Generated:** $(date -u '+%Y-%m-%d %H:%M UTC')"
-  echo "- **Subdomains:** $sub_count | **Live:** $alive_count | **Nuclei findings:** $find_count | **Fuzz hits:** ${fuzz_hits:-0}"
+  echo "- **Subdomains:** $sub_count | **Live:** $alive_count | **Nuclei findings:** $find_count | **Fuzz hits:** $(fuzz_distinct "$fuzz_findings_file") distinct (${fuzz_hits:-0} raw)"
   [ "$JSMINE" = 1 ] && echo "- **JS mined:** $(nlines "$js_urls_file") files, $(nlines "$js_secrets_file") secret hits, $(nlines "$params_file") params"
   if [ "$CRAWL" = 1 ]; then
     echo "- **Active funnel (${BLUEPRINT_NAME:-defaults}):** $(nlines "$urls_file") urls → $(nlines "$url_patterns_file") patterns → **$(nlines "$targets_active_file") juicy**"
@@ -2613,7 +2633,7 @@ if have jq; then
     [ -f "$findings_dir/kxss.txt" ] && while IFS= read -r l; do [ -n "$l" ] && emit_f reflected-param low kxss "$(nurl "$l")" "$l"; done < "$findings_dir/kxss.txt"
     [ -f "${api_specs_file:-}" ] && while IFS= read -r l; do [ -n "$l" ] && emit_f api-spec info api-discovery "$l" "exposed API spec: $l"; done < "$api_specs_file"
     [ -f "${oast_hits_file:-}" ] && while IFS= read -r l; do [ -n "$l" ] && emit_f blind-ssrf-redirect high oast "$(nurl "$l")" "$l"; done < "$oast_hits_file"
-    [ -f "${agent_file:-}" ] && while IFS= read -r l; do [ -n "$l" ] && emit_f agent-confirmed high agent "$(nurl "$l")" "$l"; done < "$agent_file"
+    [ -f "${agent_file:-}" ] && while IFS= read -r l; do [ -n "$l" ] && emit_f agent-confirmed "$(agent_sev "$l")" agent "$(nurl "$l")" "$l"; done < "$agent_file"
     [ -f "${bypass_file:-}" ] && while IFS= read -r l; do [ -n "$l" ] && emit_f access-control-bypass high bypass "$(nurl "$l")" "$l"; done < "$bypass_file"
     [ -f "${idor_file:-}" ] && while IFS= read -r l; do [ -n "$l" ] && emit_f idor-authz high idor "$(nurl "$l")" "$l"; done < "$idor_file"
     [ -f "${prop_file:-}" ] && while IFS=$'\t' read -r c u; do [ -n "$u" ] && emit_f content-discovery info cross-host "$u" "status=$c (found on a sibling host)"; done < "$prop_file"
@@ -2638,7 +2658,21 @@ diff_new="$(grep -c . "$diff_file" 2>/dev/null || echo 0)"
 
 # Final summary
 spend_note=""; [ "$AI_ENABLED" = 1 ] && spend_note="  ·  AI spend ~$(cost_fmt)"
-tally="nuclei:$find_count  fuzz-hits:${fuzz_hits:-0}$([ "$JSMINE" = 1 ] && echo "  js-secrets:$(nlines "$js_secrets_file")  params:$(nlines "$params_file")")$([ "$CRAWL" = 1 ] && echo "  active:$(nlines "$targets_active_file")  api-specs:$(nlines "${api_specs_file:-/dev/null}")  dast:$(nlines "$dast_file")  dalfox:$(nlines "$findings_dir/dalfox.txt")  sqlmap:$(nlines "$findings_dir/sqlmap.txt")")$([ "$OAST" = 1 ] && echo "  oast-confirmed:$(nlines "${oast_hits_file:-/dev/null}")")$([ "$AGENT" = 1 ] && echo "  agent-confirmed:$(nlines "${agent_file:-/dev/null}")")$([ "$CRAWL" = 1 ] && echo "  bypass:$(nlines "${bypass_file:-/dev/null}")  idor:$(nlines "${idor_file:-/dev/null}")  cors:$(nlines "${corsy_file:-/dev/null}")")  verified:$(nlines "${verified_file:-/dev/null}")"
+# Capability-aware tally: every zero says whether the tool ran, is off, or isn't installed.
+_pt="$({ [ "$PREFER_X8" = 1 ] && have x8; } && echo x8 || echo arjun)"
+tally="$(cov nuclei nuclei 1 "$find_count")  fuzz:$(fuzz_distinct "$fuzz_findings_file")u/$(cov hits ffuf "$([ "$SKIP_FUZZ" != 1 ] && echo 1 || echo 0)" "${fuzz_hits:-0}" | sed 's/^hits://')"
+tally="$tally  $(cov js-secrets "" "$([ "$JSMINE" = 1 ] && echo 1 || echo 0)" "$(nlines "$js_secrets_file")")  $(cov params "$_pt" "$([ "$JSMINE" = 1 ] && echo 1 || echo 0)" "$(nlines "$params_file")")"
+if [ "$CRAWL" = 1 ]; then
+  tally="$tally  active:$(nlines "$targets_active_file")  api-specs:$(nlines "${api_specs_file:-/dev/null}")"
+  tally="$tally  $(cov dast nuclei "$(has_spec nuclei-dast && echo 1 || echo 0)" "$(nlines "$dast_file")")"
+  tally="$tally  $(cov dalfox dalfox "$(has_spec dalfox && echo 1 || echo 0)" "$(nlines "$findings_dir/dalfox.txt")")"
+  tally="$tally  $(cov kxss kxss "$(has_spec kxss && echo 1 || echo 0)" "$(nlines "$findings_dir/kxss.txt")")"
+  tally="$tally  $(cov sqlmap sqlmap "$({ has_spec sqlmap && [ "$SQLMAP_CONFIRM" = 1 ] && [ "${ACT_MAX_SQLMAP:-0}" -gt 0 ] 2>/dev/null; } && echo 1 || echo 0)" "$(nlines "$findings_dir/sqlmap.txt")")"
+  tally="$tally  bypass:$(nlines "${bypass_file:-/dev/null}")  $(cov idor "" "$([ -n "$AUTH_A" ] && echo 1 || echo 0)" "$(nlines "${idor_file:-/dev/null}")")  $(cov cors corsy "$([ "$CORS_SCAN" = 1 ] && echo 1 || echo 0)" "$(nlines "${corsy_file:-/dev/null}")")"
+fi
+[ "$OAST" = 1 ] && tally="$tally  $(cov oast interactsh-client 1 "$(nlines "${oast_hits_file:-/dev/null}")")"
+[ "$AGENT" = 1 ] && tally="$tally  agent:$(nlines "${agent_file:-/dev/null}")"
+tally="$tally  verified:$(nlines "${verified_file:-/dev/null}")"
 if [ "$TUI" = 1 ]; then
   tui_end    # leave alt screen, reprint final panel into normal scrollback
   printf '\n %s✔ done in %ss%s%s\n   %s%s%s\n   report → %s%s%s\n' \
