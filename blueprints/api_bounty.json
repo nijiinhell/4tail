@@ -3,7 +3,7 @@
   "description": "API-heavy target: emphasise IDOR/auth/SSRF/injection on parametered JSON endpoints; lighter on XSS.",
   "focus_areas": ["idor", "ssrf", "sqli", "auth-bypass", "ssti"],
   "specialists": ["nuclei-dast", "arjun", "sqlmap"],
-  "nuclei_dast_tags": "",
+  "nuclei_dast_tags": "sqli,ssrf,ssti,redirect,lfi",
   "caps": {
     "max_juicy_urls": 120,
     "max_dalfox": 10,

@@ -179,11 +179,34 @@ and the caps. With `-B auto` (default) the **AI reads the detected tech surface 
 the blueprint** (webapp_bounty / api_bounty / wordpress / stealth / deep); or force one
 with `-B wordpress`. Your explicit env/flags always override a blueprint's values.
 
+Each blueprint also scopes the **DAST pass** via `nuclei_dast_tags` (the vulnerability
+classes nuclei `-dast` fuzzes) so, e.g., `wordpress` fuzzes only `xss,sqli,lfi` and
+`api_bounty` skips XSS — faster and less noisy than running every fuzzing template.
+`deep` leaves it empty on purpose (every class). A blueprint can also carry
+`fuzzing_strategy`: **`off`** skips classic path fuzzing entirely (the `spa`-style case
+where `/FUZZ` against a one-origin JS front-end is just noise) and **`light`** runs it
+with a trimmed wordlist / fewer extensions / tighter time cap. `spa` ships `light`.
+Override any of these with `ACT_DAST_TAGS=…` / `FUZZING_STRATEGY=off|light|normal`.
+
 ```bash
 ./4tail.sh -C -j -b 2 example.com                 # auto blueprint, full deep pass
 ./4tail.sh -C -B stealth example.com              # low-and-slow, no sqlmap
+./4tail.sh -C -B spa example.com                  # JS-mining first, path fuzzing light
 SQLMAP_CONFIRM=0 ./4tail.sh -C example.com        # never run sqlmap
+FUZZING_STRATEGY=off ./4tail.sh -C example.com    # skip /FUZZ path fuzzing this run
 ```
+
+### GraphQL introspection
+
+When the API-spec pass (part of `-C`) finds a GraphQL endpoint (`/graphql`, `/graphiql`,
+`/api/graphql`, `/vN/graphql`), 4tail fires a **read-only GET introspection query**. If the
+server answers with a schema, introspection is **open** — the single highest-signal GraphQL
+find, since it hands you the whole attack surface. 4tail dumps the types/fields/args to
+`graphql_schema.txt`, records a `graphql-introspection` finding, feeds the schema to triage
+(so the report maps per-field authz/IDOR/injection), and lets the AI fold concrete
+`?query=…` GET probes into the active set. Capped by `GRAPHQL_MAX` (default 5 endpoints).
+Servers that only accept POST simply won't introspect — the safe tradeoff for staying
+GET-only.
 
 ### Content-discovery results (ffuf) are now first-class
 

@@ -3,7 +3,7 @@
   "description": "General web-app bounty: balanced active testing across the common bug classes.",
   "focus_areas": ["idor", "sqli", "xss", "ssrf", "lfi", "redirect", "ssti"],
   "specialists": ["nuclei-dast", "dalfox", "kxss", "arjun", "sqlmap"],
-  "nuclei_dast_tags": "",
+  "nuclei_dast_tags": "xss,sqli,lfi,ssrf,redirect,ssti",
   "caps": {
     "max_juicy_urls": 100,
     "max_dalfox": 50,

@@ -18,7 +18,8 @@ set -o pipefail
 # so a loaded blueprint never overrides a value the user chose on the CLI/env.
 for _v in CRAWL_MAX_URLS CRAWL_MAX_TIME DAST_MAX_URLS NUCLEI_MAX_HOSTS NUCLEI_SEVERITY \
           MAX_TAGS ACT_MAX_JUICY ACT_MAX_DALFOX ACT_MAX_KXSS ACT_MAX_SQLMAP ACT_MAX_ARJUN \
-          ACT_DAST_TAGS ACT_SPECIALISTS ACT_FOCUS; do
+          ACT_DAST_TAGS ACT_SPECIALISTS ACT_FOCUS FUZZING_STRATEGY \
+          MAX_FUZZ_WORDS MAX_EXTS FUZZ_MAX_TIME; do
   eval "_user_set_$_v=\${$_v+1}"
 done
 
@@ -121,6 +122,7 @@ ACT_MAX_ARJUN="${ACT_MAX_ARJUN:-25}"
 ACT_SPECIALISTS="${ACT_SPECIALISTS:-nuclei-dast,dalfox,kxss,arjun,sqlmap}"
 ACT_FOCUS="${ACT_FOCUS:-idor,sqli,xss,ssrf,lfi,redirect,ssti}"
 ACT_DAST_TAGS="${ACT_DAST_TAGS:-}"        # empty = all nuclei fuzzing (DAST) templates
+FUZZING_STRATEGY="${FUZZING_STRATEGY:-normal}"  # normal | light (trim wordlist/exts/time) | off (skip path fuzzing) - set by blueprint for SPA/CDN targets
 SQLMAP_CONFIRM="${SQLMAP_CONFIRM:-1}"     # allow sqlmap when the blueprint lists it (0 to hard-disable)
 SQLMAP_MAX_TIME="${SQLMAP_MAX_TIME:-180}" # per funnel-sqlmap run cap (s) - sqlmap can run for hours otherwise
 DALFOX_MAX_TIME="${DALFOX_MAX_TIME:-180}" # dalfox pipe cap (s)
@@ -129,6 +131,7 @@ ARJUN_MAX_TIME="${ARJUN_MAX_TIME:-60}"    # per-host arjun cap (s, JS stage)
 API_SPECS="${API_SPECS:-1}"               # 1 = detect Swagger/OpenAPI/GraphQL specs -> AI builds targeted tests (part of -C)
 API_MAX_SPECS="${API_MAX_SPECS:-5}"       # cap spec documents fetched + fed to the AI
 API_MAX_TESTS="${API_MAX_TESTS:-60}"      # cap AI-generated API test URLs folded into the active set
+GRAPHQL_MAX="${GRAPHQL_MAX:-5}"           # cap GraphQL endpoints probed for open introspection
 
 # --- Correlation / exploitation passes (active, part of -C) -----------------
 BYPASS="${BYPASS:-1}"                      # 403/401 -> try proven access-control bypasses
@@ -385,6 +388,7 @@ if [ "$DOCTOR" != 1 ]; then
   targets_active_file="$OUTDIR/targets_active.txt" # AI-selected juicy URLs for specialists
   api_specs_file="$OUTDIR/api_specs.txt"           # discovered Swagger/OpenAPI/GraphQL spec URLs
   api_tests_file="$OUTDIR/api_tests.txt"           # AI-generated API test URLs (folded into active set)
+  gql_schema_file="$OUTDIR/graphql_schema.txt"     # dumped GraphQL schema when introspection is open
   stale_file="$OUTDIR/stale.tsv"                   # per-host legacy score: score<TAB>url<TAB>evidence
   oast_dir="$OUTDIR/oast"; mkdir -p "$oast_dir"    # interactsh output + injection map
   oast_log="$oast_dir/interactions.jsonl"          # raw interactsh interactions
@@ -945,6 +949,7 @@ load_blueprint() { # $1 = name or path; applies focus/specialists/caps
   bp_set ACT_FOCUS       "$(jq -r '(.focus_areas // []) | join(",")' "$f" 2>/dev/null)"
   bp_set ACT_SPECIALISTS "$(jq -r '(.specialists // []) | join(",")' "$f" 2>/dev/null)"
   bp_set ACT_DAST_TAGS   "$(jq -r '.nuclei_dast_tags // ""' "$f" 2>/dev/null)"
+  bp_set FUZZING_STRATEGY "$(jq -r '.fuzzing_strategy // ""' "$f" 2>/dev/null)"
   bp_set ACT_MAX_JUICY   "$(jq -r '.caps.max_juicy_urls // empty' "$f" 2>/dev/null)"
   bp_set ACT_MAX_DALFOX  "$(jq -r '.caps.max_dalfox // empty' "$f" 2>/dev/null)"
   bp_set ACT_MAX_KXSS    "$(jq -r '.caps.max_kxss // empty' "$f" 2>/dev/null)"
@@ -1707,6 +1712,10 @@ fuzz_possible=0
 CDN_RE='cloudfront|cloudflare|akamai|fastly|imperva|incapsula|sucuri|edgecast|stackpath|azure front door'
 if [ "$SKIP_FUZZ" = 1 ]; then
   set_stage $S_FUZZ skip "disabled (-q / SKIP_FUZZ)"
+elif [ "$FUZZING_STRATEGY" = off ]; then
+  # SPA/CDN-fronted targets: classic path fuzzing is mostly noise against a JS
+  # front-end served from one origin - the value is in JS mining + the API, not /FUZZ.
+  set_stage $S_FUZZ skip "off (blueprint fuzzing_strategy=off)"
 elif ! have ffuf; then
   set_stage $S_FUZZ skip "ffuf not installed"
 elif [ "$fuzz_possible" != 1 ]; then
@@ -1714,7 +1723,15 @@ elif [ "$fuzz_possible" != 1 ]; then
 elif [ "$RESUME" = 1 ] && [ -f "$OUTDIR/.done_fuzz" ]; then
   set_stage $S_FUZZ done "$(grep -c . "$fuzz_plan_file" 2>/dev/null || echo 0) hosts (resumed)"
 else
-  set_stage $S_FUZZ running "indexing SecLists"
+  if [ "$FUZZING_STRATEGY" = light ]; then
+    # Lighten path fuzzing (SPA/CDN blueprints): smaller wordlist, fewer exts, tighter
+    # per-host cap. Still runs - just cheap - so a stray classic path is still found.
+    # An explicit user value (CLI/env) always wins over the lightening.
+    [ -n "${_user_set_MAX_FUZZ_WORDS:-}" ] || MAX_FUZZ_WORDS=4000
+    [ -n "${_user_set_MAX_EXTS:-}" ]       || MAX_EXTS=2
+    [ -n "${_user_set_FUZZ_MAX_TIME:-}" ]  || FUZZ_MAX_TIME=120
+  fi
+  set_stage $S_FUZZ running "indexing SecLists$([ "$FUZZING_STRATEGY" = light ] && echo ' (light)')"
   build_seclists_index   # index real SecLists files once so tech matching is grounded in what's installed
   set_stage $S_FUZZ running "0 hosts ($(nlines "${seclists_index:-/dev/null}") lists indexed)"
   [ "$RESUME" = 1 ] || : > "$fuzz_plan_file"   # keep prior progress when resuming
@@ -2077,6 +2094,58 @@ else
       active_total="$(nlines "$targets_active_file")"
     fi
     set_stage $S_CRAWL running "api specs: $(nlines "$api_specs_file") found, $(nlines "$api_tests_file") tests built"
+
+    # (C2.5) GraphQL introspection: if a /graphql endpoint answers an introspection query,
+    # the whole schema (types, fields, args) is readable - the single highest-signal GraphQL
+    # find, since it hands you the full attack surface for IDOR/authz/injection. Done with a
+    # GET introspection query (read-only, no mutation) to stay within the GET-only invariant;
+    # servers that only accept POST simply won't introspect, which is the safe tradeoff.
+    : > "$gql_schema_file"
+    gql_q='{__schema{queryType{name}mutationType{name}types{name kind fields{name args{name}}}}}'
+    gql_n=0
+    gql_endpoints="$(grep -iE 'https?://[^ ]*/(graphql|graphiql|api/graphql|v[0-9]+/graphql)([?/]|$)' \
+                      "$api_specs_file" 2>/dev/null | sort -u)"
+    while IFS= read -r gql; do
+      [ -n "$gql" ] || continue
+      [ "$gql_n" -ge "${GRAPHQL_MAX:-5}" ] && break
+      gql_n=$((gql_n+1))
+      set_stage $S_CRAWL running "graphql introspection $gql_n ($gql)"
+      gresp="$(curl -s -G --max-time 12 ${CURL_NET[@]+"${CURL_NET[@]}"} \
+                 -H 'Content-Type: application/json' \
+                 --data-urlencode "query=$gql_q" "$gql" 2>/dev/null | head -c 400000)"
+      # introspection is OPEN only if the server actually returned a __schema with its types
+      printf '%s' "$gresp" | jq -e '.data.__schema.types | length > 0' >/dev/null 2>&1 || continue
+      {
+        echo "== GraphQL introspection OPEN: $gql =="
+        printf '%s' "$gresp" | jq -r '
+          .data.__schema as $s
+          | "queryType: \($s.queryType.name // "-")   mutationType: \($s.mutationType.name // "-")",
+            ( $s.types[]
+              | select(.name | test("^__") | not)
+              | select(.fields != null and (.fields | length > 0))
+              | "type \(.name) {" ,
+                ( .fields[] | "  \(.name)(\((.args // []) | map(.name) | join(", ")))" ),
+                "}" )' 2>/dev/null
+        echo
+      } >> "$gql_schema_file"
+      # Let the AI turn the live schema into concrete GET query-probes folded into the active set.
+      if [ "$AI_ENABLED" = 1 ] && budget_ok; then
+        gout="$(mktemp)"
+        ai_call "$LLM_MODEL_PLAN" 1500 \
+          "GraphQL introspection is OPEN at $gql. Below is the dumped schema. Build concrete HTTP GET probe URLs of the form ${gql}?query=<url-unencoded graphql query> that exercise the riskiest query fields for IDOR/broken-authz (fetch objects by id=1), injection (string args = test'), and SSRF (url/uri args = http://169.254.169.254/). Keep queries minimal and same-origin. One URL per line, no commentary, no markdown, max 20 lines." \
+          "$(head -c 20000 "$gql_schema_file")" >"$gout" 2>>"$llm_log" || true
+        grep -oE 'https?://[^ "'"'"'`<>]+' "$gout" 2>/dev/null \
+          | grep -iE "^https?://([a-z0-9._-]+\.)?${esc_domain}([:/]|$)" \
+          >> "$api_tests_file" || true
+        rm -f "$gout"
+      fi
+    done <<< "$gql_endpoints"
+    if [ -s "$api_tests_file" ]; then   # re-fold (AI may have added GraphQL query probes)
+      sort -u "$api_tests_file" | head -n "$API_MAX_TESTS" > "$api_tests_file.tmp" && mv "$api_tests_file.tmp" "$api_tests_file"
+      cat "$api_tests_file" >> "$targets_active_file"; sort -u -o "$targets_active_file" "$targets_active_file"
+      active_total="$(nlines "$targets_active_file")"
+    fi
+    [ -s "$gql_schema_file" ] && set_stage $S_CRAWL running "graphql: introspection OPEN on $(grep -c 'introspection OPEN' "$gql_schema_file") endpoint(s)"
   fi
 
   # (C3) kiterunner: API-route discovery with API-specific wordlists + route prediction -
@@ -2341,6 +2410,7 @@ else
       [ -s "$nuclei_file" ] && { echo "CONFIRMED NUCLEI (cves/exposures/misconfig/tech):"; head -20 "$nuclei_file"; }
       [ -s "$js_secrets_file" ] && { echo "JS SECRET CANDIDATES (url<TAB>match):"; head -15 "$js_secrets_file"; }
       [ -s "${api_specs_file:-/dev/null}" ] && { echo "EXPOSED API SPECS (fetch + inspect):"; head -10 "$api_specs_file"; }
+      [ -s "${gql_schema_file:-/dev/null}" ] && { echo "GRAPHQL INTROSPECTION OPEN (full schema readable - map authz/IDOR per field):"; head -60 "$gql_schema_file"; }
       [ -s "${bypass_file:-/dev/null}" ] && { echo "ACCESS-CONTROL BYPASSES (403->200):"; head -10 "$bypass_file"; }
       [ -s "${idor_file:-/dev/null}" ] && { echo "IDOR / AUTHZ CANDIDATES:"; head -10 "$idor_file"; }
       [ -s "$findings_dir/kxss.txt" ] && { echo "REFLECTED PARAMS (kxss):"; head -15 "$findings_dir/kxss.txt"; }
@@ -2639,6 +2709,9 @@ if have jq; then
     [ -f "$js_secrets_file" ] && while IFS=$'\t' read -r u m; do [ -n "$m" ] && emit_f secret medium js-mining "$u" "$m"; done < "$js_secrets_file"
     [ -f "$findings_dir/kxss.txt" ] && while IFS= read -r l; do [ -n "$l" ] && emit_f reflected-param low kxss "$(nurl "$l")" "$l"; done < "$findings_dir/kxss.txt"
     [ -f "${api_specs_file:-}" ] && while IFS= read -r l; do [ -n "$l" ] && emit_f api-spec info api-discovery "$l" "exposed API spec: $l"; done < "$api_specs_file"
+    [ -f "${gql_schema_file:-}" ] && grep '^== GraphQL introspection OPEN: ' "$gql_schema_file" 2>/dev/null \
+      | sed 's/^== GraphQL introspection OPEN: //; s/ ==$//' \
+      | while IFS= read -r l; do [ -n "$l" ] && emit_f graphql-introspection medium graphql "$l" "GraphQL introspection enabled - full schema readable at $l"; done
     [ -f "${oast_hits_file:-}" ] && while IFS= read -r l; do [ -n "$l" ] && emit_f blind-ssrf-redirect high oast "$(nurl "$l")" "$l"; done < "$oast_hits_file"
     [ -f "${agent_file:-}" ] && while IFS= read -r l; do [ -n "$l" ] && emit_f agent-confirmed "$(agent_sev "$l")" agent "$(nurl "$l")" "$l"; done < "$agent_file"
     [ -f "${bypass_file:-}" ] && while IFS= read -r l; do [ -n "$l" ] && emit_f access-control-bypass high bypass "$(nurl "$l")" "$l"; done < "$bypass_file"

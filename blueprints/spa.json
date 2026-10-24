@@ -4,6 +4,7 @@
   "focus_areas": ["xss", "idor", "ssrf", "redirect", "auth-bypass", "secrets"],
   "specialists": ["nuclei-dast", "dalfox", "kxss", "arjun"],
   "nuclei_dast_tags": "xss,redirect,ssrf",
+  "fuzzing_strategy": "light",
   "caps": {
     "max_juicy_urls": 120,
     "max_dalfox": 60,
