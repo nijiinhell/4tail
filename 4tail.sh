@@ -453,6 +453,7 @@ if [ "$DOCTOR" != 1 ]; then
   gql_schema_file="$OUTDIR/graphql_schema.txt"     # dumped GraphQL schema when introspection is open
   sourcemap_file="$OUTDIR/sourcemaps.txt"          # recovered .js.map URLs (source leak)
   smap_endpoints_file="$OUTDIR/sourcemap_endpoints.txt"  # endpoints reconstructed from source maps (folded into urls)
+  js_endpoints_file="$OUTDIR/js_endpoints.txt"     # API endpoints/paths mined from JS bundles (SPA surface -> folded into urls)
   stale_file="$OUTDIR/stale.tsv"                   # per-host legacy score: score<TAB>url<TAB>evidence
   oast_dir="$OUTDIR/oast"; mkdir -p "$oast_dir"    # interactsh output + injection map
   oast_log="$oast_dir/interactions.jsonl"          # raw interactsh interactions
@@ -2034,20 +2035,25 @@ elif done_marker js && [ -f "$js_secrets_file" ]; then
 else
   set_stage $S_JS running "collecting JS"
   JS_HOSTS="${JS_HOSTS:-60}"; JS_MAX="${JS_MAX:-200}"
-  # 1) gather JS URLs (subjs/getJS if present, else scrape roots)
+  # 1) gather JS URLs. UNION every available method (subjs/getJS can whiff on SPAs, and a
+  #    direct scrape of <script src> catches the Angular/Vue/React bundles they miss).
   : > "$js_urls_file"
   scan_targets="$(sort -u "$alive_file" | head -n "$JS_HOSTS")"
-  if have subjs; then
-    printf '%s\n' "$scan_targets" | subjs 2>/dev/null | sort -u > "$js_urls_file"
-  elif have getJS; then
-    printf '%s\n' "$scan_targets" | while read -r u; do getJS --url "$u" 2>/dev/null; done | sort -u > "$js_urls_file"
-  else
-    printf '%s\n' "$scan_targets" | while read -r u; do
-      curl -s -L --max-time 15 ${CURL_NET[@]+"${CURL_NET[@]}"} "$u" 2>/dev/null \
-        | grep -oiE 'src="[^"]+\.js' | sed -E 's/^src="//' \
-        | while read -r j; do case "$j" in http*) echo "$j";; /*) echo "${u%/}$j";; *) echo "${u%/}/$j";; esac; done
-    done | sort -u > "$js_urls_file"
-  fi
+  have subjs && printf '%s\n' "$scan_targets" | subjs 2>/dev/null >> "$js_urls_file"
+  have getJS && printf '%s\n' "$scan_targets" | while read -r u; do getJS --url "$u" 2>/dev/null; done >> "$js_urls_file"
+  # Always also scrape <script src=...> directly (handles ", ', and module scripts), so a SPA's
+  # runtime/polyfills/vendor/main bundles are found even when the dedicated tools return nothing.
+  printf '%s\n' "$scan_targets" | while read -r u; do
+    curl -s -L --max-time 15 ${CURL_NET[@]+"${CURL_NET[@]}"} "$u" 2>/dev/null \
+      | grep -aoiE 'src=["'"'"']?[^"'"'"' >]+\.js([?][^"'"'"' >]*)?' | sed -E 's/^src=["'"'"']?//' \
+      | while read -r jrel; do case "$jrel" in
+          http*) echo "$jrel" ;;
+          //*)   echo "${u%%/*}$jrel" ;;
+          /*)    echo "$(printf '%s' "$u" | sed -E 's#(https?://[^/]+).*#\1#')$jrel" ;;
+          *)     echo "${u%/}/$jrel" ;;
+        esac; done
+  done >> "$js_urls_file"
+  sort -u -o "$js_urls_file" "$js_urls_file"
   # Keep only FIRST-PARTY JS (hosted on the target's own domain). Third-party scripts
   # (google-analytics, gtag, cloudflare, jquery cdn...) carry public keys and produce
   # false positives that aren't the target's to fix. Override with JS_FIRST_PARTY=0.
@@ -2059,19 +2065,33 @@ else
   js_total="$(nlines "$js_urls_file")"
   # 2) fetch each JS and scan for secrets. If trufflehog is present, save the JS and let it
   #    do entropy + verification (far fewer false positives than regex); else regex fallback.
-  : > "$js_secrets_file"; ji=0
+  : > "$js_secrets_file"; : > "$js_endpoints_file"; ji=0
   js_dir=""; [ "$TRUFFLEHOG_JS" = 1 ] && have trufflehog && { js_dir="$OUTDIR/jsfiles"; mkdir -p "$js_dir"; }
   while read -r j; do
     [ -z "$j" ] && continue
     ji=$((ji + 1)); [ "$ji" -gt "$JS_MAX" ] && break
-    ST_DETAIL[$S_JS]="scanning JS $ji/$js_total  hits:$(nlines "$js_secrets_file")"; render
-    if [ -n "$js_dir" ]; then
-      curl -s -L --max-time 15 ${CURL_NET[@]+"${CURL_NET[@]}"} "$j" 2>/dev/null > "$js_dir/$(printf '%s' "$j" | tr -c 'A-Za-z0-9._-' '_' | tail -c 120).js"
-    else
-      curl -s -L --max-time 15 ${CURL_NET[@]+"${CURL_NET[@]}"} "$j" 2>/dev/null | grep -aoE "$SECRET_RE" 2>/dev/null \
-        | sort -u | sed "s#^#${j}\t#" >> "$js_secrets_file"
-    fi
+    ST_DETAIL[$S_JS]="scanning JS $ji/$js_total  hits:$(nlines "$js_secrets_file") eps:$(nlines "$js_endpoints_file")"; render
+    jtmp="$(mktemp)"
+    curl -s -L --max-time 15 ${CURL_NET[@]+"${CURL_NET[@]}"} "$j" 2>/dev/null > "$jtmp"
+    [ -s "$jtmp" ] || { rm -f "$jtmp"; continue; }
+    # secrets: trufflehog on the saved file (verified) else inline regex
+    if [ -n "$js_dir" ]; then cp "$jtmp" "$js_dir/$(printf '%s' "$j" | tr -c 'A-Za-z0-9._-' '_' | tail -c 120).js"
+    else grep -aoE "$SECRET_RE" "$jtmp" 2>/dev/null | sort -u | sed "s#^#${j}\t#" >> "$js_secrets_file"; fi
+    # endpoints: a SPA's API surface (/rest, /api, absolute URLs) lives in its JS bundles; mine
+    # them so they feed the funnel even with no archive data and no source map. Origin = this JS's.
+    jorigin="$(printf '%s' "$j" | sed -E 's#(https?://[^/]+).*#\1#')"
+    {
+      grep -aoiE "https?://([a-z0-9._-]+\.)?${esc_domain}[a-z0-9._/?=&%:-]*" "$jtmp" 2>/dev/null
+      grep -aoE "[\"'\`]/[a-zA-Z0-9_./?=&%-]{2,}[\"'\`]" "$jtmp" 2>/dev/null | tr -d "\"'\`" | sed "s#^#${jorigin}#"
+      grep -aoE "[\"'\`](rest|api|graphql|v[0-9]+)/[a-zA-Z0-9_./?=&%-]{2,}[\"'\`]" "$jtmp" 2>/dev/null | tr -d "\"'\`" | sed "s#^#${jorigin}/#"
+    } 2>/dev/null >> "$js_endpoints_file"
+    rm -f "$jtmp"
   done < "$js_urls_file"
+  if [ -s "$js_endpoints_file" ]; then
+    grep -iE "^https?://([a-z0-9._-]+\.)?${esc_domain}([:/]|$)" "$js_endpoints_file" 2>/dev/null \
+      | grep -ivE '\.(png|jpe?g|gif|svg|woff2?|ttf|eot|css|ico|map)([?#]|$)' \
+      | sort -u | head -n 4000 > "$js_endpoints_file.tmp" && mv "$js_endpoints_file.tmp" "$js_endpoints_file"
+  fi
   if [ -n "$js_dir" ] && [ -n "$(ls -A "$js_dir" 2>/dev/null)" ]; then
     ST_DETAIL[$S_JS]="trufflehog verifying JS secrets"; render
     tmo 180 trufflehog --no-update filesystem "$js_dir" --only-verified --json 2>/dev/null \
@@ -2241,8 +2261,9 @@ else
     wait "$kpid" 2>/dev/null || true
     [ -f "$OUTDIR/.katana.txt" ] && cat "$OUTDIR/.katana.txt" >> "$urls_file" && rm -f "$OUTDIR/.katana.txt"
   fi
-  # fold in endpoints reconstructed from source maps (scoped + deduped by the filter below)
+  # fold in endpoints mined from source maps + JS bundles (SPA API surface); scoped+deduped below
   [ -s "${smap_endpoints_file:-/dev/null}" ] && cat "$smap_endpoints_file" >> "$urls_file"
+  [ -s "${js_endpoints_file:-/dev/null}" ] && cat "$js_endpoints_file" >> "$urls_file"
   grep -iE "^https?://([a-z0-9._-]+\.)?${esc_domain}([:/]|$)" "$urls_file" 2>/dev/null \
     | sort -u | head -n "$CRAWL_MAX_URLS" > "$urls_file.tmp" && mv "$urls_file.tmp" "$urls_file"
   # Only URLs with a real ?k=v, and NOT static assets - so clustering, AI selection and
@@ -2505,8 +2526,8 @@ else
     # lines that are an actual finding (carry a URL or a named misconfig class).
     [ -s "$OUTDIR/.cors_in.txt" ] && tmo 180 corsy -i "$OUTDIR/.cors_in.txt" 2>/dev/null \
       | sed -E 's/\x1b\[[0-9;]*m//g' \
-      | grep -viE 'no misconfig|not vulnerable|^[[:space:]]*-?[[:space:]]*$' \
-      | grep -iE 'https?://|reflect|wildcard|null origin|arbitrary origin|credentials|trusted' > "$corsy_file" || true
+      | grep -viE 'no misconfig|not vulnerable|unreachable|could not|timed out|invalid|connection (refused|error)|^[[:space:]]*-?[[:space:]]*$' \
+      | grep -iE 'reflect|wildcard|null origin|arbitrary origin|post-domain|pre-domain|trusted|credentials|origin reflected' > "$corsy_file" || true
     rm -f "$OUTDIR/.cors_in.txt"
   fi; render
 
@@ -2811,7 +2832,7 @@ if [ "$VERIFY" = 1 ]; then set_stage $S_TRIAGE running "verifying findings"; ver
   echo "- **Target:** \`$domain\`"
   echo "- **Generated:** $(date -u '+%Y-%m-%d %H:%M UTC')"
   echo "- **Subdomains:** $sub_count | **Live:** $alive_count | **Nuclei findings:** $find_count | **Fuzz hits:** $(fuzz_distinct "$fuzz_findings_file") distinct (${fuzz_hits:-0} raw)"
-  [ "$JSMINE" = 1 ] && echo "- **JS mined:** $(nlines "$js_urls_file") files, $(nlines "$js_secrets_file") secret hits, $(nlines "$params_file") params, $(nlines "${sourcemap_file:-/dev/null}") source maps recovered"
+  [ "$JSMINE" = 1 ] && echo "- **JS mined:** $(nlines "$js_urls_file") files, $(nlines "$js_secrets_file") secret hits, $(nlines "$params_file") params, $(nlines "${js_endpoints_file:-/dev/null}") endpoints, $(nlines "${sourcemap_file:-/dev/null}") source maps recovered"
   if [ "$CRAWL" = 1 ]; then
     echo "- **Active funnel (${BLUEPRINT_NAME:-defaults}):** $(nlines "$urls_file") urls → $(nlines "$url_patterns_file") patterns → **$(nlines "$targets_active_file") juicy**"
     echo "  - specialists → DAST:$(nlines "$dast_file") · dalfox:$(nlines "$findings_dir/dalfox.txt") · kxss:$(nlines "$findings_dir/kxss.txt") · sqlmap:$(nlines "$findings_dir/sqlmap.txt")"
