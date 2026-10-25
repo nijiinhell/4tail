@@ -177,7 +177,11 @@ installed. `doctor` shows what's present.
 `blueprints/*.json` set the active-phase strategy: focus areas, which specialists to run,
 and the caps. With `-B auto` (default) the **AI reads the detected tech surface and picks
 the blueprint** (webapp_bounty / api_bounty / wordpress / stealth / deep); or force one
-with `-B wordpress`. Your explicit env/flags always override a blueprint's values.
+with `-B wordpress`. Your explicit env/flags always override a blueprint's values. When a
+**SPA framework** (Angular / React / Vue / Next / Nuxt / Svelte…) is detected in the tech
+surface, `auto` deterministically picks the **`spa`** blueprint — the generic AI pick tends
+to default to `webapp_bounty` and miss that the real surface is the mined `/rest` + `/api`,
+not classic path fuzzing.
 
 Each blueprint also scopes the **DAST pass** via `nuclei_dast_tags` (the vulnerability
 classes nuclei `-dast` fuzzes) so, e.g., `wordpress` fuzzes only `xss,sqli,lfi` and
@@ -393,7 +397,11 @@ Beyond collecting findings, the active funnel now turns them into action:
   AUTH_A="Cookie: session=AAA" AUTH_B="Cookie: session=BBB" ./4tail.sh -C example.com
   AUTH_A="Authorization: Bearer eyJ…" ./4tail.sh -C example.com   # A + anon only
   ```
-  Caps via `IDOR_MAX`; GET-only, scope-locked, behind the authorization gate.
+  It also does **path-based IDOR / BOLA**: for REST object ids in the path
+  (`/api/Users/1`, `/rest/basket/42` — mined from JS too), it reads a neighbour id as
+  identity A and, when the neighbour is readable (and the endpoint isn't just answering
+  `200` to every id — a bogus-id control guards that), flags a `[PATH-IDOR?]` lead.
+  Caps via `IDOR_MAX`; scope-locked, behind the authorization gate.
 
 All three feed the loot feed, `findings.json`, the agent's situation, and the report.
 
@@ -450,7 +458,11 @@ login/register logic, body IDOR/SQLi, and mass assignment itself — so those cl
 actively confirmed, not just written up as manual PoCs. Each POST is scope-locked and capped
 (`AGENT_MAX_POST`), and **clearly destructive bodies are refused** (`DROP`/`DELETE`/`TRUNCATE`
 /`SHUTDOWN`/`xp_cmdshell`/…); quote probes, `OR 1=1`, and extra-field mass-assignment are
-allowed. Set `AGENT_POST=0` for a strictly GET-only agent.
+allowed. Set `AGENT_POST=0` for a strictly GET-only agent. The agent is also handed the
+**API endpoints mined from the JS bundles** as explicit leads, with guidance to id-walk
+numeric path segments (`/api/Users/1`→`/2`, path-IDOR), POST a quote into a login body
+(auth SQLi), and add `role=admin`/`isAdmin=true` on register (mass assignment) — so a SPA's
+`/rest` + `/api` surface actually gets exercised, not just listed.
 
 **Secrets it reads stay local.** When a probe response carries a credential (connection
 string, `machineKey`, private key, AWS key…), the model is still only shown a **redacted**

@@ -838,6 +838,33 @@ idor_check() {
       [ "$cb" = 200 ] && _near "$sa" "$sb" && printf '[IDOR?] %s | user B gets the same resource as user A (A=200/%s B=200/%s) - verify object ownership\n' "$u" "$sa" "$sb" >> "$idor_file"
     fi
   done <<< "$cand"
+
+  # Path-based IDOR / BOLA: REST object ids live in the path (/api/Users/1, /rest/basket/42),
+  # not the query string. With identity A, read object N, then try a NEIGHBOUR id - if A can
+  # read it too (and the endpoint isn't just answering 200 to every id), that's a BOLA lead.
+  local pcand purl pid alt alturl cid ralt calt salt rcc ccc scc
+  pcand="$( { grep -aoiE 'https?://[^ "]+/[0-9]{1,9}(/[a-z0-9._-]+)?/?$' "$targets_active_file" 2>/dev/null
+              grep -aoiE 'https?://[^ "]+/[0-9]{1,9}(/[a-z0-9._-]+)?/?$' "${js_endpoints_file:-/dev/null}" 2>/dev/null
+            } | sort -u | head -n "$IDOR_MAX" )"
+  while IFS= read -r purl; do
+    [ -n "$purl" ] || continue
+    pid="$(printf '%s' "$purl" | grep -oE '/[0-9]{1,9}(/|$)' | tail -1 | tr -dc '0-9')"
+    [ -n "$pid" ] || continue
+    ra="$(curl -s -o /dev/null -w '%{http_code} %{size_download}' --max-time 10 ${CURL_NET[@]+"${CURL_NET[@]}"} -H "$AUTH_A" "$purl" 2>/dev/null || echo '000 0')"
+    ca="${ra%% *}"; sa="${ra##* }"
+    [ "$ca" = 200 ] && [ "${sa:-0}" -gt 0 ] 2>/dev/null || continue
+    alt=$((pid + 1)); [ "$alt" = "$pid" ] && alt=$((pid + 2))
+    alturl="$(printf '%s' "$purl" | sed -E "s#/${pid}(/|\$)#/${alt}\1#")"
+    cid="$(printf '%s' "$purl" | sed -E "s#/${pid}(/|\$)#/99999987\1#")"   # unlikely id -> blanket-200 guard
+    ralt="$(curl -s -o /dev/null -w '%{http_code} %{size_download}' --max-time 10 ${CURL_NET[@]+"${CURL_NET[@]}"} -H "$AUTH_A" "$alturl" 2>/dev/null || echo '000 0')"
+    calt="${ralt%% *}"; salt="${ralt##* }"
+    [ "$calt" = 200 ] && [ "${salt:-0}" -gt 0 ] 2>/dev/null || continue
+    rcc="$(curl -s -o /dev/null -w '%{http_code} %{size_download}' --max-time 10 ${CURL_NET[@]+"${CURL_NET[@]}"} -H "$AUTH_A" "$cid" 2>/dev/null || echo '000 0')"
+    ccc="${rcc%% *}"; scc="${rcc##* }"
+    # skip if the endpoint 200s even for a bogus id with a similar body (not id-scoped)
+    if [ "$ccc" = 200 ] && _near "$salt" "$scc"; then continue; fi
+    printf '[PATH-IDOR?] %s -> %s | identity A reads neighbour object id %s (200/%sB; bogus id -> %s/%sB) - verify ownership\n' "$purl" "$alturl" "$alt" "$salt" "$ccc" "$scc" >> "$idor_file"
+  done <<< "$pcand"
 }
 
 # Verification pass (anti-false-positive, per 2026 AI-pentest research): re-test each
@@ -1053,6 +1080,15 @@ load_blueprint() { # $1 = name or path; applies focus/specialists/caps
 resolve_blueprint() {
   if [ "$BLUEPRINT" != "auto" ]; then load_blueprint "$BLUEPRINT"; return; fi
   local chosen="webapp_bounty" n pick out
+  # Deterministic: a JS SPA framework in the tech surface -> the spa blueprint (JS-mining +
+  # DOM-XSS + the API behind the front-end). The generic AI pick tends to default to
+  # webapp_bounty and miss that the real surface is the mined /rest + /api, not path fuzzing.
+  if [ -s "$tech_brief" ] && [ -n "$BLUEPRINTS_DIR" ] && [ -f "$BLUEPRINTS_DIR/spa.json" ] \
+     && grep -qiE 'angular|react|vue\.?js|next\.?js|nuxt|svelte|ember|backbone|single[ -]?page' "$tech_brief" 2>/dev/null; then
+    load_blueprint spa
+    [ "$ASSUME_YES" = 1 ] || log "Blueprint: spa (SPA framework detected in tech surface)"
+    return
+  fi
   if [ "$AI_ENABLED" = 1 ] && [ -n "$BLUEPRINTS_DIR" ] && budget_ok && [ -s "$tech_brief" ]; then
     out="$(mktemp)"
     ai_call "$LLM_MODEL_PLAN" 400 \
@@ -2724,6 +2760,7 @@ else
       [ -s "${bypass_file:-/dev/null}" ] && { echo "ACCESS-CONTROL BYPASSES (403->200):"; head -10 "$bypass_file"; }
       [ -s "${idor_file:-/dev/null}" ] && { echo "IDOR / AUTHZ CANDIDATES:"; head -10 "$idor_file"; }
       [ -s "$findings_dir/kxss.txt" ] && { echo "REFLECTED PARAMS (kxss):"; head -15 "$findings_dir/kxss.txt"; }
+      [ -s "${js_endpoints_file:-/dev/null}" ] && { echo "MINED API ENDPOINTS (from JS bundles - the SPA's real /rest + /api surface; GET them, POST login/register bodies, id-walk numeric path segments):"; head -40 "$js_endpoints_file"; }
       [ -s "$gf_file" ] && { echo "GF CANDIDATE BUCKETS (class<TAB>url):"; head -40 "$gf_file"; }
       [ -s "$fuzz_findings_file" ] && { echo "EMPTY/SMALL 200 ENDPOINTS (param-mine candidates):";
         awk -F'\t' '$1==200 && $2+0<80 {print $3}' "$fuzz_findings_file" | head -15; }
@@ -2746,7 +2783,8 @@ Three kinds of action:
   GET <url> | why | success-regex            -> a passive fetch you confirm by regex (LFI reads, redirects, param mining, IDOR id-walking).
   POST <url> | body | why | success-regex    -> a form/JSON POST to test BODY-based bugs: login/register logic, body IDOR/SQLi, mass assignment. body is raw urlencoded (e.g. tfUName=%27&tfUPass=x) or JSON. NON-DESTRUCTIVE only: benign markers, id=1/id=2, a single quote for SQLi - never DROP/DELETE/TRUNCATE/SHUTDOWN/xp_cmdshell or mass writes (those are refused).
   TOOL <name> <url> | tags=...               -> run a real tool. ONLY these are installed: ${agent_tools:-none}. Use them to CONFIRM, e.g. sqlmap on a SQLi-looking param (it always runs capped at --level=1 --risk=1; higher levels are ignored), dalfox on a reflecting param, nuclei <url> tags=iis,cve on a fingerprinted host, git-dumper on an exposed /.git, nuclei-dast to fuzz a param URL. Prefer a TOOL to prove a lead over guessing.
-Ideas: confirmed/possible LFI (Templatize.asp?item=) -> read ../web.config, ../global.asa, ../../../windows/win.ini (if it holds a connection string / machineKey, 4tail saves the raw file for the human - you just confirm the read with a regex like connectionString); empty/small 200 endpoints -> add params ?id=1&debug=1; redirect params -> //example.org/ and watch Location; IDOR -> walk ids; login/register -> POST a single-quote in the username to probe SQLi, or extra fields (role=admin) to probe mass assignment; exposed /.git -> git-dumper.
+Ideas: confirmed/possible LFI (Templatize.asp?item=) -> read ../web.config, ../global.asa, ../../../windows/win.ini (if it holds a connection string / machineKey, 4tail saves the raw file for the human - you just confirm the read with a regex like connectionString); empty/small 200 endpoints -> add params ?id=1&debug=1; redirect params -> //example.org/ and watch Location; exposed /.git -> git-dumper.
+For the MINED API ENDPOINTS (SPA /rest + /api) go further than GET: (a) PATH-IDOR/BOLA - a numeric path segment like /api/Users/1 or /rest/basket/3 is an object id, so GET the neighbour (/2, /4) and compare; a readable neighbour you should not own is a lead; (b) AUTH/SQLi - POST a JSON body to a login/authentication endpoint with a single-quote injected into the email/username field and look for a SQL error or an unexpected auth success; (c) MASS ASSIGNMENT - POST/register with an extra JSON field such as role set to admin, or isAdmin true, and check whether it sticks. Use the POST action for (b) and (c); a body that starts with a brace is sent as application/json.
 All URLs MUST be on the target scope *.$domain. Respond in EXACTLY this structure, nothing else:
 NOTES:
 <2-6 short lines: updated hypotheses + status>
