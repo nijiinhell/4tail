@@ -831,6 +831,29 @@ nuclei.txt          # raw Nuclei findings
 report.md           # AI-triaged, prioritized report
 ```
 
+## Project layout (development)
+
+4tail is split into **`lib/*.sh` sections** loaded in order by the `./4tail.sh`
+entrypoint — the split is purely structural (one shell process, shared state), so
+behaviour is identical to the old single file. Sections:
+
+| Section | What's in it |
+|---------|--------------|
+| `00-prelude` | `set -u`/`pipefail`, snapshot of user-set tuning vars |
+| `config` | all the `${VAR:-default}` config |
+| `cli` | arg parsing, target parse (incl. `-s`/localhost), dep check, authz gate, output dir |
+| `dashboard` | the live TUI + loot feed |
+| `helpers` | cost ledger, verify/diff, 403-bypass / propagate / IDOR / OAST helpers |
+| `agent_tools` | the agent's real-tool dispatch |
+| `blueprints` | blueprint load/resolve (incl. SPA auto-select) |
+| `ai` | `ai_call` (LLM) |
+| `doctor` | `doctor` health check |
+| `p_recon` / `p_plan` / `p_fuzz` / `p_js` / `p_funnel` / `p_nuclei` / `p_agent` / `p_report` | the pipeline stages |
+
+Run it straight from the repo (`./4tail.sh …`). To ship a **single file**, `make build`
+concatenates the sections into `dist/4tail.sh`, byte-identical to the classic standalone
+script — copy that one file to a box with no `lib/`. `make check` syntax-checks everything.
+
 ## Notes
 
 - The AI steps only send recon metadata (aggregated technologies and Nuclei
