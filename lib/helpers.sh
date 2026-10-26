@@ -177,6 +177,33 @@ idor_check() {
   done <<< "$pcand"
 }
 
+# Deterministic <form> field harvest (page<TAB>method<TAB>action<TAB>field-names) from auth /
+# state-changing pages. Run BEFORE the agent so its POST probes use real field names, and
+# reused by the PoC generator. Idempotent: skips if forms_file is already populated.
+harvest_forms() {
+  [ "${POC_GEN:-1}" = 1 ] || return 0
+  [ -s "${forms_file:-/dev/null}" ] && return 0
+  : > "$forms_file"
+  local form_cand pg html frm m a names
+  form_cand="$( { sort -u "$alive_file" 2>/dev/null; cat "${targets_active_file:-/dev/null}" 2>/dev/null; } \
+                 | grep -iE 'login|signin|sign-in|register|signup|sign-up|reset|password|forgot|account|profile|checkout|cart|upload|contact|comment|graphql' \
+                 | sort -u | head -n "${POC_FORM_HOSTS:-12}" )"
+  [ -n "$form_cand" ] || form_cand="$(sort -u "$alive_file" 2>/dev/null | head -n 3)"
+  while IFS= read -r pg; do
+    [ -n "$pg" ] || continue
+    html="$(curl -s -L --max-time 12 ${CURL_NET[@]+"${CURL_NET[@]}"} "$pg" 2>/dev/null | tr '\n' ' ' | head -c 200000)"
+    [ -n "$html" ] || continue
+    printf '%s' "$html" | awk 'BEGIN{IGNORECASE=1; RS="<form"} NR>1{ e=index(tolower($0),"</form>"); print (e>0?substr($0,1,e):$0) }' 2>/dev/null \
+      | while IFS= read -r frm; do
+          [ -n "$frm" ] || continue
+          m="$(printf '%s' "$frm" | grep -oiE 'method=["'"'"']?[a-z]+' | head -1 | grep -oiE '[a-z]+$' | tr 'a-z' 'A-Z')"; [ -n "$m" ] || m=GET
+          a="$(printf '%s' "$frm" | grep -oiE 'action=["'"'"'][^"'"'"']*' | head -1 | sed -E 's/^action=["'"'"']//')"; [ -n "$a" ] || a="$pg"
+          names="$(printf '%s' "$frm" | grep -oiE 'name=["'"'"'][^"'"'"']+' | sed -E 's/^name=["'"'"']//' | sort -u | paste -sd, -)"
+          [ -n "$names" ] && printf '%s\t%s\t%s\t%s\n' "$pg" "$m" "$a" "$names" >> "$forms_file"
+        done
+  done <<< "$form_cand"
+}
+
 # Verification pass (anti-false-positive, per 2026 AI-pentest research): re-test each
 # CONFIRMED finding and require it to be (a) stable across two fetches and (b) DIFFERENT
 # from a bogus-sibling control - which weeds out soft-404 / catch-all pages that answer

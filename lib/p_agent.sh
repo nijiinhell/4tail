@@ -14,6 +14,9 @@ else
   set_stage $S_AGENT running "building situation"
   agent_seen="$OUTDIR/.agent_seen"; : > "$agent_seen"
   agent_loot_dir="$OUTDIR/agent_loot"; agent_post_n=0
+  # Harvest real <form> fields NOW (before the probe loop) so the agent's POST probes use the
+  # actual login/register field names instead of guessing. (PoC gen later reuses forms_file.)
+  [ "$CRAWL" = 1 ] && harvest_forms
   # Secret value patterns: when a response matches, the RAW body is saved locally for the
   # human (never sent to the LLM) so a cred read via LFI is actually captured, not just noted.
   AGENT_SECRET_RE='connection[-_ ]?string|<add[^>]*connectionString|Data Source=|Server=.*;.*(Password|Pwd)=|Initial Catalog=|Provider=|machineKey|validationKey=|decryptionKey=|BEGIN [A-Z ]*PRIVATE KEY|AKIA[0-9A-Z]{16}|password["'"'"' ]*[:=]|SA_PASSWORD|DB_PASSWORD'
@@ -44,6 +47,8 @@ else
         awk -F'\t' '$1==200 && $2+0<80 {print $3}' "$fuzz_findings_file" | head -15; }
       [ -s "$fuzz_findings_file" ] && { echo "NOTABLE PATHS:";
         awk -F'\t' '$1~/^(200|301|302|401|403)$/{print $1" "$3}' "$fuzz_findings_file" | grep -ivE 'google\.com|etc.{0,3}passwd' | head -25; }
+      [ -s "${forms_file:-/dev/null}" ] && { echo "HARVESTED FORMS (page<TAB>method<TAB>action<TAB>fields - use these REAL field names for POST probes: auth SQLi, mass assignment, CSRF):"; head -20 "$forms_file"; }
+      [ "$OAST" = 1 ] && [ -n "${OAST_DOMAIN:-}" ] && echo "OAST DOMAIN: you have an out-of-band collaborator. Put a unique subdomain like agent-r<round>.$OAST_DOMAIN into url/redirect/callback params or SSRF-able fields; a DNS/HTTP callback to it CONFIRMS blind SSRF/RCE."
     } | head -c 12000 )"
   astart=$SECONDS; round=0; results="(none yet - this is the first round)"
   agent_notes="(none yet - first round; form your initial hypotheses from the situation)"

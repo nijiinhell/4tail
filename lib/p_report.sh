@@ -3,29 +3,10 @@
 # body IDOR/SQLi, mass assignment, GraphQL mutations, CSRF) are detected but not exercised.
 # Here we harvest the real form fields deterministically, then have the AI write ready-to-run
 # curl PoCs for the HUMAN - keeping the firing invariant while closing the coverage gap.
-: > "$forms_file"; : > "$poc_file"
+: > "$poc_file"
 if [ "$CRAWL" = 1 ] && [ "$POC_GEN" = 1 ] && [ "$AI_ENABLED" = 1 ] && budget_ok; then
   set_stage $S_TRIAGE running "harvesting forms for PoCs"
-  # (a) deterministic form harvest from auth / state-changing pages
-  form_cand="$( { sort -u "$alive_file" 2>/dev/null; cat "$targets_active_file" 2>/dev/null; } \
-                 | grep -iE 'login|signin|sign-in|register|signup|sign-up|reset|password|forgot|account|profile|checkout|cart|upload|contact|comment|graphql' \
-                 | sort -u | head -n "$POC_FORM_HOSTS" )"
-  [ -n "$form_cand" ] || form_cand="$(sort -u "$alive_file" 2>/dev/null | head -n 3)"   # fall back to roots
-  while IFS= read -r pg; do
-    [ -n "$pg" ] || continue
-    html="$(curl -s -L --max-time 12 ${CURL_NET[@]+"${CURL_NET[@]}"} "$pg" 2>/dev/null | tr '\n' ' ' | head -c 200000)"
-    [ -n "$html" ] || continue
-    # Split into per-<form> chunks (awk RS on the opening tag) so multiple forms stay distinct;
-    # for each, pull method, action and the field names. grep ERE has no lazy match, hence awk.
-    printf '%s' "$html" | awk 'BEGIN{IGNORECASE=1; RS="<form"} NR>1{ e=index(tolower($0),"</form>"); print (e>0?substr($0,1,e):$0) }' 2>/dev/null \
-      | while IFS= read -r frm; do
-          [ -n "$frm" ] || continue
-          m="$(printf '%s' "$frm" | grep -oiE 'method=["'"'"']?[a-z]+' | head -1 | grep -oiE '[a-z]+$' | tr 'a-z' 'A-Z')"; [ -n "$m" ] || m=GET
-          a="$(printf '%s' "$frm" | grep -oiE 'action=["'"'"'][^"'"'"']*' | head -1 | sed -E 's/^action=["'"'"']//')"; [ -n "$a" ] || a="$pg"
-          names="$(printf '%s' "$frm" | grep -oiE 'name=["'"'"'][^"'"'"']+' | sed -E 's/^name=["'"'"']//' | sort -u | paste -sd, -)"
-          [ -n "$names" ] && printf '%s\t%s\t%s\t%s\n' "$pg" "$m" "$a" "$names" >> "$forms_file"
-        done
-  done <<< "$form_cand"
+  harvest_forms   # no-op if the agent stage already harvested them
   # (b) AI writes the PoCs from the harvested forms + the injectable/authz signals we already have
   set_stage $S_TRIAGE running "AI writing manual PoCs"
   poc_sys='You are a bug-bounty exploitation assistant on an AUTHORIZED engagement. Write a runnable bash script of curl PoCs for the BODY-BASED / state-changing bug classes a GET-only scanner cannot fire: POST auth & logic flaws (login, register, password-reset), body-based IDOR and SQLi, mass assignment (extra JSON fields like "role":"admin","isAdmin":true), GraphQL mutations, and CSRF (missing anti-CSRF token). Rules: one PoC per block; above each, a "# WHAT:" line (bug class + why this endpoint) and a "# CONFIRM:" line (the exact response signal that proves it). Use the real form fields and parameters given. Same-origin only. NON-DESTRUCTIVE: no DELETE/DROP/mass writes - use benign markers (e.g. value "4tailPoC"), id=1/id=2 for IDOR, a single quote for SQLi. Reference the session as the shell var $SESSION in a -H header so the human pastes their cookie/token. Output ONLY the bash script body (no markdown fences, no prose outside comments). If the data shows no plausible body-based test, output just: # no body-based PoC candidates from the collected data'
