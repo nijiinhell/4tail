@@ -130,7 +130,7 @@ else
         name="$(jq -r ".sources[$si] // empty" "$mtmp" 2>/dev/null)"
         jq -e ".sourcesContent[$si] != null" "$mtmp" >/dev/null 2>&1 || { si=$((si+1)); continue; }
         case "$name" in *node_modules*|*webpack/bootstrap*|*/vendor*) si=$((si+1)); continue ;; esac   # skip library code we can't fix
-        safe="$(printf '%s_%s' "$smaps" "$name" | tr -c 'A-Za-z0-9._-' '_' | tail -c 140)"
+        safe="${smaps}_$(printf '%s' "$name" | tr -c 'A-Za-z0-9._-' '_' | tail -c 140)"   # keep the ${smaps}_ glob prefix after truncation
         jq -r ".sourcesContent[$si]" "$mtmp" > "$smap_dir/$safe" 2>/dev/null
         si=$((si+1))
       done

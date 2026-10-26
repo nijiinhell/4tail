@@ -88,8 +88,16 @@ agent_tool_run() {   # name  target  extra
     git-dumper|gitdumper)
       { have git-dumper || have gitdumper; } || { echo "git-dumper: not installed (pipx install git-dumper)"; return 0; }
       local gd="git-dumper"; have git-dumper || gd="gitdumper"; mkdir -p "$findings_dir/gitdump"
-      raw="$(_cap "$gd" "${tgt%/}/.git/" "$findings_dir/gitdump" 2>&1 | tail -c 1500)"
-      [ -n "$(ls -A "$findings_dir/gitdump" 2>/dev/null)" ] && hit="CONFIRMED source-disclosure"
+      # strip any trailing /.git the AI appended so we don't request /.git/.git/
+      local gbase="${tgt%/}"; gbase="${gbase%/.git}"
+      raw="$(_cap "$gd" "$gbase/.git/" "$findings_dir/gitdump" 2>&1 | tail -c 1500)"
+      # Confirm ONLY on real dumped content - git-dumper lays down a .git skeleton (HEAD/config)
+      # even on a failed 403/404, so "dir non-empty" alone is a false positive. Require fetched
+      # objects/packs or checked-out source files.
+      if find "$findings_dir/gitdump/.git/objects" -type f 2>/dev/null | grep -q . \
+         || find "$findings_dir/gitdump" -type f -not -path '*/.git/*' 2>/dev/null | grep -q .; then
+        hit="CONFIRMED source-disclosure"
+      fi
       res="$(printf '%s' "$raw" | tail -3 | tr '\n' ';')" ;;
     trufflehog)
       have trufflehog || { echo "trufflehog: not installed"; return 0; }

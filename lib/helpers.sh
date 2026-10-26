@@ -58,12 +58,15 @@ try_403_bypass() {
     origin="$scheme://$host"
     # Soft-404/catch-all baseline: a bogus path on this origin. Many servers route unknown
     # paths (and X-Original-URL) to the homepage (200), which would look like a fake bypass.
-    bctl="$(curl -s -o /dev/null -w '%{http_code} %{size_download}' -L --max-time 8 ${CURL_NET[@]+"${CURL_NET[@]}"} "$origin/4tbz${RANDOM}x" 2>/dev/null || echo '000 0')"
+    # No -L: a 302->/login(200) must NOT be followed into a fake 200 bypass. --path-as-is: send
+    # the dot-segment tricks literally (curl would otherwise normalize /./ and /. client-side,
+    # turning the trick into a plain request before it leaves the machine).
+    bctl="$(curl -s -o /dev/null -w '%{http_code} %{size_download}' --path-as-is --max-time 8 ${CURL_NET[@]+"${CURL_NET[@]}"} "$origin/4tbz${RANDOM}x" 2>/dev/null || echo '000 0')"
     bcode="${bctl%% *}"; bsz="${bctl##* }"
     for t in "$path/" "$path/." "/.$path" "$path%2e" "$path%20" "$path%09" "$path..;/" "$path?" ; do
-      r="$(curl -s -o /dev/null -w '%{http_code} %{size_download}' -L --max-time 8 ${CURL_NET[@]+"${CURL_NET[@]}"} "$origin$t" 2>/dev/null || echo '000 0')"
+      r="$(curl -s -o /dev/null -w '%{http_code} %{size_download}' --path-as-is --max-time 8 ${CURL_NET[@]+"${CURL_NET[@]}"} "$origin$t" 2>/dev/null || echo '000 0')"
       code="${r%% *}"; sz="${r##* }"
-      case "$code" in 200|201|202|203|206|301|302|307) ;; *) continue ;; esac
+      case "$code" in 200|201|202|203|206) ;; *) continue ;; esac   # a real bypass serves the resource; a 3xx is a redirect, not access
       { [ "$bcode" = "$code" ] && _near "$sz" "$bsz"; } && continue   # same as catch-all -> not a bypass
       printf '%s -> %s via path trick %s\n' "$url" "$code" "$origin$t" >> "$bypass_file"; break
     done

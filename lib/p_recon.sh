@@ -133,7 +133,7 @@ if [ "$DNS_HYGIENE" = 1 ] && [ "$NO_ARCHIVE" != 1 ] && { have dig || have dnsx |
   if have dig || have host; then
     _ns "$domain" | sed 's/\.$//' | sort -u | head -4 | while IFS= read -r ns; do
       [ -n "$ns" ] || continue
-      if have dig; then axfr="$(tmo 12 dig +short axfr "$domain" "@$ns" 2>/dev/null | head -c 2000)"
+      if have dig; then axfr="$(tmo 12 dig axfr "$domain" "@$ns" 2>/dev/null | head -c 2000)"
       else axfr="$(tmo 12 host -l "$domain" "$ns" 2>/dev/null | grep -iv 'Transfer failed\|not found\|no servers' | head -c 2000)"; fi
       [ -n "$axfr" ] && printf '%s\n' "$axfr" | grep -qiE '(IN[[:space:]]+(A|CNAME|MX|NS)|has address|name server)' \
         && echo "[zone-transfer] AXFR allowed from $ns for $domain - full DNS zone disclosed (HIGH)" >> "$dns_hygiene_file"

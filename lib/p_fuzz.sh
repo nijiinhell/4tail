@@ -157,12 +157,16 @@ else
       sf="${JOB[$p]}"; jf="$fuzz_dir/${sf}.json"
       r429="$(jq '[.results[]?|select(.status==429)]|length' "$jf" 2>/dev/null || echo 0)"
       [ "${r429:-0}" -gt 0 ] 2>/dev/null && block_hits=$((block_hits + 1))
+      # stream this host's hits so the live loot feed shows ffuf discoveries DURING the stage,
+      # not only after it (the final block below still rebuilds the canonical sorted/deduped list).
+      jq -r '.results[]? | [(.status|tostring),(.length|tostring),.url] | @tsv' "$jf" 2>/dev/null >> "$fuzz_findings_file"
       rm -f "$fuzz_dir/.wl_${sf}.txt"; unset 'JOB[$p]'; done_count=$((done_count + 1))
     done
   }
   fuzz_status() {
     ST_DETAIL[$S_FUZZ]="run:$(fuzz_running)/$p_eff done:$done_count/$cap${skipped_cdn:+ cdn:$skipped_cdn}${resumed:+ res:$resumed}$([ "$backoff" = 1 ] && echo ' ⚠backoff')"
   }
+  : > "$fuzz_findings_file"   # fresh file for live streaming from fuzz_reap (rebuilt canonically after the loop)
 
   while IFS=$'\t' read -r url techs; do
     [ -z "$url" ] && continue

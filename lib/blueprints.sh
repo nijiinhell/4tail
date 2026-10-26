@@ -69,7 +69,9 @@ $(head -c 4000 "$tech_brief")" >"$out" 2>>"$llm_log" || true
 
 # kill background children (nuclei/ffuf/arjun/supervisor) so nothing lingers after
 # a Ctrl-C and pollutes a later resumed run's stats.
-kill_children() { local p; for p in $(jobs -p 2>/dev/null); do kill "$p" 2>/dev/null; pkill -P "$p" 2>/dev/null; done; }
+# Signal the CHILDREN (the real tools) BEFORE the backgrounded subshell parent - killing the
+# parent first reparents its children to init and pkill -P then finds nothing (orphans).
+kill_children() { local p; for p in $(jobs -p 2>/dev/null); do pkill -P "$p" 2>/dev/null; kill "$p" 2>/dev/null; done; }
 cleanup() {   # restore terminal, and if we died mid-run with the dashboard up, show WHY
   local rc=$?
   [ "$TUI" = 1 ] && printf '\033[?25h\033[?1049l'
