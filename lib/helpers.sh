@@ -48,7 +48,7 @@ _near() { awk -v a="${1:-0}" -v b="${2:-0}" 'BEGIN{d=a-b;if(d<0)d=-d;m=(a>b?a:b)
 # actually work in the wild - no spray.
 try_403_bypass() {
   [ "$BYPASS" = 1 ] || { cat >/dev/null; return 0; }
-  local st len url rest host scheme origin path code n=0 t trick h
+  local st len url rest host scheme origin path r code sz bctl bcode bsz n=0 t h
   while IFS=$'\t' read -r st len url; do
     case "$st" in 401|403) ;; *) continue ;; esac
     [ -n "$url" ] || continue
@@ -56,13 +56,23 @@ try_403_bypass() {
     scheme="${url%%://*}"; rest="${url#*://}"; host="${rest%%/*}"
     case "$rest" in */*) path="/${rest#*/}" ;; *) path="/" ;; esac
     origin="$scheme://$host"
+    # Soft-404/catch-all baseline: a bogus path on this origin. Many servers route unknown
+    # paths (and X-Original-URL) to the homepage (200), which would look like a fake bypass.
+    bctl="$(curl -s -o /dev/null -w '%{http_code} %{size_download}' -L --max-time 8 ${CURL_NET[@]+"${CURL_NET[@]}"} "$origin/4tbz${RANDOM}x" 2>/dev/null || echo '000 0')"
+    bcode="${bctl%% *}"; bsz="${bctl##* }"
     for t in "$path/" "$path/." "/.$path" "$path%2e" "$path%20" "$path%09" "$path..;/" "$path?" ; do
-      code="$(curl -s -o /dev/null -w '%{http_code}' -L --max-time 8 ${CURL_NET[@]+"${CURL_NET[@]}"} "$origin$t" 2>/dev/null || echo 000)"
-      case "$code" in 200|201|202|203|206|301|302|307) printf '%s -> %s via path trick %s\n' "$url" "$code" "$origin$t" >> "$bypass_file"; n=$n ; break ;; esac
+      r="$(curl -s -o /dev/null -w '%{http_code} %{size_download}' -L --max-time 8 ${CURL_NET[@]+"${CURL_NET[@]}"} "$origin$t" 2>/dev/null || echo '000 0')"
+      code="${r%% *}"; sz="${r##* }"
+      case "$code" in 200|201|202|203|206|301|302|307) ;; *) continue ;; esac
+      { [ "$bcode" = "$code" ] && _near "$sz" "$bsz"; } && continue   # same as catch-all -> not a bypass
+      printf '%s -> %s via path trick %s\n' "$url" "$code" "$origin$t" >> "$bypass_file"; break
     done
     for h in "X-Forwarded-For: 127.0.0.1" "X-Original-URL: $path" "X-Rewrite-URL: $path" "X-Custom-IP-Authorization: 127.0.0.1" ; do
-      code="$(curl -s -o /dev/null -w '%{http_code}' --max-time 8 ${CURL_NET[@]+"${CURL_NET[@]}"} -H "$h" "$url" 2>/dev/null || echo 000)"
-      case "$code" in 200|201|202|203|206) printf '%s -> %s via header %s\n' "$url" "$code" "$h" >> "$bypass_file"; break ;; esac
+      r="$(curl -s -o /dev/null -w '%{http_code} %{size_download}' --max-time 8 ${CURL_NET[@]+"${CURL_NET[@]}"} -H "$h" "$url" 2>/dev/null || echo '000 0')"
+      code="${r%% *}"; sz="${r##* }"
+      case "$code" in 200|201|202|203|206) ;; *) continue ;; esac
+      { [ "$bcode" = 200 ] && _near "$sz" "$bsz"; } && continue       # homepage echo -> not a bypass
+      printf '%s -> %s via header %s\n' "$url" "$code" "$h" >> "$bypass_file"; break
     done
   done
 }
@@ -78,14 +88,21 @@ propagate_paths() {
   local paths; paths="$(awk -F'\t' '$1~/^(200|301|302|401|403)$/{print $3}' "$fuzz_findings_file" 2>/dev/null \
       | sed -E 's#^[a-z]+://[^/]+##' | grep -E '^/.' | drop_static | sort -u | head -n "$PROP_MAX_PATHS")"
   [ -n "$paths" ] || return 0
-  local origin p code
+  local origin p r code sz bctl bcode bsz
   while IFS= read -r origin; do
     [ -n "$origin" ] || continue
+    # per-origin soft-404/catch-all baseline (a sibling that 302->/login or serves an SPA
+    # shell for everything would otherwise report all propagated paths as "live").
+    bctl="$(curl -s -o /dev/null -w '%{http_code} %{size_download}' --max-time 8 ${CURL_NET[@]+"${CURL_NET[@]}"} "$origin/4tprop${RANDOM}x" 2>/dev/null || echo '000 0')"
+    bcode="${bctl%% *}"; bsz="${bctl##* }"
     while IFS= read -r p; do
       [ -n "$p" ] || continue
       grep -qF "$origin$p" "$fuzz_findings_file" 2>/dev/null && continue  # already known on this host
-      code="$(curl -s -o /dev/null -w '%{http_code}' --max-time 8 ${CURL_NET[@]+"${CURL_NET[@]}"} "$origin$p" 2>/dev/null || echo 000)"
-      case "$code" in 200|301|302|401|403) printf '%s\t%s\n' "$code" "$origin$p" >> "$prop_file" ;; esac
+      r="$(curl -s -o /dev/null -w '%{http_code} %{size_download}' --max-time 8 ${CURL_NET[@]+"${CURL_NET[@]}"} "$origin$p" 2>/dev/null || echo '000 0')"
+      code="${r%% *}"; sz="${r##* }"
+      case "$code" in 200|301|302|401|403) ;; *) continue ;; esac
+      { [ "$bcode" = "$code" ] && _near "$sz" "$bsz"; } && continue     # matches catch-all -> skip
+      printf '%s\t%s\n' "$code" "$origin$p" >> "$prop_file"
     done <<< "$paths"
   done <<< "$hosts"
 }

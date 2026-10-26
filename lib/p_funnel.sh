@@ -36,6 +36,8 @@ else
     set_stage $S_CRAWL running "katana crawling…"
     kcmd=(katana -silent -list "$alive_file" -d 2 -jc -kf all -c 15 -o "$OUTDIR/.katana.txt")
     [ "${#KATANA_NET[@]}" -gt 0 ] && kcmd+=("${KATANA_NET[@]}")
+    # authenticated crawl: never follow logout/session-kill links (would drop the session)
+    [ "$AVOID_LOGOUT" = 1 ] && [ "${#AUTH_H[@]}" -gt 0 ] && kcmd+=(-cos "$LOGOUT_RE")
     [ "$CRAWL_MAX_TIME" -gt 0 ] 2>/dev/null && have timeout && kcmd=(timeout "${CRAWL_MAX_TIME}s" "${kcmd[@]}")
     "${kcmd[@]}" >/dev/null 2>>"$llm_log" & kpid=$!
     kstart=$SECONDS
@@ -45,11 +47,36 @@ else
     wait "$kpid" 2>/dev/null || true
     [ -f "$OUTDIR/.katana.txt" ] && cat "$OUTDIR/.katana.txt" >> "$urls_file" && rm -f "$OUTDIR/.katana.txt"
   fi
+  # fold in content-discovery hits so crawling/API-spec detection/param-mining also see paths
+  # only ffuf/feroxbuster found (/v2/api-docs, /admin, /api/users, ...).
+  [ -s "${fuzz_findings_file:-/dev/null}" ] && awk -F'\t' '$1 ~ /^(200|204|301|302|307|401|403)$/ {print $3}' "$fuzz_findings_file" 2>/dev/null >> "$urls_file"
+  # Deep-JS: katana + archives surface .js bundles the pre-funnel JS stage (root-scrape only)
+  # missed. Mine a bounded set of NEW ones for secrets + endpoints before drop_static discards them.
+  if [ "$JSMINE" = 1 ] && [ -f "${js_urls_file:-/dev/null}" ]; then
+    deep_js="$(grep -aoiE "https?://([a-z0-9._-]+\.)?${esc_domain}[^ \"'\`]*\.js([?][^ \"'\`]*)?" "$urls_file" 2>/dev/null | sort -u | grep -vxF -f "$js_urls_file" 2>/dev/null | head -n "${DEEP_JS_MAX:-60}")"
+    while IFS= read -r dj; do
+      [ -n "$dj" ] || continue
+      jb="$(curl -s -L --max-time 12 ${CURL_NET[@]+"${CURL_NET[@]}"} "$dj" 2>/dev/null)"; [ -n "$jb" ] || continue
+      printf '%s' "$jb" | grep -aoE "$SECRET_RE" 2>/dev/null | sort -u | sed "s#^#${dj}\t#" >> "$js_secrets_file"
+      jorg="$(printf '%s' "$dj" | sed -E 's#(https?://[^/]+).*#\1#')"
+      { grep -aoiE "https?://([a-z0-9._-]+\.)?${esc_domain}[a-z0-9._/?=&%:-]*" <<<"$jb"
+        grep -aoE "[\"'\`]/[a-zA-Z0-9_./?=&%-]{2,}[\"'\`]" <<<"$jb" | tr -d "\"'\`" | sed "s#^#${jorg}#"
+        grep -aoE "[\"'\`](rest|api|graphql|v[0-9]+)/[a-zA-Z0-9_./?=&%-]{2,}[\"'\`]" <<<"$jb" | tr -d "\"'\`" | sed "s#^#${jorg}/#"
+      } 2>/dev/null >> "$js_endpoints_file"
+      printf '%s\n' "$dj" >> "$js_urls_file"
+    done <<< "$deep_js"
+    sort -u -o "$js_secrets_file" "$js_secrets_file"
+    [ -s "$js_endpoints_file" ] && grep -ivE '\.(png|jpe?g|gif|svg|woff2?|ttf|eot|css|ico|map)([?#]|$)' "$js_endpoints_file" | sort -u > "$js_endpoints_file.t" && mv "$js_endpoints_file.t" "$js_endpoints_file"
+  fi
   # fold in endpoints mined from source maps + JS bundles (SPA API surface); scoped+deduped below
   [ -s "${smap_endpoints_file:-/dev/null}" ] && cat "$smap_endpoints_file" >> "$urls_file"
   [ -s "${js_endpoints_file:-/dev/null}" ] && cat "$js_endpoints_file" >> "$urls_file"
   grep -iE "^https?://([a-z0-9._-]+\.)?${esc_domain}([:/]|$)" "$urls_file" 2>/dev/null \
     | sort -u | head -n "$CRAWL_MAX_URLS" > "$urls_file.tmp" && mv "$urls_file.tmp" "$urls_file"
+  # authenticated: strip logout/session-kill URLs so no downstream stage fetches them
+  if [ "$AVOID_LOGOUT" = 1 ] && [ "${#AUTH_H[@]}" -gt 0 ]; then
+    grep -viE "$LOGOUT_RE" "$urls_file" > "$urls_file.tmp" 2>/dev/null && mv "$urls_file.tmp" "$urls_file"
+  fi
   # Only URLs with a real ?k=v, and NOT static assets - so clustering, AI selection and
   # every downstream specialist work on genuine injectable endpoints.
   grep -E '\?[^=]+=' "$urls_file" 2>/dev/null | drop_static | sort -u > "$urls_params_file" || : > "$urls_params_file"
@@ -83,6 +110,12 @@ else
   fi
   # fallback / augment: if AI gave nothing, use all param exemplars (capped)
   [ -s "$targets_active_file" ] || cut -f2 "$OUTDIR/.patterns.tsv" | head -n "$ACT_MAX_JUICY" > "$targets_active_file"
+  # Path-only API/accessor endpoints have no ?k=v so the param clustering above dropped them -
+  # but REST/SPA bugs (BOLA, authz, injection in path segments) live there. Fold a bounded set
+  # of non-static api/rest/versioned/object-accessor paths straight into the active set so
+  # nuclei-dast, the agent and idor_check actually reach them.
+  grep -hiE 'https?://[^ "]+/(api|rest|graphql|v[0-9]+|users?|accounts?|orders?|invoices?|baskets?|carts?|products?|customers?|documents?|files?|messages?|tickets?|admin|internal|me|profile|billing|settings)([/?][^ "]*)?' "$urls_file" 2>/dev/null \
+    | grep -vE '\?[^=]+=' | drop_static | sort -u | head -n "$ACT_MAX_JUICY" >> "$targets_active_file"
   sort -u -o "$targets_active_file" "$targets_active_file"
   rm -f "$OUTDIR/.patterns_numbered.txt"
   active_total="$(nlines "$targets_active_file")"
@@ -104,9 +137,21 @@ else
       base="${h%/}"
       for p in "${api_probe_paths[@]}"; do
         u="$base$p"
-        code="$(curl -s -o /dev/null -w '%{http_code}' -L --max-time 10 \
-                 ${CURL_NET[@]+"${CURL_NET[@]}"} "$u" 2>/dev/null || echo 000)"
-        case "$code" in 200|401|403) printf '%s\n' "$u" >> "$api_specs_file" ;; esac
+        resp="$(curl -s -L --max-time 10 ${CURL_NET[@]+"${CURL_NET[@]}"} \
+                 -w $'\n4TSTAT %{http_code} %{content_type}' "$u" 2>/dev/null)"
+        code="$(printf '%s' "$resp" | tail -1 | awk '{print $2}')"
+        ctype="$(printf '%s' "$resp" | tail -1 | cut -d' ' -f3-)"
+        body="$(printf '%s' "$resp" | sed '$d' | head -c 400)"
+        case "$code" in
+          401|403) printf '%s\n' "$u" >> "$api_specs_file" ;;   # exists-but-protected is a real signal
+          200)
+            # Only a real spec: JSON/YAML/GraphQL by content-type OR body shape. Guards against
+            # SPA/catch-all hosts that serve index.html (200) for every unknown path.
+            if printf '%s' "$ctype" | grep -qiE 'json|yaml|graphql|javascript' \
+               || printf '%s' "$body" | grep -qiE '^\s*[{[]|"(openapi|swagger|paths|__schema)"|^\s*(openapi|swagger):'; then
+              printf '%s\n' "$u" >> "$api_specs_file"
+            fi ;;
+        esac
       done
     done < <(sort -u "$alive_file" 2>/dev/null | head -n 20)
     sort -u -o "$api_specs_file" "$api_specs_file"

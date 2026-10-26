@@ -181,7 +181,12 @@ else
     while [ "$(fuzz_running)" -ge "$p_eff" ]; do fuzz_reap; fuzz_status; render; sleep 0.25; done
     fuzzed=$((fuzzed + 1))
     combined="$fuzz_dir/.wl_${safe}.txt"
-    cat "${wls[@]}" 2>/dev/null | sort -u | head -n "$MAX_FUZZ_WORDS" > "$combined"
+    # authenticated fuzzing: drop logout/session-kill words so ffuf doesn't nuke the session
+    if [ "$AVOID_LOGOUT" = 1 ] && [ "${#AUTH_H[@]}" -gt 0 ]; then
+      cat "${wls[@]}" 2>/dev/null | grep -viE "$LOGOUT_RE" | sort -u | head -n "$MAX_FUZZ_WORDS" > "$combined"
+    else
+      cat "${wls[@]}" 2>/dev/null | sort -u | head -n "$MAX_FUZZ_WORDS" > "$combined"
+    fi
     names="$(printf '%s\n' "${wls[@]}" | sed 's#.*/##' | paste -sd+ -)"
     ext_flag="$(build_ext_flag "$techs")"
     printf '%s\t%s\t(%s words) exts:[%s]\n' "$url" "$names" "$(wc -l < "$combined")" "$ext_flag" >> "$fuzz_plan_file"

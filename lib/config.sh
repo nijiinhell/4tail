@@ -127,6 +127,10 @@ AUTH_A="${AUTH_A:-}"
 AUTH_B="${AUTH_B:-}"
 IDOR="${IDOR:-1}"                          # 1 = run the A/B/anon access-control diff when AUTH_A is set
 IDOR_MAX="${IDOR_MAX:-40}"                 # cap id-bearing URLs tested
+# When scanning authenticated, never REQUEST logout/session-kill paths (katana/ffuf/specialists
+# hitting /logout silently drops the session and the rest of the scan runs unauthenticated).
+AVOID_LOGOUT="${AVOID_LOGOUT:-1}"
+LOGOUT_RE="${LOGOUT_RE:-logout|signout|sign-out|log-out|logoff|log-off|deauth|revoke|/destroy|session/(delete|destroy|end)|/(exit|quit)(/|\\?|$)}"
 # PoC generation for body-based bug classes 4tail cannot safely fire itself (POST login/
 # register logic, body IDOR/SQLi, mass assignment, GraphQL mutations, CSRF). 4tail harvests
 # real form fields deterministically, then the AI writes runnable curl PoCs for the HUMAN to
