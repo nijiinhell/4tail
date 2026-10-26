@@ -115,6 +115,21 @@ CURL_NET=("${_hdr[@]}");   [ -n "$PROXY" ] && CURL_NET+=(-x "$PROXY")
 CURL_PROXY=(); [ -n "$PROXY" ] && CURL_PROXY+=(-x "$PROXY")
 [ "${#AUTH_H[@]}" -gt 0 ] && [ "$ASSUME_YES" != 1 ] && log "Auth: ${#AUTH_H[@]} header(s) will be sent to active tools"
 [ -n "$PROXY" ] && log "Proxy: routing active tools through $PROXY"
+# JWT pre-flight: if the session token is a JWT, warn when it is already expired or will
+# expire during the scan - a dead token silently turns an authenticated scan anonymous.
+if have jq; then
+  _jwt="$(printf '%s\n%s\n%s' "$AUTH_HEADER" "$AUTH_COOKIE" "$AUTH_A" | grep -oE 'eyJ[A-Za-z0-9_-]+\.eyJ[A-Za-z0-9_-]+' | head -1)"
+  if [ -n "$_jwt" ]; then
+    _pl="${_jwt#*.}"; _pad=$(( (4 - ${#_pl} % 4) % 4 )); _pl="$_pl$(printf '%*s' "$_pad" '' | tr ' ' '=')"
+    _exp="$(printf '%s' "$_pl" | tr '_-' '/+' | base64 -d 2>/dev/null | jq -r '.exp // empty' 2>/dev/null)"
+    if [ -n "$_exp" ] && printf '%s' "$_exp" | grep -qE '^[0-9]+$'; then
+      _now="$(date +%s)"
+      if [ "$_exp" -le "$_now" ]; then warn "Auth JWT is ALREADY EXPIRED ($(date -u -d "@$_exp" 2>/dev/null || echo "$_exp")) - the scan will run UNAUTHENTICATED. Refresh the token."
+      elif [ "$((_exp - _now))" -lt 1800 ]; then warn "Auth JWT expires in <30min ($(( (_exp-_now)/60 ))m) - it may die mid-scan; refresh it for a long run."
+      fi
+    fi
+  fi
+fi
 
 # ---------------------------------------------------------------------------
 # Dependency checks
@@ -213,6 +228,7 @@ if [ "$DOCTOR" != 1 ]; then
   findings_dir="$OUTDIR/findings"; mkdir -p "$findings_dir"  # per-specialist output
   forms_file="$OUTDIR/forms.txt"                   # harvested POST/GET form fields (for PoC accuracy)
   poc_file="$OUTDIR/poc_requests.sh"               # AI-written MANUAL curl PoCs (4tail never runs these)
+  takeover_file="$OUTDIR/takeover.txt"             # dangling-CNAME subdomain-takeover candidates
   dns_hygiene_file="$OUTDIR/dns_hygiene.txt"       # SPF/DMARC/zone-transfer findings
   sec_headers_file="$OUTDIR/security_headers.txt"  # clickjacking / HSTS / CSP / cookie-flag findings
   versions_file="$OUTDIR/versioned_components.txt" # product:version pairs for CVE matching

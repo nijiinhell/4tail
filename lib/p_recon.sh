@@ -93,6 +93,25 @@ if [ "$USE_CDNCHECK" = 1 ] && have cdncheck && [ "${alive_count:-0}" -ge "$CDNCH
   rm -f "$OUTDIR/.cdncheck.txt"
 fi
 
+# Subdomain takeover: a dangling CNAME to an unclaimed cloud backend often returns NXDOMAIN or
+# refuses HTTP, so httpx drops it and nuclei's takeover tag never sees it. Check the CNAMEs of
+# subdomains that did NOT go live against takeover-prone providers. (Requires a resolver CLI.)
+: > "$takeover_file"
+if [ "$TAKEOVER_CHECK" = 1 ] && [ "$NO_ARCHIVE" != 1 ] && { have dnsx || have dig || have host; } && [ -s "$subdomains_file" ]; then
+  set_stage $S_LIVE running "$alive_count live · subdomain-takeover check"
+  _cname() { if have dig; then dig +short CNAME "$1" 2>/dev/null | sed 's/\.$//'
+             elif have dnsx; then printf '%s\n' "$1" | dnsx -silent -cname -resp-only 2>/dev/null | sed 's/\.$//'
+             elif have host; then host -t CNAME "$1" 2>/dev/null | awk '/alias for/{print $NF}' | sed 's/\.$//'; fi; }
+  _live_hosts="$(sed -E 's#^[a-z]+://##; s#[:/].*##' "$alive_file" 2>/dev/null | sort -u)"
+  while IFS= read -r sd; do
+    [ -n "$sd" ] || continue
+    printf '%s\n' "$_live_hosts" | grep -qxF "$sd" && continue   # live hosts: nuclei takeover tag covers them
+    cn="$(_cname "$sd" | head -1)"; [ -n "$cn" ] || continue
+    printf '%s' "$cn" | grep -qiE "$TAKEOVER_RE" \
+      && echo "[takeover-candidate] $sd -> CNAME $cn (dangling CNAME to a takeover-prone provider; verify the backend is unclaimed)" >> "$takeover_file"
+  done < <(sort -u "$subdomains_file" | head -n 200)
+fi
+
 # DNS / email hygiene (cheap, high-signal recon): missing/weak SPF+DMARC = email spoofing;
 # an open zone transfer (AXFR) dumps the whole internal DNS map. Uses whatever resolver CLI
 # is installed (dig > dnsx > host); skipped silently if none can answer.

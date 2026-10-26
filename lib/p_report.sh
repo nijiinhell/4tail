@@ -148,6 +148,9 @@ $(head -c 1500 "${prop_file:-/dev/null}" 2>/dev/null)
 === versioned components (map each to specific known CVEs) ===
 $(head -c 2000 "${versions_file:-/dev/null}" 2>/dev/null)
 
+=== subdomain takeover candidates (dangling CNAME to unclaimed backend; CONFIRMED-ish, rank high) ===
+$(head -c 1500 "${takeover_file:-/dev/null}" 2>/dev/null)
+
 === DNS / email hygiene (SPF/DMARC spoofing, zone transfer) ===
 $(head -c 1500 "${dns_hygiene_file:-/dev/null}" 2>/dev/null)
 
@@ -217,6 +220,8 @@ if have jq; then
     [ -f "$findings_dir/sqlmap.txt" ] && while IFS= read -r l; do [ -n "$l" ] && emit_f sqli high sqlmap "" "$l"; done < "$findings_dir/sqlmap.txt"
     [ -f "$js_secrets_file" ] && while IFS=$'\t' read -r u m; do [ -n "$m" ] && emit_f secret medium js-mining "$u" "$m"; done < "$js_secrets_file"
     [ -f "${sourcemap_file:-}" ] && while IFS= read -r l; do [ -n "$l" ] && emit_f source-map medium js-mining "$l" "source map exposed - original source reconstructed from $l"; done < "$sourcemap_file"
+    [ -f "${takeover_file:-}" ] && while IFS= read -r l; do [ -n "$l" ] || continue
+        emit_f subdomain-takeover high dns "$(printf '%s' "$l" | awk '{print $2}')" "$l"; done < "$takeover_file"
     [ -f "${dns_hygiene_file:-}" ] && while IFS= read -r l; do [ -n "$l" ] || continue
         case "$l" in *zone-transfer*) _s=high ;; *) _s=low ;; esac
         emit_f "$(printf '%s' "$l" | grep -oE '^\[[a-z-]+\]' | tr -d '[]')" "$_s" dns-hygiene "$domain" "$l"; done < "$dns_hygiene_file"
@@ -268,6 +273,7 @@ if [ "$CRAWL" = 1 ]; then
 fi
 [ "$OAST" = 1 ] && tally="$tally  $(cov oast interactsh-client 1 "$(nlines "${oast_hits_file:-/dev/null}")")"
 [ "$AGENT" = 1 ] && tally="$tally  agent:$(nlines "${agent_file:-/dev/null}")"
+[ -s "${takeover_file:-/dev/null}" ] && tally="$tally  takeover:$(nlines "$takeover_file")"
 [ "$DNS_HYGIENE" = 1 ] && tally="$tally  dns-hygiene:$(nlines "${dns_hygiene_file:-/dev/null}")"
 [ "$SEC_HEADERS" = 1 ] && tally="$tally  sec-headers:$(nlines "${sec_headers_file:-/dev/null}")"
 [ -s "${sourcemap_file:-/dev/null}" ] && tally="$tally  sourcemaps:$(nlines "$sourcemap_file")"
