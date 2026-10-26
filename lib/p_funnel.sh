@@ -320,7 +320,9 @@ $(cat "$OUTDIR/.patterns_numbered.txt")" >"$jout" 2>>"$llm_log" || true
   if { has_spec kxss && { have kxss || have Gxss; }; } && [ -s "$targets_active_file" ]; then
     set_stage $S_CRAWL running "kxss: probing reflection"; render
     xtool="kxss"; have kxss || xtool="Gxss"
-    head -n "$ACT_MAX_KXSS" "$targets_active_file" | "$xtool" 2>/dev/null > "$findings_dir/kxss.txt" || true
+    # kxss only tests query params - feed it ONLY ?k=v URLs so the cap isn't spent on the
+    # parameterless REST paths now folded into the active set.
+    grep -aE '\?[^=]+=' "$targets_active_file" 2>/dev/null | head -n "$ACT_MAX_KXSS" | "$xtool" 2>/dev/null > "$findings_dir/kxss.txt" || true
   fi
   # XSS confirm: dalfox on the URLs kxss just flagged as reflecting (chained!) plus the
   # gf xss-bucket; only if neither yields anything do we fall back to the full active set.
@@ -330,7 +332,7 @@ $(cat "$OUTDIR/.patterns_numbered.txt")" >"$jout" 2>>"$llm_log" || true
     grep -iE '^xss\t' "$gf_file" 2>/dev/null | cut -f2 >> "$xq"                 # gf xss-bucket
     # collapse value-variants (/s?q=1 /s?q=2 -> one) so dalfox tests each endpoint once
     if have qsreplace; then qsreplace FUZZ < "$xq" 2>/dev/null | sort -u | qsreplace 1 2>/dev/null | sort -u -o "$xq"; else sort -u -o "$xq" "$xq"; fi
-    [ -s "$xq" ] || cp "$targets_active_file" "$xq"                             # fallback: whole active set
+    [ -s "$xq" ] || grep -aE '\?[^=]+=' "$targets_active_file" 2>/dev/null > "$xq"   # fallback: query URLs only (dalfox needs params)
     dfx=(dalfox pipe --silence --skip-bav -o "$findings_dir/dalfox.txt"); [ "${#DALFOX_NET[@]}" -gt 0 ] && dfx+=("${DALFOX_NET[@]}")
     ( head -n "$ACT_MAX_DALFOX" "$xq" | tmo "$DALFOX_MAX_TIME" "${dfx[@]}" >/dev/null 2>>"$llm_log" ) & SPIDS+=($!)
   fi

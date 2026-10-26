@@ -855,8 +855,10 @@ concatenates the sections into `dist/4tail.sh`, byte-identical to the classic st
 script — copy that one file to a box with no `lib/`.
 
 Make targets: `make check` (syntax-check entrypoint + sections), `make lint` (ShellCheck,
-if installed), `make test` (offline smoke test — serves a fixture, stubs httpx/nuclei/ffuf,
-and asserts the JS discovery → endpoint mining → funnel → findings.json flow), `make build`.
+if installed), `make test` (offline smoke test — serves a fixture, stubs httpx/nuclei/ffuf, and asserts the
+JS discovery → endpoint mining → funnel → findings.json flow; a second phase uses a **mock
+`curl`** that returns canned LLM responses to exercise the AI parsers — plan tags, triage
+extraction, reasoning-strip, cost math — with no network and no spend), `make build`.
 
 **Docker:** `docker build -t 4tail .` bakes in the whole toolset (subfinder/httpx/nuclei/
 katana/ffuf/dalfox/kxss/gau/… + SecLists + nuclei templates), then
