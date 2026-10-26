@@ -122,7 +122,8 @@ GRAPHQL_MAX="${GRAPHQL_MAX:-5}"           # cap GraphQL endpoints probed for ope
 BYPASS="${BYPASS:-1}"                      # 403/401 -> try proven access-control bypasses
 BYPASS_MAX="${BYPASS_MAX:-20}"             # cap how many 403/401 URLs to probe
 PROPAGATE="${PROPAGATE:-1}"                # replay interesting discovered paths across all live hosts
-PROP_MAX_PATHS="${PROP_MAX_PATHS:-60}"     # cap paths replayed per host
+PROP_MAX_PATHS="${PROP_MAX_PATHS:-25}"     # cap paths replayed per host (serial curl; keep modest)
+PROP_MAX_HOSTS="${PROP_MAX_HOSTS:-15}"     # cap hosts replayed across (PROP_MAX_HOSTS x PROP_MAX_PATHS serial requests)
 # Dual-identity IDOR / broken-authz: supply one or two sessions; each is a header line
 # ("Cookie: ..." or "Authorization: Bearer ...").  A is required; B optional (horizontal test).
 AUTH_A="${AUTH_A:-}"

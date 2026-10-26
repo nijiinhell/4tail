@@ -112,8 +112,12 @@ else
       stale_hint=" These hosts look the most legacy/outdated (older stack = higher bug likelihood, prioritize their URLs): $(awk -F'\t' '{printf "%s(%s) ",$2,$3}' "$stale_file" | head -c 500)."
     jout="$(mktemp)"
     ai_call "$LLM_MODEL_PLAN" 1500 \
-      "You are an expert bug-bounty hunter. From the numbered endpoint patterns, select the ones MOST likely to hold IDOR, SQLi, XSS, SSRF, LFI, open-redirect or logic flaws, given the focus areas: $ACT_FOCUS.${stale_hint} Ignore static assets (js/css/img/fonts), analytics, and generic CMS noise. Reply with ONLY a comma-separated list of the numbers you pick (max $ACT_MAX_JUICY), nothing else." \
-      "$(cat "$OUTDIR/.patterns_numbered.txt")" >"$jout" 2>>"$llm_log" || true
+      "You are an expert bug-bounty hunter. From the numbered endpoint patterns, select the ones MOST likely to hold IDOR, SQLi, XSS, SSRF, LFI, open-redirect or logic flaws, given the focus areas: $ACT_FOCUS.${stale_hint} Use the TECH SURFACE below to prefer endpoints that fit the stack (e.g. .asp/.aspx on IIS, /wp-json on WordPress, /api + json on a REST/SPA backend). Ignore static assets (js/css/img/fonts), analytics, and generic CMS noise. Reply with ONLY a comma-separated list of the numbers you pick (max $ACT_MAX_JUICY), nothing else." \
+      "=== TECH SURFACE ===
+$(head -c 2000 "$tech_brief" 2>/dev/null)
+
+=== NUMBERED ENDPOINT PATTERNS ===
+$(cat "$OUTDIR/.patterns_numbered.txt")" >"$jout" 2>>"$llm_log" || true
     # parse chosen line numbers -> exemplar URLs
     sel="$(grep -oE '[0-9]+' "$jout" | sort -un | head -n "$ACT_MAX_JUICY")"; rm -f "$jout"
     if [ -n "$sel" ]; then
@@ -128,6 +132,12 @@ else
   # nuclei-dast, the agent and idor_check actually reach them.
   grep -hiE 'https?://[^ "]+/(api|rest|graphql|v[0-9]+|users?|accounts?|orders?|invoices?|baskets?|carts?|products?|customers?|documents?|files?|messages?|tickets?|admin|internal|me|profile|billing|settings)([/?][^ "]*)?' "$urls_file" 2>/dev/null \
     | grep -vE '\?[^=]+=' | drop_static | sort -u | head -n "$ACT_MAX_JUICY" >> "$targets_active_file"
+  # Endpoints mined from LIVE JS bundles + source maps are high-signal (the app's own API) -
+  # guarantee a bounded set is tested even if the AI selector didn't pick them from the flat
+  # pattern list (Wayback noise can crowd them out).
+  { [ -s "${js_endpoints_file:-/dev/null}" ] && cut -f2 <(cluster_urls < "$js_endpoints_file") 2>/dev/null | sort -u | head -n 40
+    [ -s "${smap_endpoints_file:-/dev/null}" ] && cut -f2 <(cluster_urls < "$smap_endpoints_file") 2>/dev/null | sort -u | head -n 40
+  } 2>/dev/null | drop_static >> "$targets_active_file"
   sort -u -o "$targets_active_file" "$targets_active_file"
   rm -f "$OUTDIR/.patterns_numbered.txt"
   active_total="$(nlines "$targets_active_file")"
