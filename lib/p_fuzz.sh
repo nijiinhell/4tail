@@ -121,9 +121,15 @@ else
     # origins so we don't fuzz the same thing hundreds of times.
     hosts_tsv="$(jq -r '
         ((.cname // (.a[0]? // .host)) | tostring) as $origin
+        | (.url | sub("^https?://";"") | sub("[:/].*";"")) as $host
+        # generic/empty roots -> keyed per hostname (keep distinct microservices behind one IP);
+        # content-rich identical pages -> collapsed by shared signature.
+        | (if ((.title // "") == "") or ((.content_length // 0) < 256)
+           then $host
+           else ($origin + "|" + (.status_code|tostring) + "|" + ((.content_length//0)|tostring) + "|" + (.title//"")) end) as $sig
         | [ (.url),
             ((.tech // []) | map(ascii_downcase) | join(",")),
-            ($origin + "|" + (.status_code|tostring) + "|" + ((.content_length//0)|tostring) + "|" + (.title//"")) ]
+            $sig ]
         | @tsv' "$httpx_json" 2>/dev/null \
       | awk -F'\t' '!seen[$3]++ {print $1"\t"$2}' | sort -u)"
   else

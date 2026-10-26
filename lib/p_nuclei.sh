@@ -10,11 +10,19 @@ nuclei_targets_file="$OUTDIR/nuclei_targets.txt"
 if [ "$NUCLEI_DEDUPE" = 1 ] && [ -s "$httpx_json" ]; then
   jq -r '
       ((.cname // (.a[0]? // .host)) | tostring) as $o
+      | (.url | sub("^https?://";"") | sub("[:/].*";"")) as $host
+      # Dedup key: collapse only CONTENT-RICH pages that are truly identical across vhosts
+      # (shared origin + status + length + title). A generic/empty root (401/404, no title, or
+      # tiny body) is keyed per HOSTNAME instead, so distinct microservices behind one gateway
+      # IP (users-api / payments-api, all "404 Not Found" at /) are NOT collapsed away.
+      | (if ((.title // "") == "") or ((.content_length // 0) < 256)
+         then $host
+         else ($o + "|" + (.status_code|tostring) + "|" + ((.content_length//0)|tostring) + "|" + (.title//"")) end) as $sig
       | [ .url,
           ((.tech // []) | map(ascii_downcase) | join(",")),
           (.status_code|tostring),
           (.title // ""),
-          ($o + "|" + (.status_code|tostring) + "|" + ((.content_length//0)|tostring) + "|" + (.title//"")) ]
+          $sig ]
       | @tsv' "$httpx_json" 2>/dev/null \
     | awk -F'\t' '!seen[$5]++' \
     | { [ "$NUCLEI_SKIP_CDN" = 1 ] && grep -viE "$CDN_RE" || cat; } \

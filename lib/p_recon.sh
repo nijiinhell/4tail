@@ -14,7 +14,9 @@ if [ "$SINGLE" = 1 ]; then
 elif done_marker subs && [ -s "$subdomains_file" ]; then
   set_stage $S_SUBS done "$(wc -l <"$subdomains_file") subs (resumed)"
 else
-  run_stage $S_SUBS "$subdomains_file" " subs" subfinder -silent -d "$domain" -o "$subdomains_file"
+  # -all uses every passive source (higher recall); SUBFINDER_ALL=0 to keep it lean/fast.
+  _sf_all=(); [ "${SUBFINDER_ALL:-1}" = 1 ] && _sf_all=(-all)
+  run_stage $S_SUBS "$subdomains_file" " subs" subfinder -silent "${_sf_all[@]}" -d "$domain" -o "$subdomains_file"
   # subfinder enumerates subdomains OF the target but not the target host itself; always
   # include it (and www.) so a specific host like testasp.vulnweb.com is actually probed.
   { printf '%s\n' "$domain" "www.$domain"; cat "$subdomains_file" 2>/dev/null; } | sort -u > "$subdomains_file.tmp" \
@@ -64,8 +66,10 @@ else
     dnsx -silent -l "$subdomains_file" -wd "$domain" -o "$resolved_file" 2>>"$llm_log" || true
     [ -s "$resolved_file" ] && probe_input="$resolved_file"
   fi
+  # -fhr follows a host's redirect (http->https, /->/login) so tech/title/length come from the
+  # real destination, not the bare redirect - better tech_brief and dedup signatures.
   run_stage $S_LIVE "$httpx_json" " live" \
-    httpx -silent -json -tech-detect -status-code -title -web-server -ip -cname \
+    httpx -silent -json -tech-detect -status-code -title -web-server -ip -cname -fhr \
           ${HTTPX_NET[@]+"${HTTPX_NET[@]}"} \
           -threads "$HTTPX_THREADS" -l "$probe_input" -o "$httpx_json"
   touch "$OUTDIR/.done_httpx"
@@ -125,12 +129,21 @@ if [ "$SEC_HEADERS" = 1 ]; then
   set_stage $S_LIVE running "$alive_count live · security headers"
   sort -u "$alive_file" 2>/dev/null | head -n "$SEC_HEADERS_MAX" | while IFS= read -r u; do
     [ -n "$u" ] || continue
-    hdrs="$(curl -s -D - -o /dev/null -L --max-time 8 ${CURL_NET[@]+"${CURL_NET[@]}"} "$u" 2>/dev/null | tr -d '\r')"
+    resp="$(curl -s -D - -o /dev/null -L --max-time 8 ${CURL_NET[@]+"${CURL_NET[@]}"} -w $'\n4TCT %{content_type}' "$u" 2>/dev/null | tr -d '\r')"
+    ctype="$(printf '%s' "$resp" | sed -n 's/^4TCT //p' | tail -1)"
+    # Keep ONLY the FINAL response's header block (-L dumps every redirect hop's headers;
+    # merging them produced false 'present/missing' results). awk paragraph-mode -> last HTTP block.
+    hdrs="$(printf '%s' "$resp" | sed '/^4TCT /d' | awk -v RS='' '/^HTTP\//{h=$0} END{print h}')"
     [ -n "$hdrs" ] || continue
     lc="$(printf '%s' "$hdrs" | tr 'A-Z' 'a-z')"
     miss=""
-    printf '%s' "$lc" | grep -q 'x-frame-options' || printf '%s' "$lc" | grep -q 'frame-ancestors' || miss="$miss clickjacking(no-XFO/frame-ancestors)"
-    printf '%s' "$lc" | grep -q 'content-security-policy' || miss="$miss no-CSP"
+    # Clickjacking / CSP only apply to HTML documents - skip them on JSON/API responses
+    # (bug-bounty programs reject "missing XFO on an API" as not-applicable noise).
+    case "$ctype" in *json*|*xml*|*javascript*|*octet-stream*) _is_doc=0 ;; *) _is_doc=1 ;; esac
+    if [ "$_is_doc" = 1 ]; then
+      printf '%s' "$lc" | grep -q 'x-frame-options' || printf '%s' "$lc" | grep -q 'frame-ancestors' || miss="$miss clickjacking(no-XFO/frame-ancestors)"
+      printf '%s' "$lc" | grep -q 'content-security-policy' || miss="$miss no-CSP"
+    fi
     case "$u" in https://*) printf '%s' "$lc" | grep -q 'strict-transport-security' || miss="$miss no-HSTS" ;; esac
     # cookie flags: inspect each Set-Cookie
     printf '%s' "$hdrs" | grep -iE '^set-cookie:' | while IFS= read -r ck; do
@@ -185,14 +198,17 @@ if [ "$STALE_RANK" = 1 ] && have jq && [ -s "$httpx_json" ]; then
     case "$lc" in *iis/5*|*iis/6*|*iis/7*|*iis/8*) score=$((score+3)); ev="$ev,EOL-IIS";; esac
     case "$lc" in *apache/2.0*|*apache/2.2*)       score=$((score+3)); ev="$ev,EOL-Apache";; esac
     case "$lc" in *nginx/0.*|*nginx/1.0*|*nginx/1.1*|*nginx/1.2*|*nginx/1.4*) score=$((score+2)); ev="$ev,old-nginx";; esac
-    case "$lc" in *php/4*|*php/5*)                 score=$((score+3)); ev="$ev,EOL-PHP";; esac
+    case "$lc" in *php/4*|*php/5*|*php/7.0*|*php/7.1*) score=$((score+3)); ev="$ev,EOL-PHP";; esac
     case "$lc" in *frontpage*)                     score=$((score+2)); ev="$ev,FrontPage";; esac
-    case "$lc" in *tinymce*)                       score=$((score+2)); ev="$ev,TinyMCE";; esac
-    case "$lc" in *coldfusion*)                    score=$((score+3)); ev="$ev,ColdFusion";; esac
-    case "$lc" in *jquery*)                        score=$((score+1)); ev="$ev,jQuery";; esac
-    case "$lc" in *bootstrap*)                     score=$((score+1)); ev="$ev,Bootstrap";; esac
-    case "$lc" in *wordpress*|*drupal*|*joomla*)   score=$((score+1)); ev="$ev,legacy-CMS";; esac
-    case "$lc" in *asp.net*|*microsoft*)           score=$((score+1)); ev="$ev,ASP.NET";; esac
+    case "$lc" in *coldfusion*|*struts*)           score=$((score+3)); ev="$ev,legacy-framework";; esac
+    case "$lc" in *wordpress*|*drupal*|*joomla*|*magento*) score=$((score+1)); ev="$ev,CMS";; esac
+    # Modern-but-outdated stacks (the real EOL risk now) - match OLD major versions only, so a
+    # current .NET 8 / Bootstrap 5 / Next 14 host is NOT scored as "legacy".
+    case "$lc" in *angularjs*|*"angular "1.*|*angular/1.*) score=$((score+3)); ev="$ev,AngularJS-1.x";; esac
+    case "$lc" in *"vue"*2.*|*vue/2.*)             score=$((score+2)); ev="$ev,Vue2";; esac
+    case "$lc" in *"spring"*boot*1.*|*springboot/1*) score=$((score+2)); ev="$ev,SpringBoot-1.x";; esac
+    case "$lc" in *jenkins*|*gitlab*|*grafana*|*confluence*|*jira*|*weblogic*|*websphere*|*jboss*) score=$((score+2)); ev="$ev,ops-app(check-version)";; esac
+    case "$lc" in *express*3.*|*express/3*|*express*2.*) score=$((score+2)); ev="$ev,old-Express";; esac
     [ "$score" -gt 0 ] && printf '%d\t%s\t%s\n' "$score" "$local_url" "${ev#,}" >> "$stale_file"
   done < "$httpx_json"
   if [ -s "$stale_file" ]; then

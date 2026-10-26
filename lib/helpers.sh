@@ -185,17 +185,23 @@ verify_findings() {
   [ "$VERIFY" = 1 ] || return 0
   : > "$verified_file"
   local u r1 r2 rc s1 z1 s2 z2 sc zc cu
-  { [ -f "${agent_file:-}" ]  && grep -oiE 'https?://[^ |]+' "$agent_file"
-    [ -f "${bypass_file:-}" ] && grep -oiE 'https?://[^ |]+' "$bypass_file"
+  # Only verify findings where a plain GET re-test is MEANINGFUL: DAST (LFI/path reflection),
+  # GET-confirmed agent probes, and IDOR candidates. We deliberately SKIP:
+  #   - access-control bypasses (bypass_file): need the exact header/path trick, not a bare GET;
+  #   - CORS (corsy_file): only manifests in response headers to an Origin request;
+  #   - agent POST confirms + SECRET-LOOT lines: re-testing with GET is the wrong method.
+  { [ -f "${agent_file:-}" ]  && grep -ivE '(^|[[:space:]])POST |SECRET-LOOT' "$agent_file" | grep -oiE 'https?://[^ |]+'
     [ -f "${idor_file:-}" ]   && grep -oiE 'https?://[^ |]+' "$idor_file"
     [ -f "${dast_file:-}" ]   && grep -oiE 'https?://[^ |]+' "$dast_file"
-    [ -f "${corsy_file:-}" ]  && grep -oiE 'https?://[^ |]+' "$corsy_file"
   } 2>/dev/null | sort -u | head -n 60 | while IFS= read -r u; do
     [ -n "$u" ] || continue
     r1="$(curl -s -o /dev/null -w '%{http_code} %{size_download}' -L --max-time 12 ${CURL_NET[@]+"${CURL_NET[@]}"} "$u" 2>/dev/null || echo '000 0')"
     r2="$(curl -s -o /dev/null -w '%{http_code} %{size_download}' -L --max-time 12 ${CURL_NET[@]+"${CURL_NET[@]}"} "$u" 2>/dev/null || echo '000 0')"
     s1="${r1%% *}"; z1="${r1##* }"; s2="${r2%% *}"; z2="${r2##* }"
-    cu="$(printf '%s' "$u" | sed -E "s#(\?.*)?\$#/4tailctl${RANDOM}&#")"
+    # Control = a nonexistent LEAF in the SAME directory, query preserved. (The old form inserted
+    # a path segment before the query -> /page.php/ctl?id=1 still executes page.php via PathInfo
+    # on PHP/IIS and returned the real page, falsely nuking valid findings.)
+    cu="$(printf '%s' "$u" | sed -E 's#^(https?://[^/]+/([^?]*/)?)[^/?]*(\?.*)?$#\14tctl'"${RANDOM}"'\3#')"
     rc="$(curl -s -o /dev/null -w '%{http_code} %{size_download}' -L --max-time 12 ${CURL_NET[@]+"${CURL_NET[@]}"} "$cu" 2>/dev/null || echo '000 0')"
     sc="${rc%% *}"; zc="${rc##* }"
     if [ "$s1" = "$s2" ] && _near "$z1" "$z2" && [ "$s1" != 000 ] && { [ "$s1" != "$sc" ] || ! _near "$z1" "$zc"; }; then

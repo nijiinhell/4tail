@@ -3,13 +3,26 @@
 has_spec() { case ",$ACT_SPECIALISTS," in *",$1,"*) return 0;; *) return 1;; esac; }
 # Deterministic URL clustering: collapse ids/uuids/hashes/values so 5000 URLs -> ~N patterns.
 cluster_urls() {  # stdin: urls -> stdout: pattern<TAB>example-url
+  local u p base q
   while IFS= read -r u; do
     [ -z "$u" ] && continue
-    p="$(printf '%s' "$u" \
+    base="${u%%\?*}"; q=""; case "$u" in *\?*) q="${u#*\?}" ;; esac
+    # collapse ID-ish path segments so N product/user pages become one pattern (not N).
+    base="$(printf '%s' "$base" \
       | sed -E 's#/[0-9a-fA-F]{8}-[0-9a-fA-F-]{20,}#/{uuid}#g' \
-      | sed -E 's#=[^&]*#={v}#g' \
-      | sed -E 's#/[0-9]+(/|\?|$)#/{id}\1#g' \
-      | sed -E 's#/[0-9a-fA-F]{12,}(/|\?|$)#/{hash}\1#g')"
+      | sed -E 's#/[0-9]+(/|$)#/{id}\1#g' \
+      | sed -E 's#/[0-9a-fA-F]{24}(/|$)#/{objectid}\1#g' \
+      | sed -E 's#/[0-9a-fA-F]{12,}(/|$)#/{hash}\1#g' \
+      | sed -E 's#/[A-Za-z0-9_-]{16,}(/|$)#/{token}\1#g' \
+      | sed -E 's#/[A-Za-z0-9]+-[A-Za-z0-9-]{6,}(/|$)#/{slug}\1#g')"
+    # normalize the query: sort params by name and blank values, so ?a=1&b=2 and ?b=9&a=5
+    # (and value variants) cluster to one pattern keyed on the param SET.
+    if [ -n "$q" ]; then
+      q="$(printf '%s' "$q" | tr '&' '\n' | sed -E 's#=.*#={v}#' | sort -u | paste -sd'&' -)"
+      p="$base?$q"
+    else
+      p="$base"
+    fi
     printf '%s\t%s\n' "$p" "$u"
   done
 }
@@ -34,7 +47,7 @@ else
   fi
   if have katana; then
     set_stage $S_CRAWL running "katana crawling…"
-    kcmd=(katana -silent -list "$alive_file" -d 2 -jc -kf all -c 15 -o "$OUTDIR/.katana.txt")
+    kcmd=(katana -silent -list "$alive_file" -d 2 -jc -kf all -c 15 -ef png,jpg,jpeg,gif,svg,ico,webp,woff,woff2,ttf,eot,otf,css,mp4,mp3,pdf,zip -o "$OUTDIR/.katana.txt")
     [ "${#KATANA_NET[@]}" -gt 0 ] && kcmd+=("${KATANA_NET[@]}")
     # authenticated crawl: never follow logout/session-kill links (would drop the session)
     [ "$AVOID_LOGOUT" = 1 ] && [ "${#AUTH_H[@]}" -gt 0 ] && kcmd+=(-cos "$LOGOUT_RE")
@@ -201,9 +214,17 @@ else
       [ "$gql_n" -ge "${GRAPHQL_MAX:-5}" ] && break
       gql_n=$((gql_n+1))
       set_stage $S_CRAWL running "graphql introspection $gql_n ($gql)"
+      # Try GET first (read-only), then fall back to a POST with a JSON body - most modern
+      # GraphQL servers (Apollo v4, Yoga, Hasura, HotChocolate) disable GET and only answer
+      # introspection on a standard POST. The POST body is a query (no mutation), still safe.
       gresp="$(curl -s -G --max-time 12 ${CURL_NET[@]+"${CURL_NET[@]}"} \
                  -H 'Content-Type: application/json' \
                  --data-urlencode "query=$gql_q" "$gql" 2>/dev/null | head -c 400000)"
+      if ! printf '%s' "$gresp" | jq -e '.data.__schema.types | length > 0' >/dev/null 2>&1; then
+        gresp="$(curl -s -X POST --max-time 12 ${CURL_NET[@]+"${CURL_NET[@]}"} \
+                   -H 'Content-Type: application/json' \
+                   --data "$(jq -nc --arg q "$gql_q" '{query:$q}')" "$gql" 2>/dev/null | head -c 400000)"
+      fi
       # introspection is OPEN only if the server actually returned a __schema with its types
       printf '%s' "$gresp" | jq -e '.data.__schema.types | length > 0' >/dev/null 2>&1 || continue
       {
