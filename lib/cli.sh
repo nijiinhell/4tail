@@ -102,6 +102,10 @@ FFUF_NET=("${_hdr[@]}");   [ -n "$PROXY" ] && FFUF_NET+=(-x "$PROXY")
 KATANA_NET=("${_hdr[@]}"); [ -n "$PROXY" ] && KATANA_NET+=(-proxy "$PROXY")
 DALFOX_NET=("${_hdr[@]}"); [ -n "$PROXY" ] && DALFOX_NET+=(--proxy "$PROXY")
 CURL_NET=("${_hdr[@]}");   [ -n "$PROXY" ] && CURL_NET+=(-x "$PROXY")
+# Proxy-only net (NO auth headers): for requests that must NOT carry identity A's session -
+# the IDOR "anonymous" and "user B" legs. Using CURL_NET there would send A's cookie and
+# falsely flag every readable URL as anon-accessible.
+CURL_PROXY=(); [ -n "$PROXY" ] && CURL_PROXY+=(-x "$PROXY")
 [ "${#AUTH_H[@]}" -gt 0 ] && [ "$ASSUME_YES" != 1 ] && log "Auth: ${#AUTH_H[@]} header(s) will be sent to active tools"
 [ -n "$PROXY" ] && log "Proxy: routing active tools through $PROXY"
 

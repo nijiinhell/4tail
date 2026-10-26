@@ -90,51 +90,69 @@ propagate_paths() {
 
 # (#1) Dual-identity IDOR / broken-authz (Autorize-style): replay A's authorized requests
 # as user B and as anon; same successful response = per-user authz not enforced.
+# Looks-like-an-auth-wall/error body, not a real resource (SPA shell, login page, JSON error
+# envelope that still returns 200). Used to reject IDOR false positives.
+_looks_denied() { printf '%s' "$1" | grep -qiE 'please (log|sign)[ -]?in|name=["'"'"']?password|type=["'"'"']?password|<title>[^<]*(log[ -]?in|sign[ -]?in)|"(error|errors|message)"[[:space:]]*:[[:space:]]*"?[^"]*(unauthori|forbidden|denied|invalid|not allowed|must (log|sign)|authentication)|\baccess denied\b|\bunauthorized\b|\bforbidden\b'; }
+# Fetch body + "code size" trailer in one request. $1=url, rest=extra curl args.
+_fetch_bs() { local u="$1"; shift; curl -s --max-time 10 "$@" -w $'\n4TSTAT %{http_code} %{size_download}' "$u" 2>/dev/null; }
+
 idor_check() {
   [ "$IDOR" = 1 ] && [ -n "$AUTH_A" ] || return 0
-  local cand; cand="$( { grep -iE '^idor\t' "$gf_file" 2>/dev/null | cut -f2
-      grep -iE '[?&](id|uid|user|userid|account|acct|order|invoice|doc|docid|file|fileid|num|no|pid|gid|key|ref)=[0-9]+' "$targets_active_file" 2>/dev/null
+  # Candidates = URLs A can actually read, ANY id shape. The key idea: with a real session we
+  # don't need to GUESS ids - we replay A's own object/accessor URLs as anon and as B. So we
+  # take id-bearing query params (int/uuid/hex/slug/email), object-accessor paths (/users/<x>),
+  # and implicit-context endpoints (/me, /account, /profile, /billing) from the active set + JS.
+  local cand; cand="$( {
+      grep -iE '^(idor|ssrf)\t' "$gf_file" 2>/dev/null | cut -f2
+      grep -hiE '[?&](id|uid|guid|uuid|user|userid|username|account|acct|order|orderid|invoice|doc|docid|file|fileid|num|no|pid|gid|key|ref|object|item|cart|basket|profile|email)=[^&[:space:]]+' "$targets_active_file" 2>/dev/null
+      grep -haoiE 'https?://[^ "]+/(users?|accounts?|orders?|invoices?|baskets?|carts?|documents?|files?|products?|customers?|profiles?|messages?|tickets?|addresses?)/[^/ ?"]+' "$targets_active_file" "${js_endpoints_file:-/dev/null}" 2>/dev/null
+      grep -haoiE 'https?://[^ "]+/(me|profile|account|settings|billing|whoami|dashboard)([/?][^ "]*)?' "$targets_active_file" "${js_endpoints_file:-/dev/null}" 2>/dev/null
     } | sort -u | head -n "$IDOR_MAX" )"
   [ -n "$cand" ] || return 0
-  local u ra rx rb ca sa cx sx cb sb
+  local u out abody acode asz nbody ncode nsz bbody bcode bsz
   while IFS= read -r u; do
     [ -n "$u" ] || continue
-    ra="$(curl -s -o /dev/null -w '%{http_code} %{size_download}' --max-time 10 ${CURL_NET[@]+"${CURL_NET[@]}"} -H "$AUTH_A" "$u" 2>/dev/null || echo '000 0')"
-    ca="${ra%% *}"; sa="${ra##* }"
-    [ "$ca" = 200 ] && [ "${sa:-0}" -gt 0 ] 2>/dev/null || continue   # only resources A can actually read
-    rx="$(curl -s -o /dev/null -w '%{http_code} %{size_download}' --max-time 10 ${CURL_NET[@]+"${CURL_NET[@]}"} "$u" 2>/dev/null || echo '000 0')"
-    cx="${rx%% *}"; sx="${rx##* }"
-    [ "$cx" = 200 ] && _near "$sa" "$sx" && printf '[ANON-ACCESS] %s | authorized content served with NO session (A=200/%s anon=200/%s)\n' "$u" "$sa" "$sx" >> "$idor_file"
+    out="$(_fetch_bs "$u" ${CURL_PROXY[@]+"${CURL_PROXY[@]}"} -H "$AUTH_A")"
+    acode="$(printf '%s' "$out" | tail -1 | awk '{print $2}')"; asz="$(printf '%s' "$out" | tail -1 | awk '{print $3}')"
+    abody="$(printf '%s' "$out" | sed '$d')"
+    { [ "$acode" = 200 ] && [ "${asz:-0}" -gt 0 ] 2>/dev/null; } || continue   # A must actually read it
+    _looks_denied "$abody" && continue                                         # ...and it must be a real resource
+    # ANON leg: proxy ONLY, no auth header (CURL_NET would leak A's session here).
+    out="$(_fetch_bs "$u" ${CURL_PROXY[@]+"${CURL_PROXY[@]}"})"
+    ncode="$(printf '%s' "$out" | tail -1 | awk '{print $2}')"; nsz="$(printf '%s' "$out" | tail -1 | awk '{print $3}')"; nbody="$(printf '%s' "$out" | sed '$d')"
+    if [ "$ncode" = 200 ] && _near "$asz" "$nsz" && ! _looks_denied "$nbody"; then
+      printf '[ANON-ACCESS] %s | A-authorized content served with NO session (A=200/%sB anon=200/%sB)\n' "$u" "$asz" "$nsz" >> "$idor_file"
+    fi
     if [ -n "$AUTH_B" ]; then
-      rb="$(curl -s -o /dev/null -w '%{http_code} %{size_download}' --max-time 10 ${CURL_NET[@]+"${CURL_NET[@]}"} -H "$AUTH_B" "$u" 2>/dev/null || echo '000 0')"
-      cb="${rb%% *}"; sb="${rb##* }"
-      [ "$cb" = 200 ] && _near "$sa" "$sb" && printf '[IDOR?] %s | user B gets the same resource as user A (A=200/%s B=200/%s) - verify object ownership\n' "$u" "$sa" "$sb" >> "$idor_file"
+      out="$(_fetch_bs "$u" ${CURL_PROXY[@]+"${CURL_PROXY[@]}"} -H "$AUTH_B")"
+      bcode="$(printf '%s' "$out" | tail -1 | awk '{print $2}')"; bsz="$(printf '%s' "$out" | tail -1 | awk '{print $3}')"; bbody="$(printf '%s' "$out" | sed '$d')"
+      if [ "$bcode" = 200 ] && _near "$asz" "$bsz" && ! _looks_denied "$bbody"; then
+        printf '[IDOR?] %s | user B reads the same resource as user A (A=200/%sB B=200/%sB) - verify object ownership\n' "$u" "$asz" "$bsz" >> "$idor_file"
+      fi
     fi
   done <<< "$cand"
 
-  # Path-based IDOR / BOLA: REST object ids live in the path (/api/Users/1, /rest/basket/42),
-  # not the query string. With identity A, read object N, then try a NEIGHBOUR id - if A can
-  # read it too (and the endpoint isn't just answering 200 to every id), that's a BOLA lead.
-  local pcand purl pid alt alturl cid ralt calt salt rcc ccc scc
-  pcand="$( { grep -aoiE 'https?://[^ "]+/[0-9]{1,9}(/[a-z0-9._-]+)?/?$' "$targets_active_file" 2>/dev/null
-              grep -aoiE 'https?://[^ "]+/[0-9]{1,9}(/[a-z0-9._-]+)?/?$' "${js_endpoints_file:-/dev/null}" 2>/dev/null
+  # Single-session fallback (no B): path-based BOLA by NEIGHBOUR-walking a guessable id in the
+  # path (/api/Users/1 -> /2). Only int ids are walkable; uuid/hex can't be guessed, so those
+  # rely on the A/B replay above. Guarded by a bogus-id control so blanket-200 APIs don't FP.
+  local pcand purl pid alt alturl cid ralt calt salt rcc ccc scc ra ca sa
+  pcand="$( { grep -haoiE 'https?://[^ "]+/[0-9]{1,9}(/[a-z0-9._-]+)?/?$' "$targets_active_file" "${js_endpoints_file:-/dev/null}" 2>/dev/null
             } | sort -u | head -n "$IDOR_MAX" )"
   while IFS= read -r purl; do
     [ -n "$purl" ] || continue
     pid="$(printf '%s' "$purl" | grep -oE '/[0-9]{1,9}(/|$)' | tail -1 | tr -dc '0-9')"
     [ -n "$pid" ] || continue
-    ra="$(curl -s -o /dev/null -w '%{http_code} %{size_download}' --max-time 10 ${CURL_NET[@]+"${CURL_NET[@]}"} -H "$AUTH_A" "$purl" 2>/dev/null || echo '000 0')"
+    ra="$(curl -s -o /dev/null -w '%{http_code} %{size_download}' --max-time 10 ${CURL_PROXY[@]+"${CURL_PROXY[@]}"} -H "$AUTH_A" "$purl" 2>/dev/null || echo '000 0')"
     ca="${ra%% *}"; sa="${ra##* }"
     [ "$ca" = 200 ] && [ "${sa:-0}" -gt 0 ] 2>/dev/null || continue
     alt=$((pid + 1)); [ "$alt" = "$pid" ] && alt=$((pid + 2))
     alturl="$(printf '%s' "$purl" | sed -E "s#/${pid}(/|\$)#/${alt}\1#")"
     cid="$(printf '%s' "$purl" | sed -E "s#/${pid}(/|\$)#/99999987\1#")"   # unlikely id -> blanket-200 guard
-    ralt="$(curl -s -o /dev/null -w '%{http_code} %{size_download}' --max-time 10 ${CURL_NET[@]+"${CURL_NET[@]}"} -H "$AUTH_A" "$alturl" 2>/dev/null || echo '000 0')"
+    ralt="$(curl -s -o /dev/null -w '%{http_code} %{size_download}' --max-time 10 ${CURL_PROXY[@]+"${CURL_PROXY[@]}"} -H "$AUTH_A" "$alturl" 2>/dev/null || echo '000 0')"
     calt="${ralt%% *}"; salt="${ralt##* }"
     [ "$calt" = 200 ] && [ "${salt:-0}" -gt 0 ] 2>/dev/null || continue
-    rcc="$(curl -s -o /dev/null -w '%{http_code} %{size_download}' --max-time 10 ${CURL_NET[@]+"${CURL_NET[@]}"} -H "$AUTH_A" "$cid" 2>/dev/null || echo '000 0')"
+    rcc="$(curl -s -o /dev/null -w '%{http_code} %{size_download}' --max-time 10 ${CURL_PROXY[@]+"${CURL_PROXY[@]}"} -H "$AUTH_A" "$cid" 2>/dev/null || echo '000 0')"
     ccc="${rcc%% *}"; scc="${rcc##* }"
-    # skip if the endpoint 200s even for a bogus id with a similar body (not id-scoped)
     if [ "$ccc" = 200 ] && _near "$salt" "$scc"; then continue; fi
     printf '[PATH-IDOR?] %s -> %s | identity A reads neighbour object id %s (200/%sB; bogus id -> %s/%sB) - verify ownership\n' "$purl" "$alturl" "$alt" "$salt" "$ccc" "$scc" >> "$idor_file"
   done <<< "$pcand"
