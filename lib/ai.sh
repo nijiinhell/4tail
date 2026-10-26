@@ -33,9 +33,15 @@ ai_call() {
         # Reasoning models (GLM/DeepSeek) may leave .content empty and put text in
         # .reasoning_content, especially if truncated (finish_reason=length).
         text="$(echo "$response" | jq -r '.choices[0].message.content // empty' 2>/dev/null)"
-        [ -z "$text" ] && text="$(echo "$response" | jq -r '.choices[0].message.reasoning_content // empty' 2>/dev/null)"
-        if [ -z "$text" ] && [ "$(echo "$response" | jq -r '.choices[0].finish_reason // empty' 2>/dev/null)" = "length" ]; then
-          echo "[warn] model=$m hit token limit with empty content - raise LLM_MAX_TOKENS_PLAN/TRIAGE" >>"$llm_log"
+        local _fr; _fr="$(echo "$response" | jq -r '.choices[0].finish_reason // empty' 2>/dev/null)"
+        # Only trust .reasoning_content as the ANSWER when the model actually FINISHED. A
+        # length-truncated reasoning_content is an unfinished chain-of-thought, not output -
+        # returning it would dump raw CoT into report.md and confuse the funnel's parsers.
+        if [ -z "$text" ] && [ "$_fr" != "length" ]; then
+          text="$(echo "$response" | jq -r '.choices[0].message.reasoning_content // empty' 2>/dev/null)"
+        fi
+        if [ -z "$text" ] && [ "$_fr" = "length" ]; then
+          echo "[warn] model=$m truncated (finish_reason=length) with empty content - discarding partial reasoning, retrying/falling back. Raise LLM_MAX_TOKENS_PLAN/TRIAGE." >>"$llm_log"
         fi
         if [ -n "$text" ]; then
           # accrue estimated cost from token usage

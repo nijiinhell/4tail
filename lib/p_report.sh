@@ -146,6 +146,24 @@ $(head -c 2000 "${verified_file:-/dev/null}" 2>/dev/null)
 === CORS misconfiguration (Corsy) ===
 $(head -c 1500 "${corsy_file:-/dev/null}" 2>/dev/null)
 
+=== reflected parameters (kxss; XSS/injection candidates) ===
+$(head -c 2000 "$findings_dir/kxss.txt" 2>/dev/null)
+
+=== confirmed blind SSRF / open-redirect (OAST callbacks; CONFIRMED, rank high) ===
+$(head -c 1500 "${oast_hits_file:-/dev/null}" 2>/dev/null)
+
+=== GraphQL introspection (open = full schema readable; map per-field authz/IDOR) ===
+$(head -c 2000 "${gql_schema_file:-/dev/null}" 2>/dev/null)
+
+=== exposed source maps (.js.map -> original source leaked) ===
+$(head -c 1000 "${sourcemap_file:-/dev/null}" 2>/dev/null)
+
+=== exposed API specs (Swagger/OpenAPI/GraphQL) ===
+$(head -c 1500 "${api_specs_file:-/dev/null}" 2>/dev/null)
+
+=== cross-host propagated endpoints (same path live on sibling hosts) ===
+$(head -c 1500 "${prop_file:-/dev/null}" 2>/dev/null)
+
 === versioned components (map each to specific known CVEs) ===
 $(head -c 2000 "${versions_file:-/dev/null}" 2>/dev/null)
 
@@ -193,10 +211,6 @@ if [ -s "${poc_file:-/dev/null}" ]; then
     echo '```'
   } >> "$report_file"
 fi
-
-# OOB: correlate any interactsh callbacks to the URLs we injected, then stop the listener.
-oast_correlate
-oast_stop
 
 # Structured output: findings.json (and optional SARIF) for automation / ticketing.
 findings_json="$OUTDIR/findings.json"

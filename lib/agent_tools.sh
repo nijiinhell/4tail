@@ -85,10 +85,6 @@ agent_tool_run() {   # name  target  extra
       have crlfuzz || { echo "crlfuzz: not installed (go install github.com/dwisiswant0/crlfuzz/cmd/crlfuzz@latest)"; return 0; }
       raw="$(printf '%s\n' "$tgt" | _cap crlfuzz -s 2>/dev/null | head -c 2000)"
       [ -n "$raw" ] && hit="CONFIRMED crlf"; res="$(printf '%s' "$raw" | head -3 | tr '\n' ';')" ;;
-    x8)
-      have x8 || { echo "x8: not installed (cargo install x8)"; return 0; }
-      raw="$(_cap x8 -u "$tgt" -w "$WORDLIST" 2>/dev/null | head -c 2000)"
-      res="x8: $(printf '%s' "$raw" | tr '\n' ' ' | head -c 300)" ;;
     git-dumper|gitdumper)
       { have git-dumper || have gitdumper; } || { echo "git-dumper: not installed (pipx install git-dumper)"; return 0; }
       local gd="git-dumper"; have git-dumper || gd="gitdumper"; mkdir -p "$findings_dir/gitdump"

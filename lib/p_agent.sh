@@ -102,7 +102,9 @@ $results" > "$aout" 2>>"$llm_log" || true
         tname="$(printf '%s' "$pline" | sed -E 's/.*TOOL[: ]+//I' | awk '{print tolower($1)}')"
         ttgt="$(printf '%s' "$pline" | grep -oiE 'https?://[^ "'"'"'`|<>]+' | head -1)"
         [ -n "$ttgt" ] || ttgt="$(printf '%s' "$pline" | grep -oiE '([a-z0-9-]+\.)+[a-z]{2,}' | head -1)"
-        textra="$(printf '%s' "$pline" | grep -oiE 'tags=[a-z0-9,._-]+' | head -1)"
+        # Everything after the first '|' is the tool's extra args (tags= for nuclei, or the
+        # safe sqlmap enum flags) - not just tags=, so the agent can actually pass them.
+        textra="$(printf '%s' "$pline" | awk -F'|' 'NF>=2{sub(/^[^|]*\|/,""); print; exit}' | sed 's/^[[:space:]]*//; s/[[:space:]]*$//')"
         [ -n "$tname" ] && [ -n "$ttgt" ] || continue
         case " $agent_tools " in *" $tname "*) ;; *) continue ;; esac   # only offered tools
         grep -qxF "TOOL $tname $ttgt" "$agent_seen" 2>/dev/null && continue
@@ -173,6 +175,12 @@ $results" > "$aout" 2>>"$llm_log" || true
   { echo "=== final hypotheses ==="; printf '%s\n' "$agent_notes"; } >> "$agent_log"
   set_stage $S_AGENT done "$(nlines "$agent_file") confirmed · $(nlines "$agent_seen") actions (${toolcalls:-0} tool runs) · ${round}r"
 fi
+
+# OOB: correlate any interactsh callbacks to the URLs we injected, then stop the listener -
+# BEFORE verify/report/triage, so confirmed blind SSRF/redirect hits reach report.md and the
+# AI analyst (not just findings.json).
+oast_correlate
+oast_stop
 
 # Verification: re-test confirmed findings so the report/triage lead with proven ones.
 if [ "$VERIFY" = 1 ]; then set_stage $S_TRIAGE running "verifying findings"; verify_findings; fi

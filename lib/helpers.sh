@@ -1,8 +1,10 @@
 # --- Cost ledger (estimated USD spent on the LLM) ---------------------------
-cost_now() { [ -n "$cost_ledger" ] && cat "$cost_ledger" 2>/dev/null || echo 0; }
+# Cost ledger is APPEND-only (one cost per line) so concurrent background ai_call writes
+# (triage + the nuclei supervisor) can't clobber each other; cost_now sums the lines.
+cost_now() { [ -n "$cost_ledger" ] && awk '{s+=$1} END{printf "%.6f\n", s+0}' "$cost_ledger" 2>/dev/null || echo 0; }
 add_cost() { # $1 = usd to add
   [ -n "$cost_ledger" ] || return 0
-  awk -v c="$(cost_now)" -v a="$1" 'BEGIN{printf "%.6f\n", c+a}' > "$cost_ledger"
+  printf '%.6f\n' "$1" >> "$cost_ledger"   # single short line -> atomic append
 }
 budget_ok() { # 0 (true) if under budget or unlimited
   [ "${LLM_BUDGET_USD:-0}" = 0 ] && return 0

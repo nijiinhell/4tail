@@ -2,7 +2,10 @@
 BLUEPRINT_NAME=""
 if [ -z "$BLUEPRINTS_DIR" ]; then
   _sd="$(cd "$(dirname "$0")" 2>/dev/null && pwd)"
-  [ -d "$_sd/blueprints" ] && BLUEPRINTS_DIR="$_sd/blueprints"
+  # next to the script (repo run), or one level up (single-file build in dist/).
+  for _bd in "$_sd/blueprints" "$_sd/../blueprints"; do
+    [ -d "$_bd" ] && { BLUEPRINTS_DIR="$(cd "$_bd" && pwd)"; break; }
+  done
 fi
 list_blueprints()    { ls "$BLUEPRINTS_DIR"/*.json 2>/dev/null | sed 's#.*/##; s#\.json$##'; }
 blueprint_catalog()  { local f; for f in "$BLUEPRINTS_DIR"/*.json; do [ -f "$f" ] && jq -r '"- "+.name+": "+(.description // "")' "$f" 2>/dev/null; done; }
