@@ -18,7 +18,9 @@ build_seclists_index() {
 }
 # Real SecLists files whose basename contains a tech token (specific lists only).
 seclists_match() {  # tech-token -> abs paths
-  local t; t="$(printf '%s' "$1" | tr 'A-Z' 'a-z')"
+  # Strip a version suffix (httpx emits "php:8.1.2", "apache 2.4") - the bare
+  # token is what appears in SecLists filenames; the versioned one matches nothing.
+  local t; t="$(printf '%s' "$1" | tr 'A-Z' 'a-z' | sed -E 's/[:[:space:]/][0-9].*$//')"
   [ "${#t}" -ge 3 ] && [ -s "$seclists_index" ] || return 0
   awk -F'\t' -v t="$t" 'index($1,t){print $2}' "$seclists_index" | head -n "$SECLISTS_MATCH_MAX"
 }
@@ -38,10 +40,21 @@ host_wordlists() {
   if [ -s "$tech_map_file" ]; then
     for t in "${_arr[@]}"; do
       [ -z "$t" ] && continue
+      t="${t%%:*}"                       # drop version suffix (php:8.1 -> php)
       while IFS=$'\t' read -r key rel; do
         [ -z "$key" ] && continue
         case "$rel" in *raft-*|*big.txt|*directory-list*|*combined_*|*dirbuster*|*/all.txt) continue ;; esac
-        case "$t" in *"$key"*) [ -f "$SECLISTS_DIR/$rel" ] && printf '%s\n' "$SECLISTS_DIR/$rel" ;; esac
+        # 'java' key must not swallow 'javascript' (substring match would mis-map it to J2EE lists)
+        [ "$key" = java ] && case "$t" in *javascript*) continue ;; esac
+        case "$t" in *"$key"*)
+          if [ -f "$SECLISTS_DIR/$rel" ]; then
+            printf '%s\n' "$SECLISTS_DIR/$rel"
+          else
+            # AI-suggested path not on disk (hallucinated path/casing): fall back to the
+            # real indexed SecLists file whose name carries this list's token.
+            seclists_match "$(basename "$rel" | sed 's/\.[^.]*$//')"
+          fi ;;
+        esac
       done < "$tech_map_file"
     done
   fi
@@ -63,13 +76,15 @@ host_extensions() {
   IFS=',' read -ra _e <<< "$techs"
   for t in "${_e[@]}"; do
     case "$t" in
-      *php*)                                   tech="$tech,php,phtml,phps" ;;
-      *asp*|*iis*|*aspnet*|*.net*)             tech="$tech,aspx,asp,ashx,config,cs" ;;
+      # javascript MUST precede *java* - otherwise *java* swallows it and JS hosts
+      # get .jsp/.war exts (filling the MAX_EXTS cap) instead of .js/.map/.env.
+      *node*|*express*|*javascript*)           tech="$tech,js,map,env" ;;
+      *php*)                                    tech="$tech,php,phtml,phps" ;;
+      *asp*|*iis*|*aspnet*|*asp.net*|*dotnet*) tech="$tech,aspx,asp,ashx,config,cs" ;;
       *java*|*jsp*|*tomcat*|*spring*|*struts*) tech="$tech,jsp,jspx,war,properties,class" ;;
       *coldfusion*|*cfm*)                      tech="$tech,cfm,cfc" ;;
       *python*|*django*|*flask*)               tech="$tech,py,pyc" ;;
       *ruby*|*rails*)                          tech="$tech,rb,erb" ;;
-      *node*|*express*|*javascript*)           tech="$tech,js,map,env" ;;
       *perl*)                                  tech="$tech,pl,cgi" ;;
     esac
   done

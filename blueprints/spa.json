@@ -5,6 +5,7 @@
   "specialists": ["nuclei-dast", "dalfox", "kxss", "arjun"],
   "nuclei_dast_tags": "xss,redirect,ssrf",
   "fuzzing_strategy": "light",
+  "stages": { "jsmine": 1 },
   "caps": {
     "max_juicy_urls": 120,
     "max_dalfox": 60,

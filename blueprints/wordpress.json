@@ -2,7 +2,7 @@
   "name": "wordpress",
   "description": "WordPress / CMS target: plugin CVEs, user enumeration, XSS; fuzzing tuned to CMS surface.",
   "focus_areas": ["cve", "xss", "sqli", "lfi", "exposure"],
-  "specialists": ["nuclei-dast", "dalfox", "kxss"],
+  "specialists": ["nuclei-dast", "dalfox", "kxss", "sqlmap", "arjun"],
   "nuclei_dast_tags": "xss,sqli,lfi",
   "caps": {
     "max_juicy_urls": 80,

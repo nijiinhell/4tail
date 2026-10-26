@@ -1,9 +1,15 @@
 {
   "name": "stealth",
-  "description": "Low-and-slow: minimal active footprint for WAF-heavy targets. No sqlmap, tiny caps, slow rates.",
+  "description": "Low-and-slow: minimal active footprint for WAF-heavy targets. No sqlmap, light fuzzing, throttled rates.",
   "focus_areas": ["xss", "redirect", "ssrf"],
   "specialists": ["kxss", "dalfox"],
-  "nuclei_dast_tags": "xss,redirect,ssrf",
+  "fuzzing_strategy": "light",
+  "rates": {
+    "ffuf_rate": 20,
+    "fuzz_parallel": 1,
+    "nuclei_ratelimit": 30,
+    "nuclei_conc": 10
+  },
   "caps": {
     "max_juicy_urls": 40,
     "max_dalfox": 15,
@@ -11,7 +17,6 @@
     "max_sqlmap": 0,
     "max_arjun_hosts": 0,
     "crawl_max_urls": 3000,
-    "crawl_max_time": 900,
-    "dast_max_urls": 400
+    "crawl_max_time": 900
   }
 }

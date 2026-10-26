@@ -175,7 +175,10 @@ AGENT_MAX_POST="${AGENT_MAX_POST:-12}"    # cap POST probes across the whole loo
 # Secrets the agent reads (e.g. a connection string via LFI) are NEVER sent to the LLM -
 # the model sees a redacted snippet, but the raw response is saved locally for the human.
 AGENT_LOOT="${AGENT_LOOT:-1}"             # 1 = save raw secret-bearing responses to agent_loot/ for manual review
-DEFAULT_NUCLEI_TAGS="${DEFAULT_NUCLEI_TAGS:-cves,exposures,misconfiguration,tech,default-login,takeover}"
+# NB: 'tech' templates are almost all severity:info; combined (AND) with a non-info
+# NUCLEI_SEVERITY they match ~nothing while eating a MAX_TAGS slot - and Step 2 already
+# does tech detection. 'exposed-panels' carries real low/med/high templates instead.
+DEFAULT_NUCLEI_TAGS="${DEFAULT_NUCLEI_TAGS:-cves,exposures,misconfiguration,exposed-panels,default-login,takeover}"
 MAX_TAGS="${MAX_TAGS:-15}"                # cap nuclei tags (more tags = far more templates = much slower)
 NUCLEI_SEVERITY="${NUCLEI_SEVERITY:-critical,high,medium,low}"
 NUCLEI_RATELIMIT="${NUCLEI_RATELIMIT:-150}"
@@ -226,7 +229,7 @@ Options:
   -j          JS/secret mining + param discovery (env JSMINE=1)
   -C          Active funnel: crawl -> cluster -> AI juicy -> API specs -> specialists (env CRAWL=1)
   -s          Single host: no subdomain enum; test exactly the given host incl. port/localhost/IP (env SINGLE=1)
-  -B <name>   Blueprint/strategy (env BLUEPRINT; "auto"=AI picks; or webapp_bounty/api_bounty/wordpress/stealth/deep)
+  -B <name>   Blueprint/strategy (env BLUEPRINT; "auto"=AI picks; or webapp_bounty/api_bounty/wordpress/spa/graphql/stealth/deep)
   -H <hdr>    Auth header, repeatable (e.g. -H "Authorization: Bearer X"); env AUTH_HEADER/AUTH_COOKIE
   -x <proxy>  Route tools through http(s) proxy (env PROXY)
   -O          OAST: start interactsh, inject OOB payloads, confirm blind SSRF/redirect (env OAST=1)

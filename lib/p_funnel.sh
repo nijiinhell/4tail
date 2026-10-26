@@ -305,8 +305,16 @@ $(cat "$OUTDIR/.patterns_numbered.txt")" >"$jout" 2>>"$llm_log" || true
   # (E) gf bucketing on the active set (candidate classes for routing)
   : > "$gf_file"
   if have gf && [ -s "$targets_active_file" ]; then
+    # Expand focus aliases so blueprint focus names map onto gf pattern names.
+    local _focus=",$ACT_FOCUS,"
+    case "$_focus" in *,injection,*) _focus="${_focus}sqli,lfi," ;; esac
     for pat in sqli xss ssrf lfi redirect rce ssti idor; do
-      case ",$ACT_FOCUS," in *",$pat,"*|*",rce,"*) ;; *) [ "$pat" != idor ] && continue ;; esac
+      # Run this bucket if the pattern is in focus; always run rce + idor (cheap, high-value,
+      # and routing on them is wanted regardless of the stated focus).
+      case "$_focus" in
+        *",$pat,"*) ;;
+        *) { [ "$pat" != idor ] && [ "$pat" != rce ]; } && continue ;;
+      esac
       gf "$pat" < "$targets_active_file" 2>/dev/null | sed "s/^/${pat}\t/" >> "$gf_file" || true
     done
   fi

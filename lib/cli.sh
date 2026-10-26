@@ -12,8 +12,9 @@ while getopts ":w:o:t:S:m:M:p:b:B:H:x:OARqjsCyPDh" opt; do
     S) NUCLEI_SEVERITY="$OPTARG" ;;
     m) LLM_MODEL="$OPTARG" ;;
     M) MAX_FUZZ_HOSTS="$OPTARG" ;;
-    p) FUZZ_PARALLEL="$OPTARG" ;;
-    j) JSMINE=1 ;;
+    p) FUZZ_PARALLEL="$OPTARG"; _user_set_FUZZ_PARALLEL=1 ;;  # authoritative over a blueprint
+    j) JSMINE=1; _user_set_JSMINE=1 ;;                        # explicit -j wins over a blueprint toggle
+
     C) CRAWL=1 ;;
     B) BLUEPRINT="$OPTARG" ;;
     H) AUTH_HEADER="${AUTH_HEADER:+$AUTH_HEADER$'\n'}$OPTARG" ;;

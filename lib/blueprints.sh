@@ -28,6 +28,15 @@ load_blueprint() { # $1 = name or path; applies focus/specialists/caps
   bp_set ACT_SPECIALISTS "$(jq -r '(.specialists // []) | join(",")' "$f" 2>/dev/null)"
   bp_set ACT_DAST_TAGS   "$(jq -r '.nuclei_dast_tags // ""' "$f" 2>/dev/null)"
   bp_set FUZZING_STRATEGY "$(jq -r '.fuzzing_strategy // ""' "$f" 2>/dev/null)"
+  # stage toggles: a blueprint can turn on JS mining (e.g. spa) so `-C` alone still
+  # mines JS when the surface demands it, without the user remembering `-j`.
+  bp_set JSMINE          "$(jq -r '.stages.jsmine // .jsmine // empty' "$f" 2>/dev/null)"
+  # rate shaping: let a blueprint (e.g. stealth) throttle the active tools it drives
+  # AFTER recon. httpx threads are deliberately NOT here - httpx runs before this.
+  bp_set FFUF_RATE       "$(jq -r '.rates.ffuf_rate // empty' "$f" 2>/dev/null)"
+  bp_set FUZZ_PARALLEL   "$(jq -r '.rates.fuzz_parallel // empty' "$f" 2>/dev/null)"
+  bp_set NUCLEI_RATELIMIT "$(jq -r '.rates.nuclei_ratelimit // empty' "$f" 2>/dev/null)"
+  bp_set NUCLEI_CONC     "$(jq -r '.rates.nuclei_conc // empty' "$f" 2>/dev/null)"
   bp_set ACT_MAX_JUICY   "$(jq -r '.caps.max_juicy_urls // empty' "$f" 2>/dev/null)"
   bp_set ACT_MAX_DALFOX  "$(jq -r '.caps.max_dalfox // empty' "$f" 2>/dev/null)"
   bp_set ACT_MAX_KXSS    "$(jq -r '.caps.max_kxss // empty' "$f" 2>/dev/null)"
@@ -42,6 +51,21 @@ load_blueprint() { # $1 = name or path; applies focus/specialists/caps
 resolve_blueprint() {
   if [ "$BLUEPRINT" != "auto" ]; then load_blueprint "$BLUEPRINT"; return; fi
   local chosen="webapp_bounty" n pick out
+  # Deterministic (no AI, works with AI_ENABLED=0): match a distinctive stack in the tech
+  # surface to its blueprint. Order matters - most specific first. WordPress and GraphQL
+  # before the generic SPA/AI fallback so an unkeyed run still loads the right profile.
+  if [ -s "$tech_brief" ] && [ -n "$BLUEPRINTS_DIR" ] && [ -f "$BLUEPRINTS_DIR/wordpress.json" ] \
+     && grep -qiE 'wordpress|wp-content|wp-includes|wp-json' "$tech_brief" 2>/dev/null; then
+    load_blueprint wordpress
+    [ "$ASSUME_YES" = 1 ] || log "Blueprint: wordpress (WordPress detected in tech surface)"
+    return
+  fi
+  if [ -s "$tech_brief" ] && [ -n "$BLUEPRINTS_DIR" ] && [ -f "$BLUEPRINTS_DIR/graphql.json" ] \
+     && grep -qiE 'graphql|graphiql|apollo|/graphql' "$tech_brief" 2>/dev/null; then
+    load_blueprint graphql
+    [ "$ASSUME_YES" = 1 ] || log "Blueprint: graphql (GraphQL detected in tech surface)"
+    return
+  fi
   # Deterministic: a JS SPA framework in the tech surface -> the spa blueprint (JS-mining +
   # DOM-XSS + the API behind the front-end). The generic AI pick tends to default to
   # webapp_bounty and miss that the real surface is the mined /rest + /api, not path fuzzing.
