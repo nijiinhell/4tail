@@ -852,7 +852,15 @@ behaviour is identical to the old single file. Sections:
 
 Run it straight from the repo (`./4tail.sh …`). To ship a **single file**, `make build`
 concatenates the sections into `dist/4tail.sh`, byte-identical to the classic standalone
-script — copy that one file to a box with no `lib/`. `make check` syntax-checks everything.
+script — copy that one file to a box with no `lib/`.
+
+Make targets: `make check` (syntax-check entrypoint + sections), `make lint` (ShellCheck,
+if installed), `make test` (offline smoke test — serves a fixture, stubs httpx/nuclei/ffuf,
+and asserts the JS discovery → endpoint mining → funnel → findings.json flow), `make build`.
+
+**Docker:** `docker build -t 4tail .` bakes in the whole toolset (subfinder/httpx/nuclei/
+katana/ffuf/dalfox/kxss/gau/… + SecLists + nuclei templates), then
+`docker run --rm -e TOGETHER_API_KEY=sk-... 4tail -C -j example.com`.
 
 ## Notes
 
