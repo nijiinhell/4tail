@@ -33,7 +33,6 @@ elif done_marker crawl && [ -f "$targets_active_file" ]; then
   set_stage $S_CRAWL done "$(nlines "$urls_file") urls, $(nlines "$targets_active_file") active, $(nlines "$dast_file") dast (resumed)"
 else
   set_stage $S_CRAWL running "collecting URLs"
-  esc_domain="$(printf '%s' "$domain" | sed 's/\./\\./g')"
   : > "$urls_file"
   # (A) Broad / passive URL collection - WAF-safe. Run ALL available sources and UNION them
   # (waymore adds commoncrawl+alienvault+urlscan, but gau/waybackurls often surface URLs it

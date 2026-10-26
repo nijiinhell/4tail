@@ -53,7 +53,6 @@ else
   # (google-analytics, gtag, cloudflare, jquery cdn...) carry public keys and produce
   # false positives that aren't the target's to fix. Override with JS_FIRST_PARTY=0.
   if [ "${JS_FIRST_PARTY:-1}" = 1 ] && [ -s "$js_urls_file" ]; then
-    esc_domain="$(printf '%s' "$domain" | sed 's/\./\\./g')"
     grep -iE "^https?://([a-z0-9._-]+\.)?${esc_domain}([:/]|$)" "$js_urls_file" > "$js_urls_file.fp" 2>/dev/null || true
     mv "$js_urls_file.fp" "$js_urls_file"
   fi

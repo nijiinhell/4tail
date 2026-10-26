@@ -219,9 +219,8 @@ if [ "$STALE_RANK" = 1 ] && have jq && [ -s "$httpx_json" ]; then
 fi
 
 # Resolve the strategy blueprint (AI-chosen from the tech surface when BLUEPRINT=auto).
-# Only needed for the active funnel (-C), where it sets focus/specialists/caps.
-if [ "$CRAWL" = 1 ]; then
-  resolve_blueprint
-  log "Blueprint: ${BLUEPRINT_NAME:-defaults}  (focus: $ACT_FOCUS | specialists: $ACT_SPECIALISTS)"
-fi
+# Run it ALWAYS, not only under -C: a blueprint also tunes stages that run without the active
+# funnel - fuzzing_strategy (light/off) for the fuzz stage, and rate/caps for nuclei.
+resolve_blueprint
+[ "$ASSUME_YES" = 1 ] || log "Blueprint: ${BLUEPRINT_NAME:-defaults}  (focus: $ACT_FOCUS | specialists: $ACT_SPECIALISTS)"
 

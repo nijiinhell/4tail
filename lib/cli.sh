@@ -45,9 +45,16 @@ raw_target="${1:-}"
 # matching, subfinder and the output dir name). SEED_URL is the exact URL httpx will probe.
 TARGET_SCHEME="$(printf '%s' "$raw_target" | sed -nE 's#^([a-zA-Z]+)://.*#\1#p' | tr 'A-Z' 'a-z')"
 _hostport="$(printf '%s' "$raw_target" | tr -d '[:space:]' | sed -E 's#^[a-zA-Z]+://##; s#/.*$##' | tr 'A-Z' 'a-z')"
-TARGET_PORT="$(printf '%s' "$_hostport" | sed -nE 's#^[^:]+:([0-9]+)$#\1#p')"
-domain="$(printf '%s' "$_hostport" | sed -E 's#:[0-9]+$##')"
-esc_domain="$(printf '%s' "$domain" | sed 's/\./\\./g')"   # regex-safe host, defined once for all scope filters
+# Split host[:port], IPv6-aware: a bracketed [::1] / [::1]:8080 keeps the brackets as the host.
+case "$_hostport" in
+  \[*\]:[0-9]*) domain="${_hostport%]:*}]"; TARGET_PORT="${_hostport##*]:}" ;;   # [::1]:8080
+  \[*\])        domain="$_hostport"; TARGET_PORT="" ;;                            # [::1]
+  *:[0-9]*)     TARGET_PORT="${_hostport##*:}"; domain="${_hostport%:*}"
+                case "$TARGET_PORT" in ''|*[!0-9]*) TARGET_PORT=""; domain="$_hostport" ;; esac ;;  # host:port (reject non-numeric)
+  *)            domain="$_hostport"; TARGET_PORT="" ;;
+esac
+# regex-safe host for scope filters: escape every regex metachar (handles . and IPv6 [ ] : ).
+esc_domain="$(printf '%s' "$domain" | sed -E 's/[][(){}.^$*+?|\\]/\\&/g')"
 # Auto-enable single-host mode when subdomain enumeration is meaningless/impossible:
 # an explicit port, localhost, a bare IP, or a single-label host (no dot).
 if [ -n "$TARGET_PORT" ] || [ "$domain" = localhost ] \

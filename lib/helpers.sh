@@ -228,6 +228,12 @@ diff_state() {
   else
     echo "(first run for $domain — baseline saved; nothing to diff yet)" > "$diff_file"
   fi
-  cp "$cur" "$snap" 2>/dev/null; rm -f "$cur"
+  # UNION the baseline with this run (never shrink it), so a quick/partial scan (-q) or a
+  # resumed run can't erase surface a previous full scan recorded. Skip the write entirely on
+  # a resumed run (it's the same run, not a new observation).
+  if [ "$RESUME" != 1 ]; then
+    sort -u "$snap" "$cur" 2>/dev/null > "$snap.new" && mv "$snap.new" "$snap"
+  fi
+  rm -f "$cur"
 }
 
