@@ -66,7 +66,7 @@ else
   set_stage $S_NUCLEI running "starting… ($nuclei_target_count hosts)"
   # no wrapping subshell, so $npid is timeout/nuclei directly and a kill reaches it
   "${nuclei_cmd[@]}" >/dev/null 2>>"$nuclei_stats_file" & npid=$!
-  ns=$SECONDS; last_sup=0; sup_pid=""; sup_out=""
+  ns=$SECONDS; last_sup=0; sup_pid=""; sup_out=""; last_err=0; last_hits=0
   while kill -0 "$npid" 2>/dev/null; do
     st="$(grep '^{' "$nuclei_stats_file" 2>/dev/null | tail -1)"
     if [ -n "$st" ]; then
@@ -90,13 +90,22 @@ else
         rm -f "$sup_out"; sup_pid=""
       fi
       if [ -z "$sup_pid" ] && [ $((SECONDS - last_sup)) -ge "$SUPERVISOR_INTERVAL" ] && [ -n "$st" ]; then
-        last_sup=$SECONDS; sup_out="$(mktemp)"
+        last_sup=$SECONDS
+        # Only spend an LLM call when something noteworthy changed (errors climbed or a new
+        # finding landed). Otherwise write a free, deterministic status line - the model note
+        # on a quiet, error-free scan adds nothing and just burns tokens.
+        if [ "${errs:-0}" -le "$last_err" ] && [ "${hits:-0}" -le "$last_hits" ]; then
+          SUP_NOTE="scan ${pct:-0}% · ${req:-0} req · ${errs:-0} err · ${rps:-0} rps · ${hits:-0} hits${eta:+ · ETA $eta}"
+          last_err="${errs:-0}"; last_hits="${hits:-0}"
+        else
+        last_err="${errs:-0}"; last_hits="${hits:-0}"; sup_out="$(mktemp)"
         sup_sys='You monitor a running nuclei scan (AUTHORIZED test). Output ONLY the final status as one short sentence (<=30 words): progress %, whether the error rate is concerning and the likely cause (WAF 429s, dead hosts, timeouts), and ETA. No reasoning, no preamble, no "Let me" - just the sentence.'
         sup_usr="tags: $nuclei_tags
 hosts: $alive_count  elapsed: $((SECONDS-ns))s
 recent stats: $(grep '^{' "$nuclei_stats_file" | tail -3)
 error sample: $(grep -iv '^{' "$nuclei_stats_file" | grep -iE 'error|timeout|refused|denied|429' | tail -5 | head -c 1500)"
         ( ai_call "$LLM_MODEL_PLAN" 1200 "$sup_sys" "$sup_usr" >"$sup_out" 2>>"$llm_log" ) & sup_pid=$!
+        fi
       fi
     fi
     render; sleep 3
