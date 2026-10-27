@@ -10,6 +10,14 @@ oauth,jwt,api,graphql,swagger,firebase,s3,redis,mongodb,mysql,postgres"
 # are checked against the (wide) NUCLEI_TAG_ALLOWLIST, but loose prose salvage is checked
 # against this strict base only, so reasoning words (target/dreamweaver/eol/...) can't leak.
 NUCLEI_TAG_ALLOWLIST_BASE="$NUCLEI_TAG_ALLOWLIST"
+# Almost all `tech` templates are severity:info; unless NUCLEI_SEVERITY keeps info they match
+# nothing (AND'd), so drop `tech` from the allowlist entirely so the planner can't pick it and
+# waste a MAX_TAGS slot. (Step 2 httpx -tech-detect already did tech fingerprinting.)
+case ",${NUCLEI_SEVERITY:-},"  in
+  *,info,*) ;;
+  *) NUCLEI_TAG_ALLOWLIST="$(printf '%s' "$NUCLEI_TAG_ALLOWLIST" | sed -E 's/(^|,)tech(,|$)/\1/g; s/,,/,/g; s/^,//; s/,$//')"
+     NUCLEI_TAG_ALLOWLIST_BASE="$(printf '%s' "$NUCLEI_TAG_ALLOWLIST_BASE" | sed -E 's/(^|,)tech(,|$)/\1/g; s/,,/,/g; s/^,//; s/,$//')" ;;
+esac
 sanitize_tags() {  # [allowlist]  (reads tags on stdin; defaults to the widened allowlist)
   local allow="${1:-$NUCLEI_TAG_ALLOWLIST}"
   tr ',[:space:]' '\n\n' | tr 'A-Z' 'a-z' | grep -oE '[a-z0-9._-]+' \

@@ -384,6 +384,29 @@ jwt_analyze() {
     [ -n "$issues" ] && printf '[jwt] %.48s… | alg=%s |%s\n' "$tok" "${alg:-?}" "$issues" >> "$jwt_file"
   done
 }
+# Status-probe the endpoints mined from JS bundles / source maps (they were only STRING
+# literals until now - never actually requested). Fold the results into fuzz_findings so every
+# downstream pass sees the real REST/API surface: 401/403 -> try_403_bypass, 500 -> stack-trace
+# harvester, 200 -> content-discovery + open-dir, all -> katana seed. The anonymous JSON check
+# is handled separately by unauth_api_scan.
+probe_mined_endpoints() {
+  [ "${PROBE_MINED:-1}" = 1 ] || return 0
+  have httpx || return 0
+  local infile="$OUTDIR/.mined_in.txt"
+  { [ -s "${js_endpoints_file:-/dev/null}" ] && cat "$js_endpoints_file"
+    [ -s "${smap_endpoints_file:-/dev/null}" ] && cat "$smap_endpoints_file"
+  } 2>/dev/null \
+    | grep -iE "^https?://([a-z0-9._-]+\.)?${esc_domain}([:/]|$)" \
+    | grep -ivE '\.(png|jpe?g|gif|svg|woff2?|ttf|eot|css|ico|map|js)([?#]|$)' \
+    | awk 'NF && !seen[$0]++' | head -n "${PROBE_MINED_MAX:-150}" > "$infile"
+  [ -s "$infile" ] || { rm -f "$infile"; return 0; }
+  httpx -silent -status-code -content-length -l "$infile" ${HTTPX_NET[@]+"${HTTPX_NET[@]}"} 2>/dev/null \
+    | sed -E 's/\x1b\[[0-9;]*m//g' \
+    | awk '{ u=$1; sc=$2; cl=$3; gsub(/[][]/,"",sc); gsub(/[][]/,"",cl);
+             if (sc ~ /^[0-9]+$/) { if (cl=="") cl=0; print sc"\t"cl"\t"u } }' >> "$fuzz_findings_file"
+  rm -f "$infile"
+  [ -s "$fuzz_findings_file" ] && sort -u -o "$fuzz_findings_file" "$fuzz_findings_file"
+}
 # Run all lightweight detectors (called from the funnel correlation pass).
 run_owasp_detectors() {
   open_dir_scan; render 2>/dev/null || true

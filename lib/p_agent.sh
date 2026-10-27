@@ -288,5 +288,28 @@ if [ "$VERIFY" = 1 ]; then set_stage $S_TRIAGE running "verifying findings"; ver
   if [ -s "$findings_dir/kxss.txt" ]; then
     echo "## Reflected-param candidates (kxss) — top 40"; echo; echo '```'; head -n 40 "$findings_dir/kxss.txt"; echo '```'; echo
   fi
+  # Raw deterministic evidence that the AI prose summarises but used to omit from the report.
+  # Always printed so report.md preserves the primary evidence above/below the commentary.
+  if [ -s "${nuclei_file:-/dev/null}" ]; then
+    echo "## Nuclei findings (raw)"; echo; echo '```'; head -n 100 "$nuclei_file"; echo '```'; echo
+  fi
+  if [ -s "${js_secrets_file:-/dev/null}" ]; then
+    echo "## JS secret candidates (url — match)"; echo; echo '```'; head -n 60 "$js_secrets_file"; echo '```'; echo
+  fi
+  if [ -s "${api_specs_file:-/dev/null}" ]; then
+    echo "## Exposed API specs"; echo; echo '```'; head -n 40 "$api_specs_file"; echo '```'; echo
+  fi
+  if [ -s "${sourcemap_file:-/dev/null}" ]; then
+    echo "## Recovered source maps (.js.map)"; echo; echo '```'; head -n 40 "$sourcemap_file"; echo '```'; echo
+  fi
+  if [ -s "${dns_hygiene_file:-/dev/null}" ]; then
+    echo "## DNS hygiene (SPF/DMARC/zone-transfer)"; echo; echo '```'; cat "$dns_hygiene_file"; echo '```'; echo
+  fi
+  if [ -s "${sec_headers_file:-/dev/null}" ]; then
+    echo "## Missing security headers"; echo; echo '```'; head -n 60 "$sec_headers_file"; echo '```'; echo
+  fi
+  if [ -s "${diff_file:-/dev/null}" ]; then
+    echo "## New since last run (diff)"; echo; echo '```'; head -n 80 "$diff_file"; echo '```'; echo
+  fi
 } > "$report_file"
 

@@ -52,7 +52,7 @@ $(head -c 2000 "${verified_file:-/dev/null}" 2>/dev/null)" >"$poc_out" 2>>"$llm_
 fi
 
 # Step 6: AI triage  (analyses nuclei + content-discovery + JS + crawl/DAST)
-have_extra=0; { [ -s "$js_secrets_file" ] || [ -s "$params_file" ] || [ -s "$fuzz_findings_file" ] || [ -s "$dast_file" ] || [ -s "$gf_file" ] || [ -s "$findings_dir/dalfox.txt" ] || [ -s "$findings_dir/sqlmap.txt" ] || [ -s "$agent_file" ] || [ -s "${bypass_file:-/dev/null}" ] || [ -s "${idor_file:-/dev/null}" ] || [ -s "${corsy_file:-/dev/null}" ] || [ -s "${verified_file:-/dev/null}" ]; } && have_extra=1
+have_extra=0; { [ -s "$js_secrets_file" ] || [ -s "$params_file" ] || [ -s "$fuzz_findings_file" ] || [ -s "$dast_file" ] || [ -s "$gf_file" ] || [ -s "$findings_dir/dalfox.txt" ] || [ -s "$findings_dir/sqlmap.txt" ] || [ -s "$agent_file" ] || [ -s "${bypass_file:-/dev/null}" ] || [ -s "${idor_file:-/dev/null}" ] || [ -s "${corsy_file:-/dev/null}" ] || [ -s "${verified_file:-/dev/null}" ] || [ -s "${open_dir_file:-/dev/null}" ] || [ -s "${unauth_api_file:-/dev/null}" ] || [ -s "${openredir_file:-/dev/null}" ] || [ -s "${jwt_file:-/dev/null}" ] || [ -s "${stacktrace_file:-/dev/null}" ]; } && have_extra=1
 if [ "$AI_ENABLED" = "1" ] && { [ "$find_count" -gt 0 ] || [ "$have_extra" = 1 ]; } && ! budget_ok; then
   { echo "## Findings (budget reached, no AI triage)"; echo '```'; cat "$nuclei_file" 2>/dev/null
     [ -s "$js_secrets_file" ] && { echo; echo "# JS secret candidates:"; cat "$js_secrets_file"; }; echo '```'; } >> "$report_file"
@@ -102,6 +102,12 @@ $(awk -F'\t' 'NF>=3{k=$1"\t"$2; c[k]++; if(!(k in r)) r[k]=$3} END{for(k in c) p
 
 === nuclei DAST findings ===
 $(head -c 8000 "$dast_file" 2>/dev/null)
+
+=== mined REST/API surface (from JS bundles + source maps - the SPA's real endpoints; probed statuses are in the content-discovery table above) ===
+$(grep -iE '/api/|/rest/|/graphql' "${js_endpoints_file:-/dev/null}" 2>/dev/null | sort -u | head -n 80 | head -c 6000)
+
+=== OWASP/API detector hits (open dirs, verbose errors, unauth API exposure, open redirects, JWT) ===
+$({ cat "${open_dir_file:-/dev/null}" "${stacktrace_file:-/dev/null}" "${unauth_api_file:-/dev/null}" "${openredir_file:-/dev/null}" "${jwt_file:-/dev/null}"; } 2>/dev/null | head -c 6000)
 
 === dalfox XSS findings ===
 $(head -c 4000 "$findings_dir/dalfox.txt" 2>/dev/null)

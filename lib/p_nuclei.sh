@@ -6,8 +6,14 @@
 # never the one truncated away.
 enrich_plan_from_surface() {
   local blob extra=""
-  blob="$({ cat "$fuzz_findings_file" "$urls_file" "$api_specs_file" "$gf_file" 2>/dev/null; \
-            [ -s "$gql_schema_file" ] && echo /graphql; } | tr 'A-Z' 'a-z')"
+  # Only enrich from PROVEN surface: fuzz_findings rows that actually returned 200/401/403, the
+  # probed API specs, and a non-empty GraphQL schema. Using raw $urls_file (unverified string
+  # literals) or 500 pages caused false enrichment (e.g. a bogus leading 'graphql' tag on a
+  # target with no GraphQL at all).
+  blob="$({ [ -s "$fuzz_findings_file" ] && awk -F'\t' '$1==200||$1==401||$1==403{print $3}' "$fuzz_findings_file"
+            [ -s "$api_specs_file" ] && cat "$api_specs_file"
+            [ -s "$gql_schema_file" ] && echo /graphql
+          } 2>/dev/null | tr 'A-Z' 'a-z')"
   [ -n "$blob" ] || return 0
   case "$blob" in *wp-content*|*wp-json*|*wp-includes*|*wp-login*) extra="$extra,wordpress,wp-plugin" ;; esac
   case "$blob" in *actuator*|*jolokia*|*'/env'*) extra="$extra,springboot,java" ;; esac

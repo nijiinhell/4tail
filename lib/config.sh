@@ -87,6 +87,8 @@ USE_PERMUTE="${USE_PERMUTE:-1}"           # dnsgen/gotator permutation of known 
 PERMUTE_MIN_SUBS="${PERMUTE_MIN_SUBS:-25}" # skip permutation unless at least this many real subs exist (it's a wildcard-scope tool; pointless on a handful of hosts)
 PERMUTE_MAX="${PERMUTE_MAX:-2000}"        # hard cap on generated permutations to resolve
 CORS_SCAN="${CORS_SCAN:-1}"              # Corsy CORS-misconfig pass on live hosts
+PROBE_MINED="${PROBE_MINED:-1}"          # status-probe JS/source-map-mined endpoints (fold into fuzz_findings)
+PROBE_MINED_MAX="${PROBE_MINED_MAX:-150}"
 # OWASP Top 10 / API Top 10 lightweight detectors (all GET-only, capped, non-destructive)
 OPEN_DIR_CHECK="${OPEN_DIR_CHECK:-1}"    # flag open directory listings + extract linked confidential files
 OPEN_DIR_MAX="${OPEN_DIR_MAX:-60}"

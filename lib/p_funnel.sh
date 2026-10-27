@@ -202,7 +202,9 @@ $(cat "$OUTDIR/.patterns_numbered.txt")" >"$jout" 2>>"$llm_log" || true
         esac
       done
     done < <(ranked_hosts 20)
-    sort -u -o "$api_specs_file" "$api_specs_file"
+    # collapse accidental double slashes (ffuf emits http://host//api-docs) before dedup, so the
+    # HTML wrapper and its canonical URL don't both count as separate specs.
+    sed -E 's#([^:])//+#\1/#g' "$api_specs_file" 2>/dev/null | sort -u > "$api_specs_file.tmp" && mv "$api_specs_file.tmp" "$api_specs_file"
 
     # (c) fetch each spec and let the AI generate targeted test URLs
     spec_n=0
@@ -212,6 +214,21 @@ $(cat "$OUTDIR/.patterns_numbered.txt")" >"$jout" 2>>"$llm_log" || true
       body="$(curl -s -L --max-time 15 ${CURL_NET[@]+"${CURL_NET[@]}"} "$spec" 2>/dev/null \
                | head -c 60000)"
       [ -n "$body" ] || continue
+      # swagger-ui-express serves an HTML wrapper at /api-docs that only <script src>s the real
+      # spec from swagger-ui-init.js (embedded swaggerDoc JSON). Follow it so the AI sees endpoints.
+      case "$body" in
+        *swagger-ui-init.js*|*swagger-initializer.js*)
+          initref="$(printf '%s' "$body" | grep -aoiE '[a-z0-9._/-]*swagger-(ui-init|initializer)\.js' | head -1)"
+          case "$initref" in
+            http*) : ;;
+            /*) initref="$(printf '%s' "$spec" | sed -E 's#(https?://[^/]+).*#\1#')$initref" ;;
+            ?*) initref="${spec%/*}/$initref" ;;
+          esac
+          if [ -n "$initref" ]; then
+            ib="$(curl -s -L --max-time 15 ${CURL_NET[@]+"${CURL_NET[@]}"} "$initref" 2>/dev/null | head -c 60000)"
+            [ -n "$ib" ] && body="$ib"
+          fi ;;
+      esac
       spec_n=$((spec_n+1))
       set_stage $S_CRAWL running "AI building API tests from spec $spec_n/$API_MAX_SPECS"
       if [ "$AI_ENABLED" = 1 ] && budget_ok; then
@@ -319,9 +336,12 @@ $(cat "$OUTDIR/.patterns_numbered.txt")" >"$jout" 2>>"$llm_log" || true
   # (D2) else run arjun here on the juicy hosts (also emitting ?param=1, not bare ?param)
   elif has_spec arjun && have arjun && [ "${ACT_MAX_ARJUN:-0}" -gt 0 ] 2>/dev/null && [ "$active_total" -gt 0 ]; then
     set_stage $S_CRAWL running "arjun param discovery"
-    awk -F/ '{print $1"//"$3}' "$targets_active_file" | sort -u | head -n "$ACT_MAX_ARJUN" \
+    # Run arjun on the actual parameterless ENDPOINTS (/api/Users, /rest/basket), not on the bare
+    # host root - the old `awk -F/ '{print $1"//"$3}'` stripped every path back to http://host and
+    # re-probed the same root x8 already covered, finding nothing.
+    grep -av '?' "$targets_active_file" 2>/dev/null | sort -u | head -n "$ACT_MAX_ARJUN" \
       | while read -r h; do [ -n "$h" ] && tmo "$ARJUN_MAX_TIME" arjun -u "$h" -q -oT /dev/stdout 2>/dev/null \
-          | sed "s#^#${h}/?#; s#\$#=1#" ; done >> "$targets_active_file" 2>/dev/null || true
+          | sed "s#^#${h}?#; s#\$#=1#" ; done >> "$targets_active_file" 2>/dev/null || true
   fi
   # Final clean of the set that feeds every slow specialist: drop static assets, then dedupe.
   drop_static < "$targets_active_file" 2>/dev/null | sort -u > "$targets_active_file.tmp" \
@@ -415,6 +435,10 @@ $(cat "$OUTDIR/.patterns_numbered.txt")" >"$jout" 2>>"$llm_log" || true
 
   # (G) Correlation / exploitation passes that connect findings into verdicts.
   : > "$bypass_file"; : > "$prop_file"; : > "$idor_file"; : > "$corsy_file"
+  # Status-probe the mined JS/source-map endpoints FIRST and fold them into fuzz_findings, so the
+  # 403-bypass / stack-trace / open-dir passes below (and the report table) see the REST surface,
+  # not just ffuf's root-path hits. Without this, 88 mined /api//rest/ endpoints went untested.
+  set_stage $S_CRAWL running "probing mined API endpoints"; probe_mined_endpoints; render
   set_stage $S_CRAWL running "403 bypass · path propagation · authz diff · CORS"
   awk -F'\t' '$1==401||$1==403' "$fuzz_findings_file" 2>/dev/null \
     | grep -viE 'google\.com|%2e%2e|\\\.\\\.|etc.{0,3}passwd' \
