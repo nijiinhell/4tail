@@ -72,6 +72,9 @@ TRUFFLEHOG_JS="${TRUFFLEHOG_JS:-1}"       # trufflehog --only-verified on saved 
 SOURCEMAPS="${SOURCEMAPS:-1}"             # 1 = recover .js.map source maps -> reconstruct original source for secrets + endpoints
 SOURCEMAP_MAX="${SOURCEMAP_MAX:-40}"      # cap JS files probed for a source map
 SOURCEMAP_SRC_MAX="${SOURCEMAP_SRC_MAX:-200}"  # cap reconstructed source files per map (skip giant vendor bundles)
+SOURCEMAP_MAX_BYTES="${SOURCEMAP_MAX_BYTES:-25000000}"  # skip .js.map files larger than this (vendor maps can be huge)
+NUCLEI_JS="${NUCLEI_JS:-1}"               # 1 = run nuclei token/key extractors over mined JS bundles
+NUCLEI_JS_MAX_TIME="${NUCLEI_JS_MAX_TIME:-180}"  # time cap (s) for the nuclei JS token pass
 USE_KITERUNNER="${USE_KITERUNNER:-1}"     # kiterunner (kr) API-route discovery when installed
 FUZZ_ENGINE="${FUZZ_ENGINE:-ffuf}"        # 'ffuf' (default, tech-aware) or 'feroxbuster' (Rust+recursion)
 FEROX_DEPTH="${FEROX_DEPTH:-2}"           # feroxbuster recursion depth (bounded - recursion can balloon)

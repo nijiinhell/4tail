@@ -3,7 +3,10 @@ js_urls_file="$OUTDIR/js_urls.txt"
 js_secrets_file="$OUTDIR/js_secrets.txt"
 params_file="$OUTDIR/params.txt"
 # Regex for common leaked secrets (no single-quote chars, so it stays shell-safe).
-SECRET_RE='AKIA[0-9A-Z]{16}|AIza[0-9A-Za-z_-]{35}|xox[baprs]-[0-9A-Za-z-]{10,}|ghp_[0-9A-Za-z]{36}|eyJ[A-Za-z0-9_-]{10,}\.[A-Za-z0-9_-]{10,}\.[A-Za-z0-9_-]{10,}|-----BEGIN [A-Z ]*PRIVATE KEY-----|[a-z0-9.-]+\.s3\.amazonaws\.com|(api[_-]?key|secret|access[_-]?token|client[_-]?secret|aws_secret|password)["[:space:]:=]{1,4}[0-9A-Za-z._+/-]{12,}'
+# The generic keyword branch REQUIRES a quote immediately before the value, so a minified
+# variable reference (password:t.applicationSecretKey, password:t.projectSecret) is NOT flagged
+# as a hardcoded secret - only a literal "secret":"<value>" / secret='<value>' / secret=`<value>` is.
+SECRET_RE='AKIA[0-9A-Z]{16}|AIza[0-9A-Za-z_-]{35}|xox[baprs]-[0-9A-Za-z-]{10,}|ghp_[0-9A-Za-z]{36}|eyJ[A-Za-z0-9_-]{10,}\.[A-Za-z0-9_-]{10,}\.[A-Za-z0-9_-]{10,}|-----BEGIN [A-Z ]*PRIVATE KEY-----|[a-z0-9.-]+\.s3\.amazonaws\.com|(api[_-]?key|secret|access[_-]?token|client[_-]?secret|aws_secret|password)["]?[[:space:]]*[:=][[:space:]]*["`][0-9A-Za-z._+/=-]{12,}'
 
 if [ "$JSMINE" != 1 ]; then
   set_stage $S_JS skip "off (-j to enable)"
@@ -78,6 +81,10 @@ else
       grep -aoiE "https?://([a-z0-9._-]+\.)?${esc_domain}[a-z0-9._/?=&%:-]*" "$jtmp" 2>/dev/null
       grep -aoE "[\"'\`]/[a-zA-Z0-9_./?=&%-]{2,}[\"'\`]" "$jtmp" 2>/dev/null | tr -d "\"'\`" | sed "s#^#${jorigin}#"
       grep -aoE "[\"'\`](rest|api|graphql|v[0-9]+)/[a-zA-Z0-9_./?=&%-]{2,}[\"'\`]" "$jtmp" 2>/dev/null | tr -d "\"'\`" | sed "s#^#${jorigin}/#"
+      # Template-literal API paths: `${this.hostServer}/rest/products/search?q=${q}` - the boundary
+      # chars are } and ${, not quotes, so the quote-anchored patterns above miss them. Match the
+      # API path directly (any boundary); $ stops the class, leaving a trailing =/ we normalise below.
+      grep -aoiE "/(rest|api|graphql|ftp|admin|auth|metrics|v[0-9]+)/[a-zA-Z0-9_./?=&%-]*" "$jtmp" 2>/dev/null | sed "s#^#${jorigin}#"
     } 2>/dev/null >> "$js_endpoints_file"
     rm -f "$jtmp"
   done < "$js_urls_file"
@@ -85,6 +92,7 @@ else
     grep -iE "^https?://([a-z0-9._-]+\.)?${esc_domain}([:/]|$)" "$js_endpoints_file" 2>/dev/null \
       | grep -ivE '\.(png|jpe?g|gif|svg|woff2?|ttf|eot|css|ico|map)([?#]|$)' \
       | sed -E '/\?/ s/=(&|$)/=1\1/g' \
+      | sed -E 's#(/(rest|api)/[a-zA-Z0-9_-]+)/$#\1/1#' \
       | sort -u | head -n 4000 > "$js_endpoints_file.tmp" && mv "$js_endpoints_file.tmp" "$js_endpoints_file"
   fi
   if [ -n "$js_dir" ] && [ -n "$(ls -A "$js_dir" 2>/dev/null)" ]; then
@@ -92,6 +100,16 @@ else
     tmo 180 trufflehog --no-update filesystem "$js_dir" --only-verified --json 2>/dev/null \
       | jq -r '[(.SourceMetadata.Data.Filesystem.file // "js"), (.DetectorName // "secret"), (.Raw // "")] | @tsv' 2>/dev/null \
       | sed -E 's#'"$js_dir"'/##' >> "$js_secrets_file" || true
+  fi
+  # 2.4) nuclei token/key extractors over the JS bundles themselves. Step 5 only scans host
+  # ROOTS, so it never looks inside the .js files; nuclei's curated token templates (150+) catch
+  # provider keys our regex misses, and it clusters/fetches each file once.
+  if [ "${NUCLEI_JS:-1}" = 1 ] && have nuclei && [ -s "$js_urls_file" ]; then
+    ST_DETAIL[$S_JS]="nuclei token scan over JS"; render
+    tmo "${NUCLEI_JS_MAX_TIME:-180}" nuclei -silent -l "$js_urls_file" \
+        -tags token,tokens,keys,exposure -severity critical,high,medium,low \
+        ${NUCLEI_NET[@]+"${NUCLEI_NET[@]}"} 2>/dev/null \
+      | sed 's#^#nuclei-js\t#' >> "$js_secrets_file" || true
   fi
   # 2.5) Source maps: a .js.map reconstructs the ORIGINAL (pre-minify) source - full
   #      endpoints, internal API shapes, and the secrets minification hides. Highest-signal
@@ -105,24 +123,28 @@ else
       smi=$((smi+1)); [ "$smi" -gt "$SOURCEMAP_MAX" ] && break
       ST_DETAIL[$S_JS]="source maps $smi: $(nlines "$sourcemap_file") recovered"; render
       # candidate map URL: the convention <file>.map, else the //# sourceMappingURL directive.
+      # Fetch the whole .map to a temp file (vendor/main maps routinely exceed 8MB; `head -c 8M`
+      # cut the JSON mid-stream -> "unexpected EOF" -> 0 maps recovered). --max-filesize skips
+      # genuinely huge maps cleanly instead of leaving truncated JSON.
+      mraw="$(mktemp)"
       mapurl="$j.map"
-      mbody="$(curl -s -L --max-time 12 ${CURL_NET[@]+"${CURL_NET[@]}"} "$mapurl" 2>/dev/null | head -c 8000000)"
-      if ! printf '%s' "$mbody" | jq -e '.sourcesContent | length > 0' >/dev/null 2>&1; then
+      curl -s -L --max-time 25 --max-filesize "${SOURCEMAP_MAX_BYTES:-25000000}" ${CURL_NET[@]+"${CURL_NET[@]}"} -o "$mraw" "$mapurl" 2>/dev/null
+      if ! jq -e '.sourcesContent | length > 0' "$mraw" >/dev/null 2>&1; then
         ref="$(curl -s -L --max-time 12 ${CURL_NET[@]+"${CURL_NET[@]}"} "$j" 2>/dev/null \
                 | grep -aoiE 'sourceMappingURL=[^ "'"'"'*]+' | tail -1 | sed 's/^sourceMappingURL=//')"
         case "$ref" in
-          "" ) continue ;;
-          data:* ) continue ;;                              # inline map, not a separate leak
+          "" ) rm -f "$mraw"; continue ;;
+          data:* ) rm -f "$mraw"; continue ;;                # inline map, not a separate leak
           http* ) mapurl="$ref" ;;
           /* ) mapurl="$(printf '%s' "$j" | sed -E 's#(https?://[^/]+).*#\1#')$ref" ;;
           * ) mapurl="${j%/*}/$ref" ;;
         esac
-        mbody="$(curl -s -L --max-time 12 ${CURL_NET[@]+"${CURL_NET[@]}"} "$mapurl" 2>/dev/null | head -c 8000000)"
-        printf '%s' "$mbody" | jq -e '.sourcesContent | length > 0' >/dev/null 2>&1 || continue
+        curl -s -L --max-time 25 --max-filesize "${SOURCEMAP_MAX_BYTES:-25000000}" ${CURL_NET[@]+"${CURL_NET[@]}"} -o "$mraw" "$mapurl" 2>/dev/null
+        jq -e '.sourcesContent | length > 0' "$mraw" >/dev/null 2>&1 || { rm -f "$mraw"; continue; }
       fi
       printf '%s\n' "$mapurl" >> "$sourcemap_file"; smaps=$((smaps+1))
       origin="$(printf '%s' "$j" | sed -E 's#(https?://[^/]+).*#\1#')"
-      mtmp="$(mktemp)"; printf '%s' "$mbody" > "$mtmp"
+      mtmp="$mraw"                                     # already the full map on disk (no truncation)
       mapglob="$smap_dir/${smaps}_"                   # this map's reconstructed files share this prefix
       scount="$(jq '.sources | length' "$mtmp" 2>/dev/null || echo 0)"
       [ "$scount" -gt "$SOURCEMAP_SRC_MAX" ] 2>/dev/null && scount="$SOURCEMAP_SRC_MAX"
@@ -166,7 +188,14 @@ else
   pwl="${SECLISTS_DIR:+$SECLISTS_DIR/Discovery/Web-Content/burp-parameter-names.txt}"
   if { { [ "$PREFER_X8" = 1 ] && have x8; } || have arjun; }; then
     PARAM_HOSTS="${PARAM_HOSTS:-20}"
-    ptotal="$(printf '%s\n' "$scan_targets" | head -n "$PARAM_HOSTS" | grep -c .)"
+    # Probe the real API/script surface, not just the SPA's static "/" (which serves index.html
+    # and yields params:0). Prefer mined /api//rest/ endpoints + non-static 200s, then host roots.
+    param_targets="$( {
+        [ -s "${js_endpoints_file:-/dev/null}" ] && grep -iE '/api/|/rest/|/graphql|\?' "$js_endpoints_file" 2>/dev/null
+        [ -s "${fuzz_findings_file:-/dev/null}" ] && awk -F'\t' '$1==200 && $2+0>0 {print $3}' "$fuzz_findings_file" 2>/dev/null
+        printf '%s\n' "$scan_targets"
+      } | awk 'NF && !seen[$0]++' )"
+    ptotal="$(printf '%s\n' "$param_targets" | head -n "$PARAM_HOSTS" | grep -c .)"
     pi=0
     while read -r u; do
       [ -z "$u" ] && continue
@@ -202,7 +231,7 @@ else
           | sed "s#^#${u}\t#" >> "$params_file"
       fi
       rm -f "$ptmp"
-    done <<< "$(printf '%s\n' "$scan_targets" | head -n "$PARAM_HOSTS")"
+    done <<< "$(printf '%s\n' "$param_targets" | head -n "$PARAM_HOSTS")"
   fi
   touch "$OUTDIR/.done_js"
   sec_hits="$(nlines "$js_secrets_file")"
