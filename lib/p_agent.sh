@@ -224,14 +224,26 @@ if [ "$VERIFY" = 1 ]; then set_stage $S_TRIAGE running "verifying findings"; ver
   if [ -s "$fuzz_findings_file" ]; then
     echo "## Content discovery hits (ffuf, top 100)"
     echo
-    echo '| Status | Length | URL | Count |'
-    echo '|--------|--------|-----|-------|'
-    # group by response fingerprint (status,length) so WAF noise / case-variants collapse
-    awk -F'\t' 'NF>=3{k=$1"\t"$2; c[k]++; if(!(k in r)) r[k]=$3}
-        END{for(k in c) printf "%s\t%s\t%d\n", k, r[k], c[k]}' "$fuzz_findings_file" \
-      | sort -t"$(printf '\t')" -k1,1n -k3,3nr | head -n 100 \
-      | while IFS=$'\t' read -r st len u c; do
-          echo "| $st | $len | \`$u\` | $([ "$c" -gt 1 ] && echo "×$c" || echo 1) |"
+    echo '| Status | Length | URL(s) | Count |'
+    echo '|--------|--------|--------|-------|'
+    # Group by response fingerprint. For 500/403 (dynamic error pages that echo the requested
+    # path, so lengths differ by a few bytes each) bucket the length by 64 so they collapse into
+    # one row instead of hundreds. For other statuses keep exact length but carry up to 3 sample
+    # URLs so a popular (status,length) doesn't hide 39 distinct endpoints behind one. 0-byte 200s
+    # sort below non-empty 200s.
+    awk -F'\t' '
+      NF>=3 {
+        st=$1; len=$2+0; u=$3
+        if (st==500 || st==403) { b=int(len/64)*64; k=st SUBSEP "b" b; disp="~"b }
+        else { k=st SUBSEP len; disp=len }
+        c[k]++; d[k]=disp; stv[k]=st; zero[k]=(len==0?1:0)
+        if (ns[k]<3) { smp[k]=(smp[k]==""?u:smp[k]" , "u); ns[k]++ }
+      }
+      END{ for(k in c) printf "%s\t%s\t%d\t%d\t%s\n", stv[k], d[k], c[k], zero[k], smp[k] }' "$fuzz_findings_file" \
+      | sort -t"$(printf '\t')" -k1,1n -k4,4n -k3,3nr | head -n 100 \
+      | while IFS=$'\t' read -r st len c z samples; do
+          scell="$(printf '%s' "$samples" | sed -E 's# , #` `#g')"
+          echo "| $st | $len | \`$scell\` | $([ "$c" -gt 1 ] && echo "×$c" || echo 1) |"
         done
     echo
   fi

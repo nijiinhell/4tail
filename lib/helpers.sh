@@ -272,6 +272,7 @@ verify_findings() {
   { [ -f "${agent_file:-}" ]  && grep -ivE '(^|[[:space:]])POST |SECRET-LOOT' "$agent_file" | grep -oiE 'https?://[^ |]+'
     [ -f "${idor_file:-}" ]   && grep -oiE 'https?://[^ |]+' "$idor_file"
     [ -f "${dast_file:-}" ]   && grep -oiE 'https?://[^ |]+' "$dast_file"
+    [ -f "${nuclei_file:-}" ] && grep -oiE 'https?://[^ |]+' "$nuclei_file"
   } 2>/dev/null | sort -u | head -n 60 | while IFS= read -r u; do
     [ -n "$u" ] || continue
     r1="$(curl -s -o /dev/null -w '%{http_code} %{size_download}' -L --max-time 12 ${CURL_NET[@]+"${CURL_NET[@]}"} "$u" 2>/dev/null || echo '000 0')"

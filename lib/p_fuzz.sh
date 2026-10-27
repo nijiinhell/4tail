@@ -225,10 +225,12 @@ else
     fi
     combined="$fuzz_dir/.wl_${safe}.txt"
     # authenticated fuzzing: drop logout/session-kill words so ffuf doesn't nuke the session
+    # Strip a leading slash from every word: SecLists API lists ship entries like "/api-docs",
+    # which would make -u "$url/FUZZ" request "$url//api-docs" (double slash). Normalise to bare.
     if [ "$AVOID_LOGOUT" = 1 ] && [ "${#AUTH_H[@]}" -gt 0 ]; then
-      cat "${wls[@]}" 2>/dev/null | grep -viE "$LOGOUT_RE" | sort -u | head -n "$hw" > "$combined"
+      cat "${wls[@]}" 2>/dev/null | sed 's#^/\+##' | grep -viE "$LOGOUT_RE" | sort -u | head -n "$hw" > "$combined"
     else
-      cat "${wls[@]}" 2>/dev/null | sort -u | head -n "$hw" > "$combined"
+      cat "${wls[@]}" 2>/dev/null | sed 's#^/\+##' | sort -u | head -n "$hw" > "$combined"
     fi
     # Prepend AI-generated, org-specific words (payments-v2, partner-portal, internal, ...) that
     # no static SecLists list carries. Added AFTER the cap so they always get fuzzed (they're few).

@@ -25,6 +25,12 @@ $(head -c 3000 "$params_file" 2>/dev/null)
 === GraphQL schema (if introspection was open - write mutation PoCs) ===
 $(head -c 6000 "${gql_schema_file:-/dev/null}" 2>/dev/null)
 
+=== mined API endpoints (SPA /rest + /api surface - no HTML forms exist, so write PoCs for these: login/register, body IDOR on numeric path ids, mass assignment) ===
+$(grep -iE '/api/|/rest/|/graphql' "${js_endpoints_file:-/dev/null}" 2>/dev/null | head -n 60 | head -c 5000)
+
+=== exposed API specs (Swagger/OpenAPI/GraphQL - derive request shapes) ===
+$(head -c 3000 "${api_specs_file:-/dev/null}" 2>/dev/null)
+
 === agent-confirmed / verified issues (anchor PoCs to these first) ===
 $(head -c 3000 "$agent_file" 2>/dev/null)
 $(head -c 2000 "${verified_file:-/dev/null}" 2>/dev/null)" >"$poc_out" 2>>"$llm_log" || true
@@ -209,11 +215,16 @@ if have jq; then
     # Group ffuf hits by response fingerprint (status,length) - never by URL string -
     # so case-variants (db.asp/DB.asp on IIS) and WAF noise (32 identical 403/312
     # traversal blocks) collapse to one representative with a count.
-    [ -f "$fuzz_findings_file" ] && awk -F'\t' 'NF>=3{k=$1"\t"$2; c[k]++; if(!(k in r)) r[k]=$3}
-        END{for(k in c) printf "%s\t%s\t%d\n", k, r[k], c[k]}' "$fuzz_findings_file" \
+    [ -f "$fuzz_findings_file" ] && awk -F'\t' '
+        NF>=3 { st=$1; len=$2+0; u=$3
+          # 500/403 error pages echo the path -> lengths differ by a few bytes; bucket by 64 so
+          # they collapse to one finding instead of dozens. Other statuses keep exact length.
+          if (st==500||st==403) { b=int(len/64)*64; k=st SUBSEP "b" b; disp="~"b } else { k=st SUBSEP len; disp=len }
+          c[k]++; if(!(k in r)) r[k]=u; d[k]=disp; sv[k]=st }
+        END{for(k in c) printf "%s\t%s\t%s\t%d\n", sv[k], d[k], r[k], c[k]}' "$fuzz_findings_file" \
       | while IFS=$'\t' read -r st len u c; do
           [ -n "$u" ] || continue
-          note="status=$st length=$len"; [ "${c:-1}" -gt 1 ] && note="$note (×$c identical responses)"
+          note="status=$st length=$len"; [ "${c:-1}" -gt 1 ] && note="$note (×$c similar responses)"
           emit_f content-discovery info ffuf "$u" "$note"
         done
     [ -f "$findings_dir/dalfox.txt" ] && while IFS= read -r l; do [ -n "$l" ] && emit_f xss high dalfox "$(nurl "$l")" "$l"; done < "$findings_dir/dalfox.txt"
