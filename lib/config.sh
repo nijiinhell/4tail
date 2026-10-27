@@ -229,7 +229,8 @@ Options:
   -j          JS/secret mining + param discovery (env JSMINE=1)
   -C          Active funnel: crawl -> cluster -> AI juicy -> API specs -> specialists (env CRAWL=1)
   -s          Single host: no subdomain enum; test exactly the given host incl. port/localhost/IP (env SINGLE=1)
-  -B <name>   Blueprint/strategy (env BLUEPRINT; "auto"=AI picks; or webapp_bounty/api_bounty/wordpress/spa/graphql/stealth/deep)
+  -B <name>   Blueprint/strategy (env BLUEPRINT; "auto"=AI picks; or webapp_bounty/api_bounty/
+              wordpress/spa/graphql/cloud_devops/legacy_enterprise/stealth/fast_triage/deep)
   -H <hdr>    Auth header, repeatable (e.g. -H "Authorization: Bearer X"); env AUTH_HEADER/AUTH_COOKIE
   -x <proxy>  Route tools through http(s) proxy (env PROXY)
   -O          OAST: start interactsh, inject OOB payloads, confirm blind SSRF/redirect (env OAST=1)

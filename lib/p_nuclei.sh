@@ -1,7 +1,29 @@
 # Step 5: Nuclei
-# Cap the tag count (the AI sometimes returns 30+ tags -> thousands of templates ->
-# hours of scanning). Keep the most relevant N.
-nuclei_tags="$(printf '%s' "$nuclei_tags" | tr ',' '\n' | awk 'NF' | head -n "$MAX_TAGS" | paste -sd, -)"
+# Close the plan feedback loop: Step 3 chose tags from only the bare "/" of each host, but
+# Steps 4-4.7 then discovered paths (/wp-json, /graphql, /actuator, /swagger, /.git, ...). Fold
+# those surface-PROVEN tags in so the scan actually covers what recon just found. Prepended
+# (ahead of the AI's speculative tags) and deduped BEFORE the MAX_TAGS cap, so a proven tag is
+# never the one truncated away.
+enrich_plan_from_surface() {
+  local blob extra=""
+  blob="$({ cat "$fuzz_findings_file" "$urls_file" "$api_specs_file" "$gf_file" 2>/dev/null; \
+            [ -s "$gql_schema_file" ] && echo /graphql; } | tr 'A-Z' 'a-z')"
+  [ -n "$blob" ] || return 0
+  case "$blob" in *wp-content*|*wp-json*|*wp-includes*|*wp-login*) extra="$extra,wordpress,wp-plugin" ;; esac
+  case "$blob" in *actuator*|*jolokia*|*'/env'*) extra="$extra,springboot,java" ;; esac
+  case "$blob" in *graphql*|*graphiql*) extra="$extra,graphql" ;; esac
+  case "$blob" in *swagger*|*openapi*|*'/api-docs'*) extra="$extra,swagger,api" ;; esac
+  case "$blob" in *'/.git'*|*'/.svn'*) extra="$extra,git,svn" ;; esac
+  case "$blob" in *'/.env'*|*'/config'*|*'/.aws'*) extra="$extra,config,exposures" ;; esac
+  case "$blob" in */jenkins/*|*/gitlab/*|*/grafana/*|*/kibana/*) extra="$extra,default-login,panel" ;; esac
+  case "$blob" in *'/v2/_catalog'*|*'/dockerfile'*) extra="$extra,docker,exposures" ;; esac
+  printf '%s' "${extra#,}"
+}
+surface_tags="$(enrich_plan_from_surface)"
+# Prepend proven tags, then sanitize (allowlist + first-occurrence dedupe) BEFORE the MAX_TAGS
+# cap, so a surface-proven tag is never the one head() truncates away.
+nuclei_tags="$(printf '%s,%s' "${surface_tags}" "$nuclei_tags" \
+  | sanitize_tags | tr ',' '\n' | awk 'NF' | head -n "$MAX_TAGS" | paste -sd, -)"
 
 # Build the nuclei target list: dedupe by (origin, response signature), then VALUE-RANK
 # so the interesting hosts (admin/login/api/dev, auth-gated, notable tech) are scanned

@@ -8,10 +8,10 @@ while getopts ":w:o:t:S:m:M:p:b:B:H:x:OARqjsCyPDh" opt; do
   case "$opt" in
     w) WORDLIST="$OPTARG" ;;
     o) OUTDIR="$OPTARG" ;;
-    t) DEFAULT_NUCLEI_TAGS="$OPTARG" ;;
-    S) NUCLEI_SEVERITY="$OPTARG" ;;
+    t) DEFAULT_NUCLEI_TAGS="$OPTARG"; _user_set_DEFAULT_NUCLEI_TAGS=1 ;;  # wins over a blueprint's extra_tags
+    S) NUCLEI_SEVERITY="$OPTARG"; _user_set_NUCLEI_SEVERITY=1 ;;          # wins over a blueprint's severity
     m) LLM_MODEL="$OPTARG" ;;
-    M) MAX_FUZZ_HOSTS="$OPTARG" ;;
+    M) MAX_FUZZ_HOSTS="$OPTARG"; _user_set_MAX_FUZZ_HOSTS=1 ;;  # wins over a blueprint cap
     p) FUZZ_PARALLEL="$OPTARG"; _user_set_FUZZ_PARALLEL=1 ;;  # authoritative over a blueprint
     j) JSMINE=1; _user_set_JSMINE=1 ;;                        # explicit -j wins over a blueprint toggle
 
@@ -188,6 +188,7 @@ if [ "$DOCTOR" != 1 ]; then
   subdomains_file="$OUTDIR/subdomains.txt"
   httpx_json="$OUTDIR/httpx.jsonl"
   alive_file="$OUTDIR/alive.txt"
+  alive_ranked_file="$OUTDIR/alive_ranked.txt"   # value-ranked alive hosts (shared by all capped stages)
   tech_brief="$OUTDIR/tech_brief.txt"
   fuzz_dir="$OUTDIR/fuzz"; mkdir -p "$fuzz_dir"
   nuclei_file="$OUTDIR/nuclei.txt"
@@ -201,6 +202,7 @@ if [ "$DOCTOR" != 1 ]; then
   supervisor_log="$OUTDIR/supervisor.log"
   fuzz_findings_file="$OUTDIR/fuzz_findings.txt"   # aggregated ffuf hits: status<TAB>length<TAB>url
   urls_file="$OUTDIR/urls.txt"                     # crawled + historical URLs (in-scope)
+  custom_words_file="$OUTDIR/custom_words.txt"     # AI-generated org/product-specific fuzz words
   urls_params_file="$OUTDIR/urls_params.txt"       # URLs with query params (for gf/DAST)
   gf_file="$OUTDIR/gf_hits.txt"                    # gf pattern -> url
   dast_file="$OUTDIR/dast_findings.txt"            # nuclei -dast findings

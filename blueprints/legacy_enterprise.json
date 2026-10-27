@@ -1,0 +1,21 @@
+{
+  "name": "legacy_enterprise",
+  "description": "Legacy enterprise stacks (IIS / .NET / Java / Tomcat / WebLogic / WebSphere / JBoss / ColdFusion / SAP): CVEs, LFI, SQLi, RCE, default logins and backup/source disclosure. Heavier extension fuzzing (.bak/.old/.config/.war/.zip) and sqlmap on.",
+  "focus_areas": ["cve", "lfi", "sqli", "rce", "exposure", "injection"],
+  "specialists": ["nuclei-dast", "sqlmap", "arjun", "dalfox", "kxss"],
+  "nuclei_dast_tags": "sqli,lfi,rce",
+  "nuclei": {
+    "extra_tags": "backup,iis,tomcat,weblogic,websphere,jboss,coldfusion,struts,java,sap"
+  },
+  "caps": {
+    "max_juicy_urls": 100,
+    "max_dalfox": 40,
+    "max_kxss": 300,
+    "max_sqlmap": 4,
+    "max_arjun_hosts": 20,
+    "max_exts": 8,
+    "crawl_max_urls": 8000,
+    "crawl_max_time": 1200,
+    "dast_max_urls": 1200
+  }
+}

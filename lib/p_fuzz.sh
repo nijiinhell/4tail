@@ -146,12 +146,13 @@ else
             ((.tech // []) | map(ascii_downcase) | join(",")),
             $sig ]
         | @tsv' "$httpx_json" 2>/dev/null \
-      | awk -F'\t' '!seen[$3]++ {print $1"\t"$2}' | sort -u)"
+      | awk -F'\t' '!seen[$3]++ {print $1"\t"$2}' | rank_filter)"
   else
     hosts_tsv="$(jq -r '[.url, ((.tech // []) | map(ascii_downcase) | join(","))] | @tsv' \
-                   "$httpx_json" 2>/dev/null | sort -u)"
+                   "$httpx_json" 2>/dev/null | rank_filter)"
   fi
-  [ -n "$hosts_tsv" ] || hosts_tsv="$(sed 's/$/\t/' "$alive_file")"
+  # rank_filter orders hosts by value (not alphabetically) so MAX_FUZZ_HOSTS keeps the top N.
+  [ -n "$hosts_tsv" ] || hosts_tsv="$(sed 's/$/\t/' "$alive_file" | rank_filter)"
   total=$(printf '%s\n' "$hosts_tsv" | grep -c .)
   cap="$total"
   [ "$MAX_FUZZ_HOSTS" -gt 0 ] 2>/dev/null && cap="$MAX_FUZZ_HOSTS"
@@ -211,6 +212,11 @@ else
       cat "${wls[@]}" 2>/dev/null | grep -viE "$LOGOUT_RE" | sort -u | head -n "$MAX_FUZZ_WORDS" > "$combined"
     else
       cat "${wls[@]}" 2>/dev/null | sort -u | head -n "$MAX_FUZZ_WORDS" > "$combined"
+    fi
+    # Prepend AI-generated, org-specific words (payments-v2, partner-portal, internal, ...) that
+    # no static SecLists list carries. Added AFTER the cap so they always get fuzzed (they're few).
+    if [ -s "${custom_words_file:-}" ]; then
+      { cat "$custom_words_file"; cat "$combined"; } | awk 'NF && !seen[$0]++' > "$combined.tmp" && mv "$combined.tmp" "$combined"
     fi
     names="$(printf '%s\n' "${wls[@]}" | sed 's#.*/##' | paste -sd+ -)"
     ext_flag="$(build_ext_flag "$techs")"

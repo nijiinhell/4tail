@@ -127,7 +127,7 @@ elif [ "$AI_ENABLED" = "1" ] && ! budget_ok; then
 elif [ "$AI_ENABLED" = "1" ] && [ -s "$tech_brief" ]; then
   sys_plan='You assist AUTHORIZED bug-bounty recon. Given an aggregated brief of the
 technologies, servers and notable paths on live hosts, produce a scan plan.
-Reply with ONLY a JSON object (no prose, no code fences) with exactly two keys:
+Reply with ONLY a JSON object (no prose, no code fences) with exactly three keys:
   "nuclei_tags": array of 4-12 lowercase nuclei tags (always include cves, exposures,
      misconfiguration, plus tags matched to the observed stack),
   "wordlists": object mapping each relevant lowercase technology name to an array of
@@ -135,7 +135,11 @@ Reply with ONLY a JSON object (no prose, no code fences) with exactly two keys:
      (e.g. "Discovery/Web-Content/CMS/wordpress.fuzz.txt"). Use only real, well-known
      SecLists paths; keep 1-3 paths per technology; omit technologies you are unsure of.
      Prefer small, tech-SPECIFIC lists (CMS/*, api/*, *.fuzz.txt). Do NOT use big generic
-     lists (raft-*, big.txt, directory-list-*, combined_*, dirbuster) - those are excluded.'
+     lists (raft-*, big.txt, directory-list-*, combined_*, dirbuster) - those are excluded.
+  "custom_words": array of 15-30 short org/product-specific path tokens inferred from the
+     subdomain names, page titles and product names in the brief (e.g. "payments-v2",
+     "partner-portal", "internal", "acme", "portal-api"). Single path segments only
+     (lowercase, [a-z0-9._-], no slashes/spaces) - words a generic wordlist would NOT contain.'
   plan_out="$(mktemp)"
   run_ai_stage $S_PLAN "$LLM_MODEL_PLAN" "$LLM_MAX_TOKENS_PLAN" "$sys_plan" "Target: $domain
 Live hosts: $alive_count
@@ -170,6 +174,11 @@ $(head -c 12000 "$tech_brief")" "$plan_out"
        | grep -viE 'raft-|big\.txt|directory-list|combined_|dirbuster|/all\.txt' \
        >> "$tech_map_file" || true
   fi
+  # --- parse org/product-specific custom words (sanitized to single path segments) ---
+  printf '%s' "$plan_json" \
+    | jq -r '.custom_words[]? | select(type=="string")' 2>/dev/null \
+    | tr 'A-Z' 'a-z' | grep -oE '[a-z0-9._-]{2,40}' \
+    | awk '!seen[$0]++' | head -n 40 > "$custom_words_file" 2>/dev/null || true
   rm -f "$plan_out"
 
   nuclei_tags="${clean_plan:-$DEFAULT_NUCLEI_TAGS}"

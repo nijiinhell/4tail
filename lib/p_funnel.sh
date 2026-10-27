@@ -175,7 +175,7 @@ $(cat "$OUTDIR/.patterns_numbered.txt")" >"$jout" 2>>"$llm_log" || true
             fi ;;
         esac
       done
-    done < <(sort -u "$alive_file" 2>/dev/null | head -n 20)
+    done < <(ranked_hosts 20)
     sort -u -o "$api_specs_file" "$api_specs_file"
 
     # (c) fetch each spec and let the AI generate targeted test URLs
@@ -275,7 +275,7 @@ $(cat "$OUTDIR/.patterns_numbered.txt")" >"$jout" 2>>"$llm_log" || true
     set_stage $S_CRAWL running "kiterunner: API route discovery"
     kapi="${SECLISTS_DIR:+$SECLISTS_DIR/Discovery/Web-Content/api/api-endpoints.txt}"
     if [ -n "$kapi" ] && [ -f "$kapi" ]; then
-      sort -u "$alive_file" 2>/dev/null | head -n 20 \
+      ranked_hosts 20 \
         | tmo 300 kr scan - -w "$kapi" -q 2>/dev/null \
         | grep -oE 'https?://[^ ]+' | grep -iE "^https?://([a-z0-9._-]+\.)?${esc_domain}([:/]|$)" \
         | sort -u | head -n 200 >> "$targets_active_file" || true
@@ -390,7 +390,7 @@ $(cat "$OUTDIR/.patterns_numbered.txt")" >"$jout" 2>>"$llm_log" || true
   idor_check; render
   # CORS misconfiguration (Corsy) on the live hosts + juicy URLs (bug class we don't cover elsewhere).
   if [ "$CORS_SCAN" = 1 ] && have corsy; then
-    { sort -u "$alive_file" 2>/dev/null; head -n 30 "$targets_active_file" 2>/dev/null; } | sort -u | head -n "$CORS_MAX" > "$OUTDIR/.cors_in.txt"
+    { ranked_hosts; head -n 30 "$targets_active_file" 2>/dev/null; } | awk '!seen[$0]++' | head -n "$CORS_MAX" > "$OUTDIR/.cors_in.txt"
     # Strip Corsy's ANSI colors, drop its "No misconfigurations found" banner, and keep only
     # lines that are an actual finding (carry a URL or a named misconfig class).
     [ -s "$OUTDIR/.cors_in.txt" ] && tmo 180 corsy -i "$OUTDIR/.cors_in.txt" 2>/dev/null \

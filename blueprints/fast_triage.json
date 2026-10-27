@@ -1,0 +1,23 @@
+{
+  "name": "fast_triage",
+  "description": "5-minute recon + quick wins on a freshly announced scope: tight caps, critical/high/medium only, JS mining on, light fuzzing. A fast first look before a deep pass.",
+  "focus_areas": ["cve", "exposure", "xss", "redirect"],
+  "specialists": ["nuclei-dast", "kxss"],
+  "nuclei_dast_tags": "xss,redirect",
+  "fuzzing_strategy": "light",
+  "stages": { "jsmine": 1 },
+  "nuclei": { "severity": "critical,high,medium" },
+  "rates": { "fuzz_parallel": 2 },
+  "caps": {
+    "max_juicy_urls": 40,
+    "max_dalfox": 0,
+    "max_kxss": 150,
+    "max_sqlmap": 0,
+    "max_arjun_hosts": 0,
+    "max_fuzz_hosts": 10,
+    "fuzz_max_time": 60,
+    "crawl_max_urls": 2000,
+    "crawl_max_time": 300,
+    "dast_max_urls": 400
+  }
+}

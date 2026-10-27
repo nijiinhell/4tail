@@ -28,15 +28,26 @@ load_blueprint() { # $1 = name or path; applies focus/specialists/caps
   bp_set ACT_SPECIALISTS "$(jq -r '(.specialists // []) | join(",")' "$f" 2>/dev/null)"
   bp_set ACT_DAST_TAGS   "$(jq -r '.nuclei_dast_tags // ""' "$f" 2>/dev/null)"
   bp_set FUZZING_STRATEGY "$(jq -r '.fuzzing_strategy // ""' "$f" 2>/dev/null)"
-  # stage toggles: a blueprint can turn on JS mining (e.g. spa) so `-C` alone still
-  # mines JS when the surface demands it, without the user remembering `-j`.
+  # stage toggles: a blueprint can turn stages on/off (e.g. spa turns on JS mining so `-C`
+  # alone mines JS without the user remembering `-j`; a config-focused profile can skip the
+  # client-side XSS passes). Each still yields to an explicit user/env value.
   bp_set JSMINE          "$(jq -r '.stages.jsmine // .jsmine // empty' "$f" 2>/dev/null)"
+  bp_set SOURCEMAPS      "$(jq -r '.stages.sourcemaps // empty' "$f" 2>/dev/null)"
+  bp_set PROPAGATE       "$(jq -r '.stages.propagate // empty' "$f" 2>/dev/null)"
+  bp_set CORS_SCAN       "$(jq -r '.stages.cors // empty' "$f" 2>/dev/null)"
   # rate shaping: let a blueprint (e.g. stealth) throttle the active tools it drives
   # AFTER recon. httpx threads are deliberately NOT here - httpx runs before this.
   bp_set FFUF_RATE       "$(jq -r '.rates.ffuf_rate // empty' "$f" 2>/dev/null)"
   bp_set FUZZ_PARALLEL   "$(jq -r '.rates.fuzz_parallel // empty' "$f" 2>/dev/null)"
   bp_set NUCLEI_RATELIMIT "$(jq -r '.rates.nuclei_ratelimit // empty' "$f" 2>/dev/null)"
   bp_set NUCLEI_CONC     "$(jq -r '.rates.nuclei_conc // empty' "$f" 2>/dev/null)"
+  bp_set NUCLEI_SEVERITY "$(jq -r '.nuclei.severity // empty' "$f" 2>/dev/null)"
+  # nuclei.extra_tags are ADDED to the fallback tag set, so a blueprint pre-seeds stack-specific
+  # tags (wordpress -> wp-plugin,wpscan) even with AI_ENABLED=0. Skipped if the user set -t.
+  local _ntags; _ntags="$(jq -r '.nuclei.extra_tags // empty' "$f" 2>/dev/null)"
+  if [ -n "$_ntags" ] && [ "$_ntags" != null ] && [ -z "${_user_set_DEFAULT_NUCLEI_TAGS:-}" ]; then
+    DEFAULT_NUCLEI_TAGS="$DEFAULT_NUCLEI_TAGS,$_ntags"
+  fi
   bp_set ACT_MAX_JUICY   "$(jq -r '.caps.max_juicy_urls // empty' "$f" 2>/dev/null)"
   bp_set ACT_MAX_DALFOX  "$(jq -r '.caps.max_dalfox // empty' "$f" 2>/dev/null)"
   bp_set ACT_MAX_KXSS    "$(jq -r '.caps.max_kxss // empty' "$f" 2>/dev/null)"
@@ -45,6 +56,10 @@ load_blueprint() { # $1 = name or path; applies focus/specialists/caps
   bp_set CRAWL_MAX_URLS  "$(jq -r '.caps.crawl_max_urls // empty' "$f" 2>/dev/null)"
   bp_set CRAWL_MAX_TIME  "$(jq -r '.caps.crawl_max_time // empty' "$f" 2>/dev/null)"
   bp_set DAST_MAX_URLS   "$(jq -r '.caps.dast_max_urls // empty' "$f" 2>/dev/null)"
+  bp_set MAX_EXTS        "$(jq -r '.caps.max_exts // empty' "$f" 2>/dev/null)"
+  bp_set MAX_FUZZ_HOSTS  "$(jq -r '.caps.max_fuzz_hosts // empty' "$f" 2>/dev/null)"
+  bp_set MAX_FUZZ_WORDS  "$(jq -r '.caps.max_fuzz_words // empty' "$f" 2>/dev/null)"
+  bp_set FUZZ_MAX_TIME   "$(jq -r '.caps.fuzz_max_time // empty' "$f" 2>/dev/null)"
   return 0
 }
 # Resolve the blueprint: explicit name, or AI-chosen from the catalog using the tech brief.
@@ -73,6 +88,20 @@ resolve_blueprint() {
      && grep -qiE 'angular|react|vue\.?js|next\.?js|nuxt|svelte|ember|backbone|single[ -]?page' "$tech_brief" 2>/dev/null; then
     load_blueprint spa
     [ "$ASSUME_YES" = 1 ] || log "Blueprint: spa (SPA framework detected in tech surface)"
+    return
+  fi
+  # DevOps / cloud-native tooling -> config/secret exposure profile.
+  if [ -s "$tech_brief" ] && [ -n "$BLUEPRINTS_DIR" ] && [ -f "$BLUEPRINTS_DIR/cloud_devops.json" ] \
+     && grep -qiE 'kubernetes|kubelet|docker|jenkins|gitlab|grafana|kibana|prometheus|consul|vault|argocd|rancher|harbor|spring ?boot' "$tech_brief" 2>/dev/null; then
+    load_blueprint cloud_devops
+    [ "$ASSUME_YES" = 1 ] || log "Blueprint: cloud_devops (DevOps/cloud-native tooling detected)"
+    return
+  fi
+  # Legacy enterprise stacks -> CVE/LFI/SQLi/RCE + heavy extension fuzzing.
+  if [ -s "$tech_brief" ] && [ -n "$BLUEPRINTS_DIR" ] && [ -f "$BLUEPRINTS_DIR/legacy_enterprise.json" ] \
+     && grep -qiE 'weblogic|websphere|jboss|coldfusion|struts|/sap/|netweaver|iis/[5-8][^0-9]' "$tech_brief" 2>/dev/null; then
+    load_blueprint legacy_enterprise
+    [ "$ASSUME_YES" = 1 ] || log "Blueprint: legacy_enterprise (legacy stack detected in tech surface)"
     return
   fi
   if [ "$AI_ENABLED" = 1 ] && [ -n "$BLUEPRINTS_DIR" ] && budget_ok && [ -s "$tech_brief" ]; then

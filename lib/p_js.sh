@@ -17,7 +17,7 @@ else
   # 1) gather JS URLs. UNION every available method (subjs/getJS can whiff on SPAs, and a
   #    direct scrape of <script src> catches the Angular/Vue/React bundles they miss).
   : > "$js_urls_file"
-  scan_targets="$(sort -u "$alive_file" | head -n "$JS_HOSTS")"
+  scan_targets="$(ranked_hosts "$JS_HOSTS")"
   have subjs && printf '%s\n' "$scan_targets" | subjs 2>/dev/null >> "$js_urls_file"
   have getJS && printf '%s\n' "$scan_targets" | while read -r u; do getJS --url "$u" 2>/dev/null; done >> "$js_urls_file"
   # Always also scrape <script src=...> directly (handles ", ', and module scripts), so a SPA's

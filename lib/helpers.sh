@@ -1,3 +1,52 @@
+# --- Host value-ranking (shared across every capped stage) -------------------
+# Rank live hosts ONCE by likely value (admin/api/dev/auth-gated/notable tech first,
+# CDN last, legacy-stack bonus) into $alive_ranked_file, so fuzz/js/api-spec/nuclei all
+# spend their caps on the interesting hosts instead of the alphabetical first N.
+build_alive_ranked() {
+  alive_ranked_file="${alive_ranked_file:-$OUTDIR/alive_ranked.txt}"
+  if have jq && [ -s "$httpx_json" ]; then
+    jq -r '[ .url, ((.tech // [])|map(ascii_downcase)|join(",")), (.status_code|tostring), (.title // "") ] | @tsv' \
+        "$httpx_json" 2>/dev/null \
+      | awk -F'\t' '!seen[$1]++' \
+      | awk -F'\t' -v stale="${stale_file:-}" '
+          BEGIN{ if (stale!=""){ while((getline ln<stale)>0){ n=split(ln,a,"\t"); if(n>=2) sc[a[2]]=a[1] } } }
+          { url=$1; tech=$2; st=$3; l=tolower($1" "$4" "$2); s=0;
+            if (l ~ /admin|login|portal|dashboard|dev|staging|test|internal|api|graphql|swagger|git|jenkins|grafana|kibana|vpn|auth|sso|jira|confluence|gitlab|panel|backend|secure|account|billing|payment|upload|debug|config/) s+=3;
+            if (st=="401"||st=="403") s+=2;
+            if (st=="500"||st=="503") s+=1;
+            if (tech ~ /wordpress|drupal|joomla|magento|jira|confluence|gitlab|jenkins|grafana|tomcat|spring|php/) s+=2;
+            if (tech ~ /cloudfront|cloudflare|akamai|fastly|imperva|incapsula|sucuri|edgecast/) s-=5;
+            if (url in sc) s += sc[url];
+            printf "%d\t%s\n", s, url }' \
+      | sort -t"$(printf '\t')" -k1,1nr -s | cut -f2 > "$alive_ranked_file" 2>/dev/null || true
+  fi
+  [ -s "$alive_ranked_file" ] || { [ -s "${alive_file:-}" ] && sort -u "$alive_file" > "$alive_ranked_file" 2>/dev/null; }
+  [ -f "$alive_ranked_file" ] || : > "$alive_ranked_file"
+}
+# Emit the top-N value-ranked alive hosts (plain URLs), falling back to the alphabetical
+# alive list if ranking never ran. N omitted = all.
+ranked_hosts() {
+  local n="${1:-0}"
+  if [ -s "${alive_ranked_file:-}" ]; then
+    if [ "$n" -gt 0 ] 2>/dev/null; then head -n "$n" "$alive_ranked_file"; else cat "$alive_ranked_file"; fi
+  elif [ -s "${alive_file:-}" ]; then
+    if [ "$n" -gt 0 ] 2>/dev/null; then sort -u "$alive_file" | head -n "$n"; else sort -u "$alive_file"; fi
+  fi
+}
+# Reorder stdin (field 1 = url) to match $alive_ranked_file, de-duped by url, unknown urls last.
+# Falls back to a plain de-dupe when no ranking exists. Preserves each line's own tabs.
+rank_filter() {
+  local rf="${1:-${alive_ranked_file:-}}"
+  if [ -n "$rf" ] && [ -s "$rf" ]; then
+    awk -F'\t' -v rf="$rf" '
+      BEGIN{ r=0; while((getline u<rf)>0){ if(!(u in rank)) rank[u]=++r } }
+      !seen[$1]++ { print (($1 in rank) ? rank[$1] : 1000000+NR) "\t" $0 }' \
+    | sort -k1,1n -s | cut -f2-
+  else
+    awk '!seen[$0]++'
+  fi
+}
+
 # --- Cost ledger (estimated USD spent on the LLM) ---------------------------
 # Cost ledger is APPEND-only (one cost per line) so concurrent background ai_call writes
 # (triage + the nuclei supervisor) can't clobber each other; cost_now sums the lines.

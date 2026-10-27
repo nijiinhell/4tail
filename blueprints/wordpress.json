@@ -4,6 +4,7 @@
   "focus_areas": ["cve", "xss", "sqli", "lfi", "exposure"],
   "specialists": ["nuclei-dast", "dalfox", "kxss", "sqlmap", "arjun"],
   "nuclei_dast_tags": "xss,sqli,lfi",
+  "nuclei": { "extra_tags": "wordpress,wp-plugin,wp-theme" },
   "caps": {
     "max_juicy_urls": 80,
     "max_dalfox": 60,
