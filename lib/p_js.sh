@@ -233,6 +233,18 @@ else
       rm -f "$ptmp"
     done <<< "$(printf '%s\n' "$param_targets" | head -n "$PARAM_HOSTS")"
   fi
+  # Post-JS SPA fallback: httpx fingerprinted no server tech, but JS mining found a real SPA/API
+  # surface. Record it in the brief and, if the auto-blueprint only fell back to the generic
+  # default, apply spa traits now (sqlmap/nuclei-dast on the /rest+/api backend, light fuzzing) -
+  # these drive the funnel stage that runs next.
+  js_count="$(nlines "$js_urls_file")"; ep_count="$(nlines "${js_endpoints_file:-/dev/null}")"
+  if { [ "${js_count:-0}" -ge 10 ] || [ "${ep_count:-0}" -ge 10 ]; } \
+     && ! grep -qiE 'wordpress|drupal|joomla|magento|php|iis|asp|tomcat|spring|django|express|angular|react|vue|svelte' "${tech_brief:-/dev/null}" 2>/dev/null; then
+    echo "== detected: SPA / REST API (JS-heavy; httpx saw no server tech; JS mining found $js_count bundles / $ep_count endpoints) ==" >> "$tech_brief"
+    if [ "${BLUEPRINT:-auto}" = auto ] && [ "${BLUEPRINT_NAME:-}" = webapp_bounty ] && command -v load_blueprint >/dev/null 2>&1 && [ -n "${BLUEPRINTS_DIR:-}" ]; then
+      load_blueprint spa && { [ "$ASSUME_YES" = 1 ] || log "Blueprint: spa (post-JS detection - httpx saw no tech, JS surface is a SPA)"; }
+    fi
+  fi
   touch "$OUTDIR/.done_js"
   sec_hits="$(nlines "$js_secrets_file")"
   set_stage $S_JS done "$js_total JS, $sec_hits secret hits$([ -s "$params_file" ] && echo ', params')"

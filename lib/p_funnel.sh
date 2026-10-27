@@ -46,7 +46,14 @@ else
   fi
   if have katana; then
     set_stage $S_CRAWL running "katana crawling…"
-    kcmd=(katana -silent -list "$alive_file" -d 2 -jc -kf all -c 15 -ef png,jpg,jpeg,gif,svg,ico,webp,woff,woff2,ttf,eot,otf,css,mp4,mp3,pdf,zip -o "$OUTDIR/.katana.txt")
+    # Seed katana with the live hosts PLUS ffuf's 200 hits, so it crawls INSIDE unlinked
+    # directories discovery found (/ftp, /api-docs, ...) instead of only the root pages.
+    katana_seed="$OUTDIR/.katana_seed.txt"
+    { cat "$alive_file" 2>/dev/null
+      [ -s "${fuzz_findings_file:-/dev/null}" ] && awk -F'\t' '$1==200 {print $3}' "$fuzz_findings_file" 2>/dev/null
+    } | awk 'NF && !seen[$0]++' | head -n 500 > "$katana_seed"
+    [ -s "$katana_seed" ] || cp "$alive_file" "$katana_seed" 2>/dev/null
+    kcmd=(katana -silent -list "$katana_seed" -d 2 -jc -kf all -c 15 -ef png,jpg,jpeg,gif,svg,ico,webp,woff,woff2,ttf,eot,otf,css,mp4,mp3,pdf,zip -o "$OUTDIR/.katana.txt")
     [ "${#KATANA_NET[@]}" -gt 0 ] && kcmd+=("${KATANA_NET[@]}")
     # authenticated crawl: never follow logout/session-kill links (would drop the session)
     [ "$AVOID_LOGOUT" = 1 ] && [ "${#AUTH_H[@]}" -gt 0 ] && kcmd+=(-cos "$LOGOUT_RE")
@@ -58,6 +65,7 @@ else
     done
     wait "$kpid" 2>/dev/null || true
     [ -f "$OUTDIR/.katana.txt" ] && cat "$OUTDIR/.katana.txt" >> "$urls_file" && rm -f "$OUTDIR/.katana.txt"
+    rm -f "$katana_seed"
   fi
   # fold in content-discovery hits so crawling/API-spec detection/param-mining also see paths
   # only ffuf/feroxbuster found (/v2/api-docs, /admin, /api/users, ...).
@@ -170,7 +178,8 @@ $(cat "$OUTDIR/.patterns_numbered.txt")" >"$jout" 2>>"$llm_log" || true
       "$urls_file" 2>/dev/null | grep -iE 'https?://' | sort -u >> "$api_specs_file" || true
     # (b) probe common spec paths on each live host (capped, auth-aware)
     api_probe_paths=(/swagger.json /swagger/v1/swagger.json /openapi.json /v2/api-docs /v3/api-docs \
-                     /api-docs /api/swagger.json /api/openapi.json /swagger-ui/index.html /graphql /api/graphql)
+                     /api-docs /api/swagger.json /api/openapi.json /swagger-ui/index.html /graphql /api/graphql \
+                     /api-docs/swagger-ui-init.js /swagger-ui-init.js)   # Express/Node Swagger UI embeds the spec JSON here
     while IFS= read -r h; do
       [ -n "$h" ] || continue
       base="${h%/}"
