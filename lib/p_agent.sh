@@ -35,6 +35,28 @@ else
   _http_status() { printf '%s' "$1" | grep -aiE '^HTTP/' | tail -1 | tr -d '\r'; }
   _http_keyhdrs() { printf '%s' "$1" | grep -aiE '^(location|set-cookie|content-type):' | tr -d '\r' | tr '\n' ' ' | head -c 220; }
   _status_code() { printf '%s' "$1" | grep -aoE '[0-9]{3}' | head -1; }   # 3-digit code from a status line
+  # Autonomous auth capture: when the user supplied NO session, a token/cookie the agent earns from
+  # a 200/201 (register/login/leak) is captured ONCE and applied to every later probe, so it can
+  # pivot into authenticated BOLA/IDOR/priv-esc on its own. Reads the UNREDACTED response.
+  agent_autoauth=0; { [ -z "${AUTH_HEADER:-}" ] && [ -z "${AUTH_COOKIE:-}" ] && [ -z "${AUTH_A:-}" ]; } && agent_autoauth=1
+  agent_captured_auth=""
+  agent_try_capture_auth() {  # $1 = raw (unredacted) response
+    [ "$agent_autoauth" = 1 ] && [ -z "$agent_captured_auth" ] || return 0
+    local tok ck
+    tok="$(printf '%s' "$1" | grep -aoiE '"(access[_-]?token|id[_-]?token|jwt|token)"[[:space:]]*:[[:space:]]*"[A-Za-z0-9._-]{20,}"' | head -1 | grep -aoE '[A-Za-z0-9._-]{20,}' | head -1)"
+    if [ -n "$tok" ]; then
+      agent_captured_auth="Authorization: Bearer $tok"
+      printf '[auth-captured] bearer token acquired - applied to subsequent probes\n' >> "$agent_file"
+      results="$results"$'\n'"[auth-captured] a bearer token was captured and is now applied to all further probes - re-test the 401/403 endpoints and id-walk resource paths"
+      return 0
+    fi
+    ck="$(printf '%s' "$1" | grep -aoiE '^set-cookie:[[:space:]]*[^;[:space:]]+' | head -1 | sed -E 's/^set-cookie:[[:space:]]*//I')"
+    if [ -n "$ck" ]; then
+      agent_captured_auth="Cookie: $ck"
+      printf '[auth-captured] session cookie acquired - applied to subsequent probes\n' >> "$agent_file"
+      results="$results"$'\n'"[auth-captured] a session cookie was captured and is now applied to all further probes - re-test the 401/403 endpoints and id-walk resource paths"
+    fi
+  }
   # Scope string for the AI: in single-host / custom-port mode, hand it the exact seed URL
   # (http://localhost:3000) so it keeps the scheme+port; otherwise the wildcard host scope.
   agent_scope="*.$domain"; [ "${SINGLE:-0}" = 1 ] && agent_scope="${SEED_URL:-$agent_scope}"
@@ -62,7 +84,10 @@ else
         awk -F'\t' '$1==200 && $2+0<80 {print $3}' "$fuzz_findings_file" | head -15; }
       [ -s "$fuzz_findings_file" ] && { echo "NOTABLE PATHS:";
         awk -F'\t' '$1~/^(200|301|302|401|403)$/{print $1" "$3}' "$fuzz_findings_file" | grep -ivE 'google\.com|etc.{0,3}passwd' | head -25; }
+      [ -s "$fuzz_findings_file" ] && { echo "AUTH-GATED ENDPOINTS (401/403 - re-probe these once you capture a token/cookie):";
+        awk -F'\t' '$1==401||$1==403{print $3}' "$fuzz_findings_file" | head -20; }
       [ -s "${forms_file:-/dev/null}" ] && { echo "HARVESTED FORMS (page<TAB>method<TAB>action<TAB>fields - use these REAL field names for POST probes: auth SQLi, mass assignment, CSRF):"; head -20 "$forms_file"; }
+      [ -s "${js_fields_file:-/dev/null}" ] && { echo "MINED REQUEST FIELD NAMES (from JS bundles - the app's real body/param vocabulary; prefer these over guessing, and send {} to an unknown POST to learn the rest from its 400/422 error):"; paste -sd, "$js_fields_file" | head -c 1000; echo; }
       [ "$OAST" = 1 ] && [ -n "${OAST_DOMAIN:-}" ] && echo "OAST DOMAIN: you have an out-of-band collaborator. Put a unique subdomain like agent-r<round>.$OAST_DOMAIN into url/redirect/callback params or SSRF-able fields; a DNS/HTTP callback to it CONFIRMS blind SSRF/RCE."
     } | head -c 12000 )"
   astart=$SECONDS; round=0; results="(none yet - this is the first round)"
@@ -83,8 +108,12 @@ Three kinds of action:
   GET <url> | why | success-regex            -> a passive fetch you confirm by regex (LFI reads, redirects, param mining, IDOR id-walking).
   POST <url> | body | why | success-regex    -> a form/JSON POST to test BODY-based bugs: login/register logic, body IDOR/SQLi, mass assignment. body is raw urlencoded (e.g. tfUName=%27&tfUPass=x) or JSON. NON-DESTRUCTIVE only: benign markers, id=1/id=2, a single quote for SQLi - never DROP/DELETE/TRUNCATE/SHUTDOWN/xp_cmdshell or mass writes (those are refused).
   TOOL <name> <url> | tags=...               -> run a real tool. ONLY these are installed: ${agent_tools:-none}. Use them to CONFIRM, e.g. sqlmap on a SQLi-looking param (it always runs capped at --level=1 --risk=1; higher levels are ignored), dalfox on a reflecting param, nuclei <url> tags=iis,cve on a fingerprinted host, git-dumper on an exposed /.git, nuclei-dast to fuzz a param URL. Prefer a TOOL to prove a lead over guessing.
-Ideas: confirmed/possible LFI (Templatize.asp?item=) -> read ../web.config, ../global.asa, ../../../windows/win.ini (if it holds a connection string / machineKey, 4tail saves the raw file for the human - you just confirm the read with a regex like connectionString); empty/small 200 endpoints -> add params ?id=1&debug=1; redirect params -> //example.org/ and watch Location; exposed /.git -> git-dumper.
-For the MINED API ENDPOINTS (SPA /rest + /api) go further than GET: (a) PATH-IDOR/BOLA - a numeric path segment like /api/Users/1 or /rest/basket/3 is an object id, so GET the neighbour (/2, /4) and compare; a readable neighbour you should not own is a lead; (b) AUTH/SQLi - POST a JSON body to a login/authentication endpoint with a single-quote injected into the email/username field and look for a SQL error or an unexpected auth success; (c) MASS ASSIGNMENT - POST/register with an extra JSON field such as role set to admin, or isAdmin true, and check whether it sticks. Use the POST action for (b) and (c); a body that starts with a brace is sent as application/json.
+Work from first principles on THIS target - do not assume any framework's specific paths or field names. Methodology:
+- SCHEMA FIRST: before POSTing to an endpoint whose body fields you do not already know from the DISCOVERED FORMS/FIELDS or an API spec, send an empty JSON body {} (or a single dummy field) once. A 400/422 validation error usually names the required fields (e.g. "field 'x' is required"); use those exact names next round. Do NOT invent field names.
+- LFI / path traversal: on a param that names a file/template/page, read common sensitive files relative to it (../ up to the web root: app config, env files, /etc/passwd, source) and confirm with a content signature (connectionString, root:.*:0:0:, BEGIN PRIVATE KEY). 4tail saves any raw credential file for the human.
+- empty/small 200 endpoints -> add plausible params (?id=1&debug=1); redirect-looking params -> set an off-site absolute URL and watch the Location header; an exposed /.git -> git-dumper.
+For the MINED API ENDPOINTS go further than GET: (a) PATH-IDOR/BOLA - a numeric or UUID path segment is an object id, so GET a neighbour id and compare; a readable record you should not own is a lead; (b) AUTH/SQLi - POST to a login/auth endpoint with a single quote in the identifier field and look for a SQL error or an unexpected auth success; (c) MASS ASSIGNMENT - when registering or updating a profile, add standard privilege attributes alongside the REAL required fields: role (e.g. admin), isAdmin/is_admin true, permissions, group, plan - then read the response to see if they stuck. Use the POST action for (b)/(c); a body starting with a brace is sent as application/json.
+If an unauthenticated probe returns a session token or creates an account, 4tail auto-captures it and applies it to your later probes - so next round PIVOT to re-testing the 401/403 endpoints and sequential/UUID resource paths for BOLA/IDOR with that new access.
 All URLs MUST be on the target scope $agent_scope (keep the scheme and port exactly as given). Respond in EXACTLY this structure, nothing else:
 NOTES:
 <2-6 short lines: updated hypotheses + status>
@@ -156,18 +185,22 @@ $results" > "$aout" 2>>"$llm_log" || true
         printf 'POST %s %s\n' "$purl" "$pbody" >> "$agent_seen"; np=$((np+1)); agent_post_n=$((agent_post_n+1))
         set_stage $S_AGENT running "round $round: POST probe ($agent_post_n/$AGENT_MAX_POST)"; render
         pct="application/x-www-form-urlencoded"; case "$pbody" in \{*|\[*) pct="application/json" ;; esac
-        presp="$(_cap curl -s -i -L -X POST --max-time 15 ${CURL_NET[@]+"${CURL_NET[@]}"} -H "Content-Type: $pct" --data "$pbody" "$purl" 2>/dev/null | head -c 6000)"
+        presp="$(_cap curl -s -i -L -X POST --max-time 15 ${CURL_NET[@]+"${CURL_NET[@]}"} ${agent_captured_auth:+-H "$agent_captured_auth"} -H "Content-Type: $pct" --data "$pbody" "$purl" 2>/dev/null | head -c 6000)"
         agent_capture_secret "$purl" "$presp"
         phit=""; printf '%s' "$presp" | grep -qiE -- "$prx" 2>/dev/null && phit="HIT"
         pstatus="$(_http_status "$presp")"; pcode="$(_status_code "$pstatus")"
+        case "$pcode" in 200|201) agent_try_capture_auth "$presp" ;; esac
         pbody_raw="$(_http_body "$presp")"; pkeyh="$(_http_keyhdrs "$presp")"
         pbody_red="$(printf '%s' "$pbody_raw" | sed -E 's/((pass(word|wd)?|connection[-_ ]?string|accountkey|secret|api[-_]?key|token)[^[:cntrl:]]{0,8}[:=])[^[:cntrl:]"'"'"']{1,}/\1<redacted>/Ig')"
         psnip="$(printf '%s' "$pbody_red" | tr '\n\r\t' '   ' | sed -E 's/  +/ /g' | head -c 400)"
         printf '[r%s] POST %-4s %s (body: %.60s)\n   why: %s\n   resp: %s | %s | %s\n' "$round" "${phit:-...}" "$purl" "$pbody" "$pwhy" "$pstatus" "$pkeyh" "$psnip" >> "$agent_log"
         results="$results"$'\n'"POST $purl => ${phit:-no-match} [$pstatus] ${pkeyh} ${psnip}"
-        # Record a CONFIRMED only once per (method,url) and never on a 4xx client-error rejection.
+        # Record CONFIRMED once per (method,url); never on a 4xx; and not when the match is only the
+        # SPA catch-all HTML shell (auth-bypass/mass-assignment artifacts are JSON/headers, not index.html).
         if [ "$phit" = HIT ]; then
-          case "$pcode" in 4[0-9][0-9]) : ;; *) grep -qF "[CONFIRMED] POST $purl " "$agent_file" 2>/dev/null \
+          _pshell=0; printf '%s' "$pbody_raw" | head -c 80 | grep -qiE '^[[:space:]]*<(!doctype|html)' \
+            && ! printf '%s' "$prx" | grep -qiE 'html|doctype|<' && _pshell=1
+          case "$pcode" in 4[0-9][0-9]) : ;; *) [ "$_pshell" = 1 ] || grep -qF "[CONFIRMED] POST $purl " "$agent_file" 2>/dev/null \
               || printf '[CONFIRMED] POST %s (body: %s) | %s\n' "$purl" "$pbody" "$pwhy" >> "$agent_file" ;; esac
         fi
         continue
@@ -183,20 +216,27 @@ $results" > "$aout" 2>>"$llm_log" || true
       grep -qxF "$url" "$agent_seen" 2>/dev/null && continue
       printf '%s\n' "$url" >> "$agent_seen"; np=$((np+1))
       set_stage $S_AGENT running "round $round: probing ($(nlines "$agent_seen") sent)"; render
-      resp="$(curl -s -i -L --max-time 12 ${CURL_NET[@]+"${CURL_NET[@]}"} "$url" 2>/dev/null | head -c 6000)"
+      resp="$(curl -s -i -L --max-time 12 ${CURL_NET[@]+"${CURL_NET[@]}"} ${agent_captured_auth:+-H "$agent_captured_auth"} "$url" 2>/dev/null | head -c 6000)"
       agent_capture_secret "$url" "$resp"   # save raw creds locally (not to the LLM) if present
       # (body is redacted below before it is shown to the LLM)
       hit=""; [ -n "$rx" ] && printf '%s' "$resp" | grep -qiE -- "$rx" 2>/dev/null && hit="HIT"
       local_status="$(_http_status "$resp")"; gcode="$(_status_code "$local_status")"
+      case "$gcode" in 200|201) agent_try_capture_auth "$resp" ;; esac
       gbody="$(_http_body "$resp")"; gkeyh="$(_http_keyhdrs "$resp")"
       gbody_red="$(printf '%s' "$gbody" | sed -E 's/((pass(word|wd)?|connection[-_ ]?string|accountkey|secret|api[-_]?key|token|aws[_-]?secret[_-]?access[_-]?key)[^[:cntrl:]]{0,8}[:=])[^[:cntrl:]"'"'"']{1,}/\1<redacted>/Ig')"
       snippet="$(printf '%s' "$gbody_red" | tr '\n\r\t' '   ' | sed -E 's/  +/ /g' | head -c 400)"
       printf '[r%s] %-4s %s\n   why: %s\n   resp: %s | %s | %s\n' "$round" "${hit:-...}" "$url" "$why" "$local_status" "$gkeyh" "$snippet" >> "$agent_log"
       results="$results"$'\n'"$url => ${hit:-no-match} [$local_status] ${gkeyh} ${snippet}"
-      # CONFIRM only once per url, and not on a 4xx client-error rejection (e.g. 406 redirect reject).
+      # CONFIRM only once per url; never on a 4xx rejection; and not when the regex only matched the
+      # SPA catch-all HTML shell (a real data/LFI leak is not the app's index.html).
       if [ "$hit" = HIT ]; then
-        case "$gcode" in 4[0-9][0-9]) : ;; *) grep -qF "[CONFIRMED] $url |" "$agent_file" 2>/dev/null \
-            || printf '[CONFIRMED] %s | %s\n' "$url" "$why" >> "$agent_file" ;; esac
+        _shell=0; printf '%s' "$gbody" | head -c 80 | grep -qiE '^[[:space:]]*<(!doctype|html)' \
+          && ! printf '%s' "$rx" | grep -qiE 'html|doctype|<' && _shell=1
+        case "$gcode" in
+          4[0-9][0-9]) : ;;
+          *) [ "$_shell" = 1 ] || grep -qF "[CONFIRMED] $url |" "$agent_file" 2>/dev/null \
+               || printf '[CONFIRMED] %s | %s\n' "$url" "$why" >> "$agent_file" ;;
+        esac
       fi
     done <<< "$probes"
     [ -n "$results" ] || break

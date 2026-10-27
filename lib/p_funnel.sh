@@ -230,6 +230,18 @@ $(cat "$OUTDIR/.patterns_numbered.txt")" >"$jout" 2>>"$llm_log" || true
           fi ;;
       esac
       spec_n=$((spec_n+1))
+      # Extract POST/PUT/PATCH request-body field names from the OpenAPI spec into forms_file, so
+      # the agent/PoC know the real body schema of write endpoints (not just GET paths). Best-effort
+      # jq over OpenAPI 3 inline schemas; failures are silent.
+      if have jq; then
+        printf '%s' "$body" | jq -r '
+          (.paths // {}) | to_entries[] | .key as $p | (.value // {}) | to_entries[]
+          | select(.key|test("^(post|put|patch)$";"i")) | .key as $m
+          | ((.value.requestBody.content // {}) | to_entries[]?.value.schema.properties? // (.value.parameters // [] | map(select(.in=="body")) | .[0].schema.properties?) // {})
+          | if (type=="object") then (keys | join(",")) else empty end
+          | select(length>0) | "\($p)\t\($m|ascii_upcase)\tapi-spec\t\(.)"' 2>/dev/null \
+          >> "${forms_file:-/dev/null}" || true
+      fi
       set_stage $S_CRAWL running "AI building API tests from spec $spec_n/$API_MAX_SPECS"
       if [ "$AI_ENABLED" = 1 ] && budget_ok; then
         aout="$(mktemp)"

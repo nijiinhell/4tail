@@ -234,8 +234,10 @@ idor_check() {
 # reused by the PoC generator. Idempotent: skips if forms_file is already populated.
 harvest_forms() {
   [ "${POC_GEN:-1}" = 1 ] || return 0
-  [ -s "${forms_file:-/dev/null}" ] && return 0
-  : > "$forms_file"
+  # Run once (marker, not "file non-empty") so OpenAPI request-body schemas appended earlier by the
+  # funnel are preserved - and so re-calls (agent then PoC-gen) don't duplicate the HTML harvest.
+  [ -f "$OUTDIR/.forms_done" ] && return 0
+  touch "$OUTDIR/.forms_done"
   local form_cand pg html frm m a names
   form_cand="$( { sort -u "$alive_file" 2>/dev/null; cat "${targets_active_file:-/dev/null}" 2>/dev/null; } \
                  | grep -iE 'login|signin|sign-in|register|signup|sign-up|reset|password|forgot|account|profile|checkout|cart|upload|contact|comment|graphql' \

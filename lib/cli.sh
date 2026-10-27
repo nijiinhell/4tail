@@ -214,6 +214,7 @@ if [ "$DOCTOR" != 1 ]; then
   sourcemap_file="$OUTDIR/sourcemaps.txt"          # recovered .js.map URLs (source leak)
   smap_endpoints_file="$OUTDIR/sourcemap_endpoints.txt"  # endpoints reconstructed from source maps (folded into urls)
   js_endpoints_file="$OUTDIR/js_endpoints.txt"     # API endpoints/paths mined from JS bundles (SPA surface -> folded into urls)
+  js_fields_file="$OUTDIR/js_fields.txt"           # request field/param names mined from JS (so the agent doesn't guess bodies)
   open_dir_file="$OUTDIR/open_dirs.txt"            # open directory listings + extracted confidential files
   stacktrace_file="$OUTDIR/stack_traces.txt"       # 500 pages leaking stack traces / DB errors
   unauth_api_file="$OUTDIR/unauth_api.txt"         # unauthenticated REST/API data exposure (BOLA candidates)

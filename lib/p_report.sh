@@ -28,6 +28,9 @@ $(head -c 6000 "${gql_schema_file:-/dev/null}" 2>/dev/null)
 === mined API endpoints (SPA /rest + /api surface - no HTML forms exist, so write PoCs for these: login/register, body IDOR on numeric path ids, mass assignment) ===
 $(grep -iE '/api/|/rest/|/graphql' "${js_endpoints_file:-/dev/null}" 2>/dev/null | head -n 60 | head -c 5000)
 
+=== mined request field names (the app's real body/param vocabulary - use these in PoC bodies, not guesses) ===
+$(paste -sd, "${js_fields_file:-/dev/null}" 2>/dev/null | head -c 1200)
+
 === exposed API specs (Swagger/OpenAPI/GraphQL - derive request shapes) ===
 $(head -c 3000 "${api_specs_file:-/dev/null}" 2>/dev/null)
 

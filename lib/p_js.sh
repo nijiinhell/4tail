@@ -86,8 +86,20 @@ else
       # API path directly (any boundary); $ stops the class, leaving a trailing =/ we normalise below.
       grep -aoiE "/(rest|api|graphql|ftp|admin|auth|metrics|v[0-9]+)/[a-zA-Z0-9_./?=&%-]*" "$jtmp" 2>/dev/null | sed "s#^#${jorigin}#"
     } 2>/dev/null >> "$js_endpoints_file"
+    # Field-name vocabulary (so the agent/PoC use the target's REAL body fields, not guesses):
+    # form bindings (high precision) + object-literal keys (noisy -> filtered/capped below).
+    {
+      grep -aoE '(formControlName|ng-model|v-model|data-field|name|id)="[a-zA-Z_][a-zA-Z0-9_.-]{1,39}"' "$jtmp" 2>/dev/null | sed -E 's/.*="([^"]+)".*/\1/'
+      grep -aoE '[{,][[:space:]]*"[a-zA-Z_][a-zA-Z0-9_]{2,30}"[[:space:]]*:' "$jtmp" 2>/dev/null | grep -aoE '"[a-zA-Z_][a-zA-Z0-9_]{2,30}"' | tr -d '"'
+    } 2>/dev/null >> "$js_fields_file"
     rm -f "$jtmp"
   done < "$js_urls_file"
+  # Rank mined field names by frequency (real fields recur across the app), drop JS-internal noise,
+  # cap, and record a compact vocab line in forms_file for the agent + PoC generator.
+  if [ -s "$js_fields_file" ]; then
+    grep -avwiE 'function|return|length|prototype|constructor|default|window|document|undefined|null|true|false|this|var|let|const|typeof|string|number|object|array|value|target|event|type|name|class|style|children|props|state|render|module|exports|require|import|export' "$js_fields_file" \
+      | sort | uniq -c | sort -rn | awk '$1>=1{print $2}' | head -n 120 > "$js_fields_file.t" && mv "$js_fields_file.t" "$js_fields_file"
+  fi
   if [ -s "$js_endpoints_file" ]; then
     grep -iE "^https?://([a-z0-9._-]+\.)?${esc_domain}([:/]|$)" "$js_endpoints_file" 2>/dev/null \
       | grep -ivE '\.(png|jpe?g|gif|svg|woff2?|ttf|eot|css|ico|map)([?#]|$)' \
