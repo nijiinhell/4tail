@@ -306,7 +306,8 @@ $(cat "$OUTDIR/.patterns_numbered.txt")" >"$jout" 2>>"$llm_log" || true
   : > "$gf_file"
   if have gf && [ -s "$targets_active_file" ]; then
     # Expand focus aliases so blueprint focus names map onto gf pattern names.
-    local _focus=",$ACT_FOCUS,"
+    # NB: this block is sourced at top level, not inside a function - no 'local' here.
+    _focus=",$ACT_FOCUS,"
     case "$_focus" in *,injection,*) _focus="${_focus}sqli,lfi," ;; esac
     for pat in sqli xss ssrf lfi redirect rce ssti idor; do
       # Run this bucket if the pattern is in focus; always run rce + idor (cheap, high-value,

@@ -19,6 +19,7 @@ build:
 check:
 	@bash -n 4tail.sh && echo "entrypoint: OK"
 	@tmp=$$(mktemp); cat $(LIBS) > "$$tmp"; bash -n "$$tmp" && echo "sections: OK"; rm -f "$$tmp"
+	@bash tests/check_toplevel_local.sh $(LIBS)   # `local` outside a function crashes sourced libs under set -u
 
 # ShellCheck the entrypoint + every section (skips cleanly if shellcheck isn't installed).
 lint:

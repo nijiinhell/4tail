@@ -32,6 +32,10 @@ line='{"url":"http://localhost:$port","status_code":200,"title":"Fix","webserver
 [ -n "\$out" ] && printf '%s\n' "\$line" > "\$out" || printf '%s\n' "\$line"; exit 0
 EOF
 for t in nuclei ffuf subfinder; do printf '#!/bin/sh\nexit 0\n' > "$tmp/bin/$t"; done
+# gf stub: present so the `if have gf` block in p_funnel.sh actually RUNS during the test
+# (that block is sourced at top level - this is what catches a stray top-level `local` etc.
+# under set -u, which `have gf`=false would silently skip). Echoes param-ish URLs from stdin.
+printf '#!/bin/sh\ngrep -aE "[?&][A-Za-z0-9_]+=" 2>/dev/null || true\n' > "$tmp/bin/gf"
 chmod +x "$tmp/bin"/*
 
 # ===================== Phase 1: no AI =====================
