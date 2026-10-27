@@ -177,7 +177,9 @@ $(head -c 12000 "$tech_brief")" "$plan_out"
   # --- parse org/product-specific custom words (sanitized to single path segments) ---
   printf '%s' "$plan_json" \
     | jq -r '.custom_words[]? | select(type=="string")' 2>/dev/null \
-    | tr 'A-Z' 'a-z' | grep -oE '[a-z0-9._-]{2,40}' \
+    | tr 'A-Z' 'a-z' \
+    | sed -E 's#^/+##; s#/+$##' \
+    | grep -E '^[a-z0-9._/-]{2,40}$' | grep -vF '..' \
     | awk '!seen[$0]++' | head -n 40 > "$custom_words_file" 2>/dev/null || true
   rm -f "$plan_out"
 

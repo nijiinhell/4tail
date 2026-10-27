@@ -118,14 +118,23 @@ elif [ "$fuzz_possible" != 1 ]; then
 elif [ "$RESUME" = 1 ] && [ -f "$OUTDIR/.done_fuzz" ]; then
   set_stage $S_FUZZ done "$(grep -c . "$fuzz_plan_file" 2>/dev/null || echo 0) hosts (resumed)"
 else
-  if [ "$FUZZING_STRATEGY" = light ]; then
-    # Lighten path fuzzing (SPA/CDN blueprints): smaller wordlist, fewer exts, tighter
-    # per-host cap. Still runs - just cheap - so a stray classic path is still found.
-    # An explicit user value (CLI/env) always wins over the lightening.
-    [ -n "${_user_set_MAX_FUZZ_WORDS:-}" ] || MAX_FUZZ_WORDS=4000
-    [ -n "${_user_set_MAX_EXTS:-}" ]       || MAX_EXTS=2
-    [ -n "${_user_set_FUZZ_MAX_TIME:-}" ]  || FUZZ_MAX_TIME=120
-  fi
+  # Per-host fuzzing depth (mixed scopes): a pure-SPA host wastes a big path-fuzz, while its
+  # WordPress/IIS sibling deserves the full list. We keep the user/normal sizing as the base
+  # and a cheaper "light" sizing, then pick PER HOST in the loop (host_fuzz_strategy). An
+  # explicit user value for any sizing var pins that var for every host (no per-host override).
+  _fuzz_norm_words="$MAX_FUZZ_WORDS"; _fuzz_norm_exts="$MAX_EXTS"; _fuzz_norm_time="$FUZZ_MAX_TIME"
+  _fuzz_light_words=4000; _fuzz_light_exts=2; _fuzz_light_time=120
+  _fuzz_user_sized=""; { [ -n "${_user_set_MAX_FUZZ_WORDS:-}" ] || [ -n "${_user_set_MAX_EXTS:-}" ] || [ -n "${_user_set_FUZZ_MAX_TIME:-}" ]; } && _fuzz_user_sized=1
+  FUZZ_SPA_RE='react|angular|vue|next\.?js|nuxt|svelte|ember|backbone'
+  FUZZ_SERVER_RE='wordpress|drupal|joomla|magento|php|iis|asp|aspx|tomcat|spring|weblogic|coldfusion|struts|jsp|\.net'
+  # host techs -> light|normal. Classic server/CMS always normal; pure SPA always light;
+  # anything else follows the blueprint's global FUZZING_STRATEGY.
+  host_fuzz_strategy() {
+    local tc; tc="$(printf '%s' "$1" | tr 'A-Z' 'a-z')"
+    printf '%s' "$tc" | grep -qE "$FUZZ_SERVER_RE" && { echo normal; return; }
+    printf '%s' "$tc" | grep -qE "$FUZZ_SPA_RE"    && { echo light;  return; }
+    [ "$FUZZING_STRATEGY" = light ] && echo light || echo normal
+  }
   set_stage $S_FUZZ running "indexing SecLists$([ "$FUZZING_STRATEGY" = light ] && echo ' (light)')"
   build_seclists_index   # index real SecLists files once so tech matching is grounded in what's installed
   set_stage $S_FUZZ running "0 hosts ($(nlines "${seclists_index:-/dev/null}") lists indexed)"
@@ -206,12 +215,20 @@ else
     # wait for a free slot
     while [ "$(fuzz_running)" -ge "$p_eff" ]; do fuzz_reap; fuzz_status; render; sleep 0.25; done
     fuzzed=$((fuzzed + 1))
+    # Per-host depth: honor a user-forced sizing globally, else light/normal by this host's tech.
+    if [ -n "$_fuzz_user_sized" ]; then
+      hw="$MAX_FUZZ_WORDS"; he="$MAX_EXTS"; ht="$FUZZ_MAX_TIME"
+    elif [ "$(host_fuzz_strategy "$techs")" = light ]; then
+      hw="$_fuzz_light_words"; he="$_fuzz_light_exts"; ht="$_fuzz_light_time"
+    else
+      hw="$_fuzz_norm_words"; he="$_fuzz_norm_exts"; ht="$_fuzz_norm_time"
+    fi
     combined="$fuzz_dir/.wl_${safe}.txt"
     # authenticated fuzzing: drop logout/session-kill words so ffuf doesn't nuke the session
     if [ "$AVOID_LOGOUT" = 1 ] && [ "${#AUTH_H[@]}" -gt 0 ]; then
-      cat "${wls[@]}" 2>/dev/null | grep -viE "$LOGOUT_RE" | sort -u | head -n "$MAX_FUZZ_WORDS" > "$combined"
+      cat "${wls[@]}" 2>/dev/null | grep -viE "$LOGOUT_RE" | sort -u | head -n "$hw" > "$combined"
     else
-      cat "${wls[@]}" 2>/dev/null | sort -u | head -n "$MAX_FUZZ_WORDS" > "$combined"
+      cat "${wls[@]}" 2>/dev/null | sort -u | head -n "$hw" > "$combined"
     fi
     # Prepend AI-generated, org-specific words (payments-v2, partner-portal, internal, ...) that
     # no static SecLists list carries. Added AFTER the cap so they always get fuzzed (they're few).
@@ -219,7 +236,7 @@ else
       { cat "$custom_words_file"; cat "$combined"; } | awk 'NF && !seen[$0]++' > "$combined.tmp" && mv "$combined.tmp" "$combined"
     fi
     names="$(printf '%s\n' "${wls[@]}" | sed 's#.*/##' | paste -sd+ -)"
-    ext_flag="$(build_ext_flag "$techs")"
+    ext_flag="$(MAX_EXTS="$he" build_ext_flag "$techs")"
     printf '%s\t%s\t(%s words) exts:[%s]\n' "$url" "$names" "$(wc -l < "$combined")" "$ext_flag" >> "$fuzz_plan_file"
     # -ac auto-calibration filters soft-404 / catch-all responses (huge quality boost:
     # without it a host that answers 200 to everything floods the results with junk).
@@ -234,7 +251,7 @@ else
       [ -n "$AUTH_HEADER" ] && while IFS= read -r _hl; do [ -n "$_hl" ] && fcmd+=(-H "$_hl"); done <<< "$AUTH_HEADER"
       [ -n "$AUTH_COOKIE" ] && fcmd+=(-b "$AUTH_COOKIE")
       [ -n "$PROXY" ] && fcmd+=(-p "$PROXY")
-      [ "$FUZZ_MAX_TIME" -gt 0 ] 2>/dev/null && fcmd+=(--time-limit "${FUZZ_MAX_TIME}s")
+      [ "$ht" -gt 0 ] 2>/dev/null && fcmd+=(--time-limit "${ht}s")
       ( "${fcmd[@]}" >/dev/null 2>>"$llm_log"
         jq -s '{results:[.[]?|select(.type=="response")|{status:.status,length:.content_length,url:.url}]}' \
            "$fuzz_dir/.fx_${safe}.jsonl" 2>/dev/null > "$fuzz_dir/${safe}.json" || echo '{"results":[]}' > "$fuzz_dir/${safe}.json"
@@ -245,7 +262,7 @@ else
       [ "${#FFUF_NET[@]}" -gt 0 ] && ffuf_args+=("${FFUF_NET[@]}")
       [ -n "$ext_flag" ] && ffuf_args+=(-e "$ext_flag")
       [ "$FFUF_RATE" -gt 0 ] 2>/dev/null && ffuf_args+=(-rate "$FFUF_RATE")
-      [ "$FUZZ_MAX_TIME" -gt 0 ] 2>/dev/null && ffuf_args+=(-maxtime "$FUZZ_MAX_TIME")  # stop a slow host after N s
+      [ "$ht" -gt 0 ] 2>/dev/null && ffuf_args+=(-maxtime "$ht")  # per-host time cap (light/normal)
       ffuf "${ffuf_args[@]}" >/dev/null 2>>"$llm_log" & JOB[$!]="$safe"
     fi
     fuzz_status; render

@@ -62,62 +62,128 @@ load_blueprint() { # $1 = name or path; applies focus/specialists/caps
   bp_set FUZZ_MAX_TIME   "$(jq -r '.caps.fuzz_max_time // empty' "$f" 2>/dev/null)"
   return 0
 }
-# Resolve the blueprint: explicit name, or AI-chosen from the catalog using the tech brief.
+# --- Mixed-scope helpers ----------------------------------------------------
+_bp_av() { [ -n "$BLUEPRINTS_DIR" ] && [ -f "$BLUEPRINTS_DIR/$1.json" ]; }
+# How many live hosts show a tech/webserver/url signature (one line per host in httpx_json).
+_stack_hosts() {
+  { [ -s "${httpx_json:-}" ] && have jq; } || { echo 0; return; }
+  jq -r '[.url, (.webserver//""), ((.tech//[])|join(" "))] | @tsv' "$httpx_json" 2>/dev/null \
+    | grep -ciE "$1"
+}
+# Should a stack set the PRIMARY profile for the whole scope? Only when it's on a meaningful
+# SHARE of live hosts (>=STACK_DOMINANCE_PCT%, default 30) - so one WordPress/Grafana outlier
+# among 50 hosts can't hijack the scan - or when the scope is tiny (<=3 hosts).
+_stack_dominant() {
+  local c; c="$(_stack_hosts "$1")"
+  [ "${c:-0}" -gt 0 ] 2>/dev/null || return 1
+  [ "${alive_count:-0}" -le 3 ] && return 0
+  [ "$(( c * 100 ))" -ge "$(( ${alive_count:-1} * ${STACK_DOMINANCE_PCT:-30} ))" ]
+}
+_add_def_tags() {  # append nuclei tags unless the user pinned -t
+  [ -z "${_user_set_DEFAULT_NUCLEI_TAGS:-}" ] && [ -n "$1" ] && DEFAULT_NUCLEI_TAGS="$DEFAULT_NUCLEI_TAGS,$1"
+}
+# Layer ADDITIVE traits from SECONDARY stacks present on a mixed scope, so hosts outside the
+# primary profile still get the right JS mining / nuclei tags (sets $_layered for logging).
+layer_secondary_traits() {
+  _layered=""
+  if [ "$(_stack_hosts 'react|angular|vue\.?js|next\.?js|nuxt|svelte|ember|backbone')" -gt 0 ] 2>/dev/null; then
+    if [ "${JSMINE:-0}" != 1 ] && [ -z "${_user_set_JSMINE:-}" ]; then JSMINE=1; _layered="$_layered,jsmine"; fi
+  fi
+  if [ "$(_stack_hosts 'wordpress|wp-content|wp-json')" -gt 0 ] 2>/dev/null; then
+    _add_def_tags 'wordpress,wp-plugin'; _layered="$_layered,wp-tags"
+  fi
+  if [ "$(_stack_hosts 'jenkins|grafana|kibana|gitlab|kubernetes|consul|vault|prometheus')" -gt 0 ] 2>/dev/null; then
+    _add_def_tags 'default-login,takeover,exposures'; _layered="$_layered,devops-tags"
+  fi
+  _layered="${_layered#,}"
+}
+# --- Blueprint composition (-B spa+api_bounty / spa,api_bounty) --------------
+_csv_union() {  # var  new-csv : append items not already present (respects a user-set flag)
+  local var="$1" add="$2" flag="_user_set_$1" oldifs tok out
+  [ -n "${!flag:-}" ] && return 0
+  { [ -z "$add" ] || [ "$add" = null ]; } && return 0
+  out="${!var:-}"; oldifs="$IFS"; IFS=','
+  for tok in $add; do [ -z "$tok" ] && continue; case ",$out," in *",$tok,"*) ;; *) out="${out:+$out,}$tok" ;; esac; done
+  IFS="$oldifs"; eval "$var=\$out"
+}
+_cap_max() {  # var  new : keep the LARGER (composing must never shrink the scope)
+  local var="$1" nv="$2" flag="_user_set_$1" cur
+  [ -n "${!flag:-}" ] && return 0
+  { [ -z "$nv" ] || [ "$nv" = null ]; } && return 0
+  cur="${!var:-}"; case "$cur" in ''|*[!0-9]*) eval "$var=\$nv"; return ;; esac
+  [ "$nv" -gt "$cur" ] 2>/dev/null && eval "$var=\$nv"
+}
+# Union ONE more blueprint's additive traits + max caps onto the already-loaded base.
+_union_blueprint() {
+  local bp="$1" f=""; _bp_av "$bp" && f="$BLUEPRINTS_DIR/$bp.json"; [ -n "$f" ] && have jq || return 0
+  _csv_union ACT_FOCUS       "$(jq -r '(.focus_areas // []) | join(",")' "$f" 2>/dev/null)"
+  _csv_union ACT_SPECIALISTS "$(jq -r '(.specialists // []) | join(",")' "$f" 2>/dev/null)"
+  _csv_union ACT_DAST_TAGS   "$(jq -r '.nuclei_dast_tags // ""' "$f" 2>/dev/null)"
+  local et; et="$(jq -r '.nuclei.extra_tags // empty' "$f" 2>/dev/null)"; _add_def_tags "$et"
+  [ "$(jq -r '.stages.jsmine // .jsmine // empty' "$f" 2>/dev/null)" = 1 ] && bp_set JSMINE 1
+  [ "$(jq -r '.fuzzing_strategy // empty' "$f" 2>/dev/null)" = light ] && [ -z "${FUZZING_STRATEGY:-}" ] && bp_set FUZZING_STRATEGY light
+  _cap_max ACT_MAX_JUICY  "$(jq -r '.caps.max_juicy_urls // empty' "$f" 2>/dev/null)"
+  _cap_max ACT_MAX_DALFOX "$(jq -r '.caps.max_dalfox // empty' "$f" 2>/dev/null)"
+  _cap_max ACT_MAX_KXSS   "$(jq -r '.caps.max_kxss // empty' "$f" 2>/dev/null)"
+  _cap_max ACT_MAX_SQLMAP "$(jq -r '.caps.max_sqlmap // empty' "$f" 2>/dev/null)"
+  _cap_max ACT_MAX_ARJUN  "$(jq -r '.caps.max_arjun_hosts // empty' "$f" 2>/dev/null)"
+  _cap_max CRAWL_MAX_URLS "$(jq -r '.caps.crawl_max_urls // empty' "$f" 2>/dev/null)"
+  _cap_max CRAWL_MAX_TIME "$(jq -r '.caps.crawl_max_time // empty' "$f" 2>/dev/null)"
+  _cap_max DAST_MAX_URLS  "$(jq -r '.caps.dast_max_urls // empty' "$f" 2>/dev/null)"
+}
+compose_blueprints() {  # $1 = "a+b" or "a,b,c" : first sets the base, the rest union on top
+  local label spec first n
+  label="$(printf '%s' "$1" | tr ',' '+')"
+  spec="$(printf '%s' "$1" | tr '+,' '  ')"; set -- $spec
+  first="${1:-webapp_bounty}"; shift || true
+  load_blueprint "$first" || return 1
+  for n in "$@"; do [ -n "$n" ] && _union_blueprint "$n"; done
+  BLUEPRINT_NAME="$label"
+}
+
+# Resolve the blueprint: explicit name/composition, or auto-picked from the DOMINANT stack
+# (falling back to the AI / webapp_bounty on a mixed scope), then layer secondary traits.
 resolve_blueprint() {
-  if [ "$BLUEPRINT" != "auto" ]; then load_blueprint "$BLUEPRINT"; return; fi
-  local chosen="webapp_bounty" n pick out
-  # Deterministic (no AI, works with AI_ENABLED=0): match a distinctive stack in the tech
-  # surface to its blueprint. Order matters - most specific first. WordPress and GraphQL
-  # before the generic SPA/AI fallback so an unkeyed run still loads the right profile.
-  if [ -s "$tech_brief" ] && [ -n "$BLUEPRINTS_DIR" ] && [ -f "$BLUEPRINTS_DIR/wordpress.json" ] \
-     && grep -qiE 'wordpress|wp-content|wp-includes|wp-json' "$tech_brief" 2>/dev/null; then
-    load_blueprint wordpress
-    [ "$ASSUME_YES" = 1 ] || log "Blueprint: wordpress (WordPress detected in tech surface)"
+  if [ "$BLUEPRINT" != "auto" ]; then
+    case "$BLUEPRINT" in
+      */*|*.json)  load_blueprint "$BLUEPRINT" ;;        # explicit path - no composition
+      *[+,]*)      compose_blueprints "$BLUEPRINT" ;;    # a+b / a,b
+      *)           load_blueprint "$BLUEPRINT" ;;
+    esac
+    [ "$ASSUME_YES" = 1 ] || log "Blueprint: ${BLUEPRINT_NAME:-$BLUEPRINT}"
     return
   fi
-  if [ -s "$tech_brief" ] && [ -n "$BLUEPRINTS_DIR" ] && [ -f "$BLUEPRINTS_DIR/graphql.json" ] \
-     && grep -qiE 'graphql|graphiql|apollo|/graphql' "$tech_brief" 2>/dev/null; then
-    load_blueprint graphql
-    [ "$ASSUME_YES" = 1 ] || log "Blueprint: graphql (GraphQL detected in tech surface)"
-    return
+  local chosen="" n pick out
+  # PRIMARY = the dominant stack only (a lone outlier host must not force its profile on the
+  # whole scope). Priority order applies when more than one stack clears the threshold.
+  if   _bp_av wordpress         && _stack_dominant 'wordpress|wp-content|wp-includes|wp-json'; then chosen=wordpress
+  elif _bp_av graphql           && _stack_dominant 'graphql|graphiql|apollo'; then chosen=graphql
+  elif _bp_av spa               && _stack_dominant 'angular|react|vue\.?js|next\.?js|nuxt|svelte|ember|backbone|single[ -]?page'; then chosen=spa
+  elif _bp_av cloud_devops      && _stack_dominant 'kubernetes|kubelet|docker|jenkins|gitlab|grafana|kibana|prometheus|consul|vault|argocd|rancher|harbor|spring ?boot'; then chosen=cloud_devops
+  elif _bp_av legacy_enterprise && _stack_dominant 'weblogic|websphere|jboss|coldfusion|struts|/sap/|netweaver|iis/[5-8][^0-9]'; then chosen=legacy_enterprise
   fi
-  # Deterministic: a JS SPA framework in the tech surface -> the spa blueprint (JS-mining +
-  # DOM-XSS + the API behind the front-end). The generic AI pick tends to default to
-  # webapp_bounty and miss that the real surface is the mined /rest + /api, not path fuzzing.
-  if [ -s "$tech_brief" ] && [ -n "$BLUEPRINTS_DIR" ] && [ -f "$BLUEPRINTS_DIR/spa.json" ] \
-     && grep -qiE 'angular|react|vue\.?js|next\.?js|nuxt|svelte|ember|backbone|single[ -]?page' "$tech_brief" 2>/dev/null; then
-    load_blueprint spa
-    [ "$ASSUME_YES" = 1 ] || log "Blueprint: spa (SPA framework detected in tech surface)"
-    return
-  fi
-  # DevOps / cloud-native tooling -> config/secret exposure profile.
-  if [ -s "$tech_brief" ] && [ -n "$BLUEPRINTS_DIR" ] && [ -f "$BLUEPRINTS_DIR/cloud_devops.json" ] \
-     && grep -qiE 'kubernetes|kubelet|docker|jenkins|gitlab|grafana|kibana|prometheus|consul|vault|argocd|rancher|harbor|spring ?boot' "$tech_brief" 2>/dev/null; then
-    load_blueprint cloud_devops
-    [ "$ASSUME_YES" = 1 ] || log "Blueprint: cloud_devops (DevOps/cloud-native tooling detected)"
-    return
-  fi
-  # Legacy enterprise stacks -> CVE/LFI/SQLi/RCE + heavy extension fuzzing.
-  if [ -s "$tech_brief" ] && [ -n "$BLUEPRINTS_DIR" ] && [ -f "$BLUEPRINTS_DIR/legacy_enterprise.json" ] \
-     && grep -qiE 'weblogic|websphere|jboss|coldfusion|struts|/sap/|netweaver|iis/[5-8][^0-9]' "$tech_brief" 2>/dev/null; then
-    load_blueprint legacy_enterprise
-    [ "$ASSUME_YES" = 1 ] || log "Blueprint: legacy_enterprise (legacy stack detected in tech surface)"
-    return
-  fi
-  if [ "$AI_ENABLED" = 1 ] && [ -n "$BLUEPRINTS_DIR" ] && budget_ok && [ -s "$tech_brief" ]; then
-    out="$(mktemp)"
-    ai_call "$LLM_MODEL_PLAN" 400 \
-      'You are a bug-bounty strategist. Pick the single best scan blueprint for this target from the catalog, based on its technology surface. Reply with ONLY the blueprint name (one token), nothing else.' \
-      "Catalog:
+  # No single dominant stack (mixed scope) -> AI pick if available, else webapp_bounty.
+  if [ -z "$chosen" ]; then
+    chosen="webapp_bounty"
+    if [ "$AI_ENABLED" = 1 ] && [ -n "$BLUEPRINTS_DIR" ] && budget_ok && [ -s "$tech_brief" ]; then
+      out="$(mktemp)"
+      ai_call "$LLM_MODEL_PLAN" 400 \
+        'You are a bug-bounty strategist. Pick the single best scan blueprint for this target from the catalog, based on its technology surface. Reply with ONLY the blueprint name (one token), nothing else.' \
+        "Catalog:
 $(blueprint_catalog)
 
 Target: $domain
 Tech brief:
 $(head -c 4000 "$tech_brief")" >"$out" 2>>"$llm_log" || true
-    pick="$(grep -oiE '[a-z_]+' "$out" | tail -1 | tr 'A-Z' 'a-z')"; rm -f "$out"
-    for n in $(list_blueprints); do [ "$pick" = "$n" ] && chosen="$pick"; done
+      pick="$(grep -oiE '[a-z_]+' "$out" | tail -1 | tr 'A-Z' 'a-z')"; rm -f "$out"
+      for n in $(list_blueprints); do [ "$pick" = "$n" ] && chosen="$pick"; done
+    fi
   fi
   load_blueprint "$chosen"
+  # Mixed scope: layer additive traits (JS mining, wp/devops tags) from any SECONDARY stack
+  # present, so hosts outside the primary profile aren't neglected.
+  layer_secondary_traits
+  [ "$ASSUME_YES" = 1 ] || log "Blueprint: $BLUEPRINT_NAME${_layered:+ (+traits: $_layered)}"
 }
 
 # kill background children (nuclei/ffuf/arjun/supervisor) so nothing lingers after
