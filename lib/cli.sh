@@ -38,7 +38,7 @@ shift $((OPTIND - 1))
 # Resolve per-role models/token budgets now that -m / env are applied.
 LLM_MODEL_PLAN="${LLM_MODEL_PLAN:-$LLM_MODEL}"
 LLM_MODEL_TRIAGE="${LLM_MODEL_TRIAGE:-$LLM_MODEL}"
-LLM_MAX_TOKENS_TRIAGE="${LLM_MAX_TOKENS_TRIAGE:-8000}"
+LLM_MAX_TOKENS_TRIAGE="${LLM_MAX_TOKENS_TRIAGE:-16000}"  # headroom: reasoning models + a rich finding set overran 8000 mid-report
 
 raw_target="${1:-}"
 # Normalize but KEEP scheme + port so we can test a specific host:port (e.g. http://localhost:3000).

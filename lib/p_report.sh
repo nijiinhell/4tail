@@ -42,8 +42,12 @@ $(head -c 2000 "${verified_file:-/dev/null}" 2>/dev/null)" >"$poc_out" 2>>"$llm_
       echo "# session and run the ones you want:   export SESSION='Cookie: session=...'"
       echo "# Authorized testing only."
       echo "set -u"
+      # Default SESSION so the no-auth PoCs (login SQLi, unauth register) run without a crash;
+      # the user overrides it with their real cookie/token when testing authed endpoints.
+      echo ': "${SESSION:=Cookie: 4tail=none}"'
       echo
-      sed -E '/^```/d' "$poc_out"
+      # strip code fences AND any shebang the model emitted inside the body (we add our own above)
+      sed -E '/^```/d; /^#!\/.*(bash|sh)[[:space:]]*$/d' "$poc_out"
     } > "$poc_file"
     chmod +x "$poc_file" 2>/dev/null || true
   fi
@@ -85,7 +89,9 @@ whether it is likely exploitable here; say "no high-confidence CVE" rather than 
 "## Infra & hardening" (assess the DNS/EMAIL HYGIENE and SECURITY-HEADER findings: SPF/DMARC
 spoofing, zone transfer, clickjacking, missing HSTS/CSP, weak cookie flags - impact + fix),
 "## Attack surface notes" and "## Recommended manual follow-ups".
-Use ONLY the provided data - do not invent findings.
+Use ONLY the provided data - do not invent findings. Keep tables concise and do NOT repeat the
+same endpoint across multiple tables; prefer one row per issue. Finish every section - do not
+run long.
 Output ONLY the final report starting exactly with the line "## Executive summary".
 Do NOT include any reasoning, planning, or preamble before it.'
   triage_out="$(mktemp)"

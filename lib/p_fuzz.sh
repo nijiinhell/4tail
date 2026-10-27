@@ -225,12 +225,14 @@ else
     fi
     combined="$fuzz_dir/.wl_${safe}.txt"
     # authenticated fuzzing: drop logout/session-kill words so ffuf doesn't nuke the session
-    # Strip a leading slash from every word: SecLists API lists ship entries like "/api-docs",
-    # which would make -u "$url/FUZZ" request "$url//api-docs" (double slash). Normalise to bare.
+    # Strip a leading slash from every word (SecLists API lists ship "/api-docs" -> would make
+    # -u "$url/FUZZ" request "$url//api-docs"). Dedupe ORDER-PRESERVING (awk, not sort -u): the
+    # high-signal base list (Bo0oM/fuzz.txt) is placed FIRST by host_wordlists, so sorting then
+    # head -n would alphabetise all ~20k words and keep only a-c, dropping /ftp, /metrics, etc.
     if [ "$AVOID_LOGOUT" = 1 ] && [ "${#AUTH_H[@]}" -gt 0 ]; then
-      cat "${wls[@]}" 2>/dev/null | sed 's#^/\+##' | grep -viE "$LOGOUT_RE" | sort -u | head -n "$hw" > "$combined"
+      cat "${wls[@]}" 2>/dev/null | sed 's#^/\+##' | grep -viE "$LOGOUT_RE" | awk 'NF && !seen[$0]++' | head -n "$hw" > "$combined"
     else
-      cat "${wls[@]}" 2>/dev/null | sed 's#^/\+##' | sort -u | head -n "$hw" > "$combined"
+      cat "${wls[@]}" 2>/dev/null | sed 's#^/\+##' | awk 'NF && !seen[$0]++' | head -n "$hw" > "$combined"
     fi
     # Prepend AI-generated, org-specific words (payments-v2, partner-portal, internal, ...) that
     # no static SecLists list carries. Added AFTER the cap so they always get fuzzed (they're few).

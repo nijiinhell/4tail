@@ -100,7 +100,7 @@ else
     sort -u -o "$js_secrets_file" "$js_secrets_file"
     [ -s "${sourcemap_file:-/dev/null}" ] && sort -u -o "$sourcemap_file" "$sourcemap_file"
     [ -s "${smap_endpoints_file:-/dev/null}" ] && sort -u -o "$smap_endpoints_file" "$smap_endpoints_file"
-    [ -s "$js_endpoints_file" ] && grep -ivE '\.(png|jpe?g|gif|svg|woff2?|ttf|eot|css|ico|map)([?#]|$)' "$js_endpoints_file" | sed -E '/\?/ s/=(&|$)/=1\1/g' | sort -u > "$js_endpoints_file.t" && mv "$js_endpoints_file.t" "$js_endpoints_file"
+    [ -s "$js_endpoints_file" ] && grep -ivE '\.(png|jpe?g|gif|svg|woff2?|ttf|eot|css|ico|map)([?#]|$)' "$js_endpoints_file" | grep -vE '^https?://[^/]+(/[0-9]+)+/?(\?|$)' | sed -E '/\?/ s/=(&|$)/=1\1/g' | sort -u > "$js_endpoints_file.t" && mv "$js_endpoints_file.t" "$js_endpoints_file"
     # keep the JS dashboard row in sync with what the deep re-mine added (was frozen at the
     # pre-funnel count, so the TUI showed "0 secret hits" while the tally said js-secrets:N).
     set_stage $S_JS done "$(nlines "$js_urls_file") JS, $(nlines "$js_secrets_file") secret hits, $(nlines "${sourcemap_file:-/dev/null}") maps"

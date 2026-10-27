@@ -28,6 +28,13 @@ else
     { echo "# $1"; printf '%s\n' "$2"; } > "$f"
     printf '[SECRET-LOOT] %s | raw response with credentials saved -> %s\n' "$1" "$f" >> "$agent_file"
   }
+  # curl -i responses carry the HTTP headers first; Juice Shop's headers alone are ~330 bytes, so
+  # head -c 240 of the whole thing never reached the JSON body. These split headers from body
+  # (last block, so -L redirects resolve) so the agent actually SEES the body (JWT, "role":"admin").
+  _http_body() { printf '%s' "$1" | awk '/^HTTP\//{h=NR;b=0} {l[NR]=$0} (h&&!b&&NR>h&&$0~/^\r?$/){b=NR} END{for(i=b+1;i<=NR;i++)print l[i]}'; }
+  _http_status() { printf '%s' "$1" | grep -aiE '^HTTP/' | tail -1 | tr -d '\r'; }
+  _http_keyhdrs() { printf '%s' "$1" | grep -aiE '^(location|set-cookie|content-type):' | tr -d '\r' | tr '\n' ' ' | head -c 220; }
+  _status_code() { printf '%s' "$1" | grep -aoE '[0-9]{3}' | head -1; }   # 3-digit code from a status line
   # Scope string for the AI: in single-host / custom-port mode, hand it the exact seed URL
   # (http://localhost:3000) so it keeps the scheme+port; otherwise the wildcard host scope.
   agent_scope="*.$domain"; [ "${SINGLE:-0}" = 1 ] && agent_scope="${SEED_URL:-$agent_scope}"
@@ -151,13 +158,18 @@ $results" > "$aout" 2>>"$llm_log" || true
         pct="application/x-www-form-urlencoded"; case "$pbody" in \{*|\[*) pct="application/json" ;; esac
         presp="$(_cap curl -s -i -L -X POST --max-time 15 ${CURL_NET[@]+"${CURL_NET[@]}"} -H "Content-Type: $pct" --data "$pbody" "$purl" 2>/dev/null | head -c 6000)"
         agent_capture_secret "$purl" "$presp"
-        pred="$(printf '%s' "$presp" | sed -E 's/((pass(word|wd)?|connection[-_ ]?string|accountkey|secret|api[-_]?key|token)[^[:cntrl:]]{0,8}[:=])[^[:cntrl:]"'"'"']{1,}/\1<redacted>/Ig')"
         phit=""; printf '%s' "$presp" | grep -qiE -- "$prx" 2>/dev/null && phit="HIT"
-        pstatus="$(printf '%s' "$presp" | head -1 | tr -d '\r')"
-        psnip="$(printf '%s' "$pred" | tr '\n\r\t' '   ' | sed -E 's/  +/ /g' | head -c 240)"
-        printf '[r%s] POST %-4s %s (body: %.60s)\n   why: %s\n   resp: %s | %s\n' "$round" "${phit:-...}" "$purl" "$pbody" "$pwhy" "$pstatus" "$psnip" >> "$agent_log"
-        results="$results"$'\n'"POST $purl => ${phit:-no-match} [$pstatus] $psnip"
-        [ "$phit" = HIT ] && printf '[CONFIRMED] POST %s (body: %s) | %s\n' "$purl" "$pbody" "$pwhy" >> "$agent_file"
+        pstatus="$(_http_status "$presp")"; pcode="$(_status_code "$pstatus")"
+        pbody_raw="$(_http_body "$presp")"; pkeyh="$(_http_keyhdrs "$presp")"
+        pbody_red="$(printf '%s' "$pbody_raw" | sed -E 's/((pass(word|wd)?|connection[-_ ]?string|accountkey|secret|api[-_]?key|token)[^[:cntrl:]]{0,8}[:=])[^[:cntrl:]"'"'"']{1,}/\1<redacted>/Ig')"
+        psnip="$(printf '%s' "$pbody_red" | tr '\n\r\t' '   ' | sed -E 's/  +/ /g' | head -c 400)"
+        printf '[r%s] POST %-4s %s (body: %.60s)\n   why: %s\n   resp: %s | %s | %s\n' "$round" "${phit:-...}" "$purl" "$pbody" "$pwhy" "$pstatus" "$pkeyh" "$psnip" >> "$agent_log"
+        results="$results"$'\n'"POST $purl => ${phit:-no-match} [$pstatus] ${pkeyh} ${psnip}"
+        # Record a CONFIRMED only once per (method,url) and never on a 4xx client-error rejection.
+        if [ "$phit" = HIT ]; then
+          case "$pcode" in 4[0-9][0-9]) : ;; *) grep -qF "[CONFIRMED] POST $purl " "$agent_file" 2>/dev/null \
+              || printf '[CONFIRMED] POST %s (body: %s) | %s\n' "$purl" "$pbody" "$pwhy" >> "$agent_file" ;; esac
+        fi
         continue
       fi
       # GET probe (passive fetch, regex-confirmed).
@@ -173,14 +185,19 @@ $results" > "$aout" 2>>"$llm_log" || true
       set_stage $S_AGENT running "round $round: probing ($(nlines "$agent_seen") sent)"; render
       resp="$(curl -s -i -L --max-time 12 ${CURL_NET[@]+"${CURL_NET[@]}"} "$url" 2>/dev/null | head -c 6000)"
       agent_capture_secret "$url" "$resp"   # save raw creds locally (not to the LLM) if present
-      # redact anything that looks like a secret before it is stored or sent back to the LLM
-      red="$(printf '%s' "$resp" | sed -E 's/((pass(word|wd)?|connection[-_ ]?string|accountkey|secret|api[-_]?key|token|aws[_-]?secret[_-]?access[_-]?key)[^[:cntrl:]]{0,8}[:=])[^[:cntrl:]"'"'"']{1,}/\1<redacted>/Ig')"
+      # (body is redacted below before it is shown to the LLM)
       hit=""; [ -n "$rx" ] && printf '%s' "$resp" | grep -qiE -- "$rx" 2>/dev/null && hit="HIT"
-      local_status="$(printf '%s' "$resp" | head -1 | tr -d '\r')"
-      snippet="$(printf '%s' "$red" | tr '\n\r\t' '   ' | sed -E 's/  +/ /g' | head -c 240)"
-      printf '[r%s] %-4s %s\n   why: %s\n   resp: %s | %s\n' "$round" "${hit:-...}" "$url" "$why" "$local_status" "$snippet" >> "$agent_log"
-      results="$results"$'\n'"$url => ${hit:-no-match} [$local_status] $snippet"
-      [ "$hit" = HIT ] && printf '[CONFIRMED] %s | %s\n' "$url" "$why" >> "$agent_file"
+      local_status="$(_http_status "$resp")"; gcode="$(_status_code "$local_status")"
+      gbody="$(_http_body "$resp")"; gkeyh="$(_http_keyhdrs "$resp")"
+      gbody_red="$(printf '%s' "$gbody" | sed -E 's/((pass(word|wd)?|connection[-_ ]?string|accountkey|secret|api[-_]?key|token|aws[_-]?secret[_-]?access[_-]?key)[^[:cntrl:]]{0,8}[:=])[^[:cntrl:]"'"'"']{1,}/\1<redacted>/Ig')"
+      snippet="$(printf '%s' "$gbody_red" | tr '\n\r\t' '   ' | sed -E 's/  +/ /g' | head -c 400)"
+      printf '[r%s] %-4s %s\n   why: %s\n   resp: %s | %s | %s\n' "$round" "${hit:-...}" "$url" "$why" "$local_status" "$gkeyh" "$snippet" >> "$agent_log"
+      results="$results"$'\n'"$url => ${hit:-no-match} [$local_status] ${gkeyh} ${snippet}"
+      # CONFIRM only once per url, and not on a 4xx client-error rejection (e.g. 406 redirect reject).
+      if [ "$hit" = HIT ]; then
+        case "$gcode" in 4[0-9][0-9]) : ;; *) grep -qF "[CONFIRMED] $url |" "$agent_file" 2>/dev/null \
+            || printf '[CONFIRMED] %s | %s\n' "$url" "$why" >> "$agent_file" ;; esac
+      fi
     done <<< "$probes"
     [ -n "$results" ] || break
     # The AI chases a hot lead across rounds, but stops itself when exhausted.

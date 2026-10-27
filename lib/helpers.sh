@@ -278,6 +278,9 @@ verify_findings() {
     r1="$(curl -s -o /dev/null -w '%{http_code} %{size_download}' -L --max-time 12 ${CURL_NET[@]+"${CURL_NET[@]}"} "$u" 2>/dev/null || echo '000 0')"
     r2="$(curl -s -o /dev/null -w '%{http_code} %{size_download}' -L --max-time 12 ${CURL_NET[@]+"${CURL_NET[@]}"} "$u" 2>/dev/null || echo '000 0')"
     s1="${r1%% *}"; z1="${r1##* }"; s2="${r2%% *}"; z2="${r2##* }"
+    # A client-error rejection (400/403/404/405/406/410/...) is NOT a finding, even when its body
+    # echoes our input and so differs from the SPA catch-all. Only verify success/redirect codes.
+    case "$s1" in 200|201|202|203|206|301|302|303|307|308|500) ;; *) continue ;; esac
     # Control = a nonexistent LEAF in the SAME directory, query preserved. (The old form inserted
     # a path segment before the query -> /page.php/ctl?id=1 still executes page.php via PathInfo
     # on PHP/IIS and returned the real page, falsely nuking valid findings.)
@@ -400,10 +403,19 @@ probe_mined_endpoints() {
     | grep -ivE '\.(png|jpe?g|gif|svg|woff2?|ttf|eot|css|ico|map|js)([?#]|$)' \
     | awk 'NF && !seen[$0]++' | head -n "${PROBE_MINED_MAX:-150}" > "$infile"
   [ -s "$infile" ] || { rm -f "$infile"; return 0; }
+  # SPA catch-all fingerprint: a single-page app serves index.html (same status+length) for EVERY
+  # unknown path, so probe one random nonexistent path first and drop any mined result matching it
+  # (otherwise 50+ bogus paths all show as 200/<shell-size>).
+  local corigin cfp cs cl
+  corigin="$(head -1 "$infile" | sed -E 's#(https?://[^/]+).*#\1#')"
+  cfp="$(curl -s -o /dev/null -w '%{http_code} %{size_download}' -L --max-time 10 ${CURL_NET[@]+"${CURL_NET[@]}"} "$corigin/4tail_spa_${RANDOM}${RANDOM}" 2>/dev/null || echo '')"
+  cs="${cfp%% *}"; cl="${cfp##* }"; case "$cs" in ''|*[!0-9]*) cs=""; esac
   httpx -silent -status-code -content-length -l "$infile" ${HTTPX_NET[@]+"${HTTPX_NET[@]}"} 2>/dev/null \
     | sed -E 's/\x1b\[[0-9;]*m//g' \
-    | awk '{ u=$1; sc=$2; cl=$3; gsub(/[][]/,"",sc); gsub(/[][]/,"",cl);
-             if (sc ~ /^[0-9]+$/) { if (cl=="") cl=0; print sc"\t"cl"\t"u } }' >> "$fuzz_findings_file"
+    | awk -v cs="$cs" -v cl="$cl" '{ u=$1; sc=$2; c=$3; gsub(/[][]/,"",sc); gsub(/[][]/,"",c);
+             if (sc !~ /^[0-9]+$/) next; if (c=="") c=0;
+             if (cs!="" && sc==cs && c+0>=cl-64 && c+0<=cl+64) next;   # SPA catch-all shell -> skip
+             print sc"\t"c"\t"u }' >> "$fuzz_findings_file"
   rm -f "$infile"
   [ -s "$fuzz_findings_file" ] && sort -u -o "$fuzz_findings_file" "$fuzz_findings_file"
 }
