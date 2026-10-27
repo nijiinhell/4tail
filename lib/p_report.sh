@@ -240,6 +240,12 @@ if have jq; then
         _u="$(printf '%s' "$l" | grep -oE 'https?://[^ ]+' | head -1)"
         emit_f "$(printf '%s' "$l" | grep -oE '^\[[a-z-]+\]' | tr -d '[]')" low security-headers "${_u:-$domain}" "$l"; done < "$sec_headers_file"
     [ -f "$findings_dir/kxss.txt" ] && while IFS= read -r l; do [ -n "$l" ] && emit_f reflected-param low kxss "$(nurl "$l")" "$l"; done < "$findings_dir/kxss.txt"
+    # OWASP/API Top-10 detector outputs
+    [ -f "${open_dir_file:-}" ]   && grep '^\[open-directory\]' "$open_dir_file" 2>/dev/null | while IFS= read -r l; do emit_f open-directory medium discovery "$(nurl "$l")" "$l"; done
+    [ -f "${stacktrace_file:-}" ] && while IFS= read -r l; do [ -n "$l" ] && emit_f verbose-error medium error-harvest "$(nurl "$l")" "$l"; done < "$stacktrace_file"
+    [ -f "${unauth_api_file:-}" ] && while IFS= read -r l; do [ -n "$l" ] && emit_f unauth-api-exposure high api-probe "$(nurl "$l")" "$l"; done < "$unauth_api_file"
+    [ -f "${openredir_file:-}" ]  && while IFS= read -r l; do [ -n "$l" ] && emit_f open-redirect medium redirect-probe "$(nurl "$l")" "$l"; done < "$openredir_file"
+    [ -f "${jwt_file:-}" ]        && while IFS= read -r l; do [ -n "$l" ] && emit_f jwt-weakness medium jwt-analysis "" "$l"; done < "$jwt_file"
     [ -f "${api_specs_file:-}" ] && while IFS= read -r l; do [ -n "$l" ] && emit_f api-spec info api-discovery "$l" "exposed API spec: $l"; done < "$api_specs_file"
     [ -f "${gql_schema_file:-}" ] && grep '^== GraphQL introspection OPEN: ' "$gql_schema_file" 2>/dev/null \
       | sed 's/^== GraphQL introspection OPEN: //; s/ ==$//' \

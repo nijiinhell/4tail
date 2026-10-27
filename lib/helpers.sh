@@ -290,6 +290,109 @@ verify_findings() {
   done
 }
 
+# --- OWASP / API Top-10 lightweight detectors (GET-only, capped, non-destructive) ----------
+# A05: open directory listings -> flag + extract linked confidential files into the URL pool.
+open_dir_scan() {
+  [ "${OPEN_DIR_CHECK:-1}" = 1 ] || return 0
+  : > "$open_dir_file"
+  local u body href fu origin
+  { [ -s "${fuzz_findings_file:-/dev/null}" ] && awk -F'\t' '$1==200{print $3}' "$fuzz_findings_file" 2>/dev/null
+    [ -s "${urls_file:-/dev/null}" ] && grep -iE '/$' "$urls_file" 2>/dev/null
+  } | awk 'NF && !seen[$0]++' | head -n "${OPEN_DIR_MAX:-60}" | while IFS= read -r u; do
+    [ -n "$u" ] || continue
+    body="$(curl -s -L --max-time 10 ${CURL_NET[@]+"${CURL_NET[@]}"} "$u" 2>/dev/null | head -c 20000)"
+    printf '%s' "$body" | grep -qiE 'Index of /|<title>Directory listing|Directory listing for|Parent Directory|\[To Parent Directory\]' || continue
+    printf '[open-directory] %s\n' "$u" >> "$open_dir_file"
+    origin="$(printf '%s' "$u" | sed -E 's#(https?://[^/]+).*#\1#')"
+    printf '%s' "$body" | grep -aoE 'href="[^"]+"' | sed -E 's/^href="//; s/"$//' \
+      | grep -iE '\.(bak|old|sql|env|ya?ml|zip|conf|cfg|json|md|log|tar|gz|tgz|pem|key|ini)$' \
+      | while IFS= read -r href; do
+          case "$href" in http*) fu="$href";; /*) fu="$origin$href";; *) fu="${u%/}/$href";; esac
+          printf '%s\n' "$fu" >> "$urls_file"
+          printf '  -> %s\n' "$fu" >> "$open_dir_file"
+        done
+  done
+}
+# A05/A03: 500 pages leaking stack traces / DB errors.
+stacktrace_harvest() {
+  [ "${STACKTRACE_CHECK:-1}" = 1 ] || return 0
+  : > "$stacktrace_file"
+  [ -s "${fuzz_findings_file:-/dev/null}" ] || return 0
+  local u body m
+  awk -F'\t' '$1==500{print $3}' "$fuzz_findings_file" 2>/dev/null | awk 'NF && !seen[$0]++' \
+    | head -n "${STACKTRACE_MAX:-5}" | while IFS= read -r u; do
+    body="$(curl -s -L --max-time 10 ${CURL_NET[@]+"${CURL_NET[@]}"} "$u" 2>/dev/null | head -c 12000)"
+    m="$(printf '%s' "$body" | grep -aoiE 'SQLITE_[A-Z]+|SQLSTATE|ORA-[0-9]{4,}|SQL syntax.*(MySQL|MariaDB)|PDOException|Sequelize[A-Za-z]*Error|SyntaxError|ReferenceError|TypeError:|at Object\.<anonymous>|Traceback \(most recent call last\)|java\.lang\.[A-Za-z.]+Exception|System\.[A-Za-z.]+Exception' | head -1)"
+    [ -n "$m" ] || continue
+    printf '[stack-trace] %s | %s\n' "$u" "$m" >> "$stacktrace_file"
+  done
+}
+# API1/A01: unauthenticated REST/API data exposure (BOLA candidates). Probes ANONYMOUSLY
+# (CURL_PROXY carries no auth header) so it works even when no session was supplied.
+unauth_api_scan() {
+  [ "${UNAUTH_API_CHECK:-1}" = 1 ] || return 0
+  : > "$unauth_api_file"
+  local u resp body f
+  { [ -s "${js_endpoints_file:-/dev/null}" ] && grep -iE '/api/|/rest/' "$js_endpoints_file" 2>/dev/null
+    [ -s "${targets_active_file:-/dev/null}" ] && grep -iE '/api/|/rest/' "$targets_active_file" 2>/dev/null
+  } | awk 'NF && !seen[$0]++' | head -n "${UNAUTH_API_MAX:-40}" | while IFS= read -r u; do
+    [ -n "$u" ] || continue
+    resp="$(curl -s -i -L --max-time 10 ${CURL_PROXY[@]+"${CURL_PROXY[@]}"} "$u" 2>/dev/null | head -c 12000)"
+    printf '%s' "$resp" | head -1 | grep -qE ' 20[0-6]' || continue
+    printf '%s' "$resp" | grep -qiE '^content-type:.*json' || continue
+    body="$(printf '%s' "$resp" | sed -E '1,/^\r{0,1}$/d')"
+    f="$(printf '%s' "$body" | grep -aoiE '"(email|password|hash|totpSecret|role|isAdmin|cardNum|ssn|balance|apiKey|token)"' | sort -u | tr -d '"' | tr '\n' ',' | sed 's/,$//' | head -c 140)"
+    [ -n "$f" ] || continue
+    printf '[unauth-api-exposure] %s | sensitive fields: %s\n' "$u" "$f" >> "$unauth_api_file"
+  done
+}
+# A01: deterministic open-redirect confirmation via a canary (no OAST needed).
+openredir_confirm() {
+  [ "${OPENREDIR_CHECK:-1}" = 1 ] || return 0
+  : > "$openredir_file"
+  local u inj loc canary='https://4tail-canary.example.org/'
+  local rparams='(to|redirect|redir|next|url|uri|return|returnurl|return_url|dest|destination|continue|out|goto)'
+  { [ -f "${gf_file:-/dev/null}" ] && grep -iE '^redirect\t' "$gf_file" 2>/dev/null | cut -f2
+    [ -s "${targets_active_file:-/dev/null}" ] && grep -aiE "[?&]${rparams}=" "$targets_active_file" 2>/dev/null
+  } | awk 'NF && !seen[$0]++' | head -n "${OPENREDIR_MAX:-25}" | while IFS= read -r u; do
+    [ -n "$u" ] || continue
+    inj="$(printf '%s' "$u" | sed -E "s#([?&]${rparams})=[^&]*#\1=${canary//#/\\#}#Ig")"
+    [ "$inj" = "$u" ] && continue
+    loc="$(curl -s -o /dev/null -D - --max-time 8 ${CURL_NET[@]+"${CURL_NET[@]}"} "$inj" 2>/dev/null | grep -iE '^location:' | head -1 | tr -d '\r')"
+    printf '%s' "$loc" | grep -qiE '4tail-canary\.example\.org' && printf '[open-redirect] %s | %s\n' "$u" "$loc" >> "$openredir_file"
+  done
+}
+# A07: passive JWT weakness analysis (alg=none, symmetric HS*, missing exp, sensitive claims).
+_b64url_decode() { local s="$1" pad; pad=$(( (4 - ${#s} % 4) % 4 )); s="$s$(printf '%*s' "$pad" '' | tr ' ' '=')"; printf '%s' "$s" | tr '_-' '/+' | base64 -d 2>/dev/null; }
+jwt_analyze() {
+  [ "${JWT_CHECK:-1}" = 1 ] || return 0
+  : > "$jwt_file"; have jq || return 0
+  local tok hdr pl hj pj alg exp issues sens
+  { [ -s "${js_secrets_file:-/dev/null}" ] && grep -aoE 'eyJ[A-Za-z0-9_-]+\.eyJ[A-Za-z0-9_-]+\.[A-Za-z0-9_-]*' "$js_secrets_file" 2>/dev/null
+    [ -s "${agent_file:-/dev/null}" ] && grep -aoE 'eyJ[A-Za-z0-9_-]+\.eyJ[A-Za-z0-9_-]+\.[A-Za-z0-9_-]*' "$agent_file" 2>/dev/null
+    printf '%s\n%s\n%s' "${AUTH_HEADER:-}" "${AUTH_COOKIE:-}" "${AUTH_A:-}" | grep -aoE 'eyJ[A-Za-z0-9_-]+\.eyJ[A-Za-z0-9_-]+\.[A-Za-z0-9_-]*'
+  } 2>/dev/null | awk 'NF && !seen[$0]++' | head -n 20 | while IFS= read -r tok; do
+    hdr="${tok%%.*}"; pl="${tok#*.}"; pl="${pl%%.*}"
+    hj="$(_b64url_decode "$hdr")"; pj="$(_b64url_decode "$pl")"
+    alg="$(printf '%s' "$hj" | jq -r '.alg // empty' 2>/dev/null)"
+    exp="$(printf '%s' "$pj" | jq -r '.exp // empty' 2>/dev/null)"
+    issues=""
+    case "$alg" in none|None|NONE) issues="$issues alg=none(!)";; HS256|HS384|HS512) issues="$issues symmetric-$alg";; esac
+    [ -z "$exp" ] && issues="$issues missing-exp"
+    sens="$(printf '%s' "$pj" | grep -aoiE '"(password|hash|totpSecret|role|isAdmin|secret)"' | tr -d '"' | tr '\n' ',' | sed 's/,$//')"
+    [ -n "$sens" ] && issues="$issues sensitive-claims:$sens"
+    [ -n "$issues" ] && printf '[jwt] %.48s… | alg=%s |%s\n' "$tok" "${alg:-?}" "$issues" >> "$jwt_file"
+  done
+}
+# Run all lightweight detectors (called from the funnel correlation pass).
+run_owasp_detectors() {
+  open_dir_scan; render 2>/dev/null || true
+  stacktrace_harvest; render 2>/dev/null || true
+  unauth_api_scan; render 2>/dev/null || true
+  openredir_confirm; render 2>/dev/null || true
+  jwt_analyze; render 2>/dev/null || true
+}
+
 # Change-detection: remember each target's attack surface + findings between runs and
 # show what's NEW this time (newly-deployed endpoints are disproportionately buggy).
 diff_state() {

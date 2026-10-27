@@ -43,6 +43,11 @@ else
       [ -s "${gql_schema_file:-/dev/null}" ] && { echo "GRAPHQL INTROSPECTION OPEN (full schema readable - map authz/IDOR per field):"; head -60 "$gql_schema_file"; }
       [ -s "${bypass_file:-/dev/null}" ] && { echo "ACCESS-CONTROL BYPASSES (403->200):"; head -10 "$bypass_file"; }
       [ -s "${idor_file:-/dev/null}" ] && { echo "IDOR / AUTHZ CANDIDATES:"; head -10 "$idor_file"; }
+      [ -s "${unauth_api_file:-/dev/null}" ] && { echo "UNAUTH API EXPOSURE (anon GET returned sensitive JSON - escalate: id-walk, confirm BOLA):"; head -10 "$unauth_api_file"; }
+      [ -s "${open_dir_file:-/dev/null}" ] && { echo "OPEN DIRECTORIES + EXPOSED FILES (GET the listed files):"; head -12 "$open_dir_file"; }
+      [ -s "${openredir_file:-/dev/null}" ] && { echo "CONFIRMED OPEN REDIRECTS:"; head -8 "$openredir_file"; }
+      [ -s "${jwt_file:-/dev/null}" ] && { echo "JWT WEAKNESSES (forge/replay candidates):"; head -8 "$jwt_file"; }
+      [ -s "${stacktrace_file:-/dev/null}" ] && { echo "STACK TRACES / DB ERRORS (verbose errors - probe the failing param deeper):"; head -8 "$stacktrace_file"; }
       [ -s "$findings_dir/kxss.txt" ] && { echo "REFLECTED PARAMS (kxss):"; head -15 "$findings_dir/kxss.txt"; }
       [ -s "${js_endpoints_file:-/dev/null}" ] && { echo "MINED API ENDPOINTS (from JS bundles - the SPA's real /rest + /api surface; GET them, POST login/register bodies, id-walk numeric path segments):"; head -40 "$js_endpoints_file"; }
       [ -s "$gf_file" ] && { echo "GF CANDIDATE BUCKETS (class<TAB>url):"; head -40 "$gf_file"; }
@@ -258,6 +263,21 @@ if [ "$VERIFY" = 1 ]; then set_stage $S_TRIAGE running "verifying findings"; ver
   fi
   if [ -s "${prop_file:-/dev/null}" ]; then
     echo "## Cross-host paths (found on one host, live on another)"; echo; echo '```'; head -n 60 "$prop_file"; echo '```'; echo
+  fi
+  if [ -s "${open_dir_file:-/dev/null}" ]; then
+    echo "## Open directory listings + exposed files (OWASP A05)"; echo; echo '```'; cat "$open_dir_file"; echo '```'; echo
+  fi
+  if [ -s "${stacktrace_file:-/dev/null}" ]; then
+    echo "## Verbose errors / stack traces (OWASP A05/A03)"; echo; echo '```'; cat "$stacktrace_file"; echo '```'; echo
+  fi
+  if [ -s "${unauth_api_file:-/dev/null}" ]; then
+    echo "## Unauthenticated API data exposure / BOLA candidates (OWASP API1/A01)"; echo; echo '```'; cat "$unauth_api_file"; echo '```'; echo
+  fi
+  if [ -s "${openredir_file:-/dev/null}" ]; then
+    echo "## Open redirects (confirmed) (OWASP A01)"; echo; echo '```'; cat "$openredir_file"; echo '```'; echo
+  fi
+  if [ -s "${jwt_file:-/dev/null}" ]; then
+    echo "## JWT weaknesses (OWASP A07)"; echo; echo '```'; cat "$jwt_file"; echo '```'; echo
   fi
   if [ -s "$findings_dir/dalfox.txt" ]; then
     echo "## XSS (dalfox)"; echo; echo '```'; head -n 80 "$findings_dir/dalfox.txt"; echo '```'; echo

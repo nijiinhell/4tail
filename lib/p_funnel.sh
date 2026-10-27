@@ -442,6 +442,11 @@ $(cat "$OUTDIR/.patterns_numbered.txt")" >"$jout" 2>>"$llm_log" || true
     rm -f "$OUTDIR/.cors_in.txt"
   fi; render
 
+  # OWASP/API Top-10 lightweight detectors (open dirs, 500 stack traces, unauth API exposure,
+  # open-redirect confirmation, JWT weaknesses) - GET-only, capped, non-destructive.
+  set_stage $S_CRAWL running "OWASP detectors (dirs · errors · unauth-api · redirect · jwt)"
+  run_owasp_detectors; render
+
   touch "$OUTDIR/.done_crawl"
   set_stage $S_CRAWL done "$url_total urls -> $active_total active | dast:$(nlines "$dast_file") dalfox:$(nlines "$findings_dir/dalfox.txt") kxss:$(nlines "$findings_dir/kxss.txt") sqlmap:$(nlines "$findings_dir/sqlmap.txt") bypass:$(nlines "$bypass_file") prop:$(nlines "$prop_file") idor:$(nlines "$idor_file")"
 fi

@@ -87,6 +87,16 @@ USE_PERMUTE="${USE_PERMUTE:-1}"           # dnsgen/gotator permutation of known 
 PERMUTE_MIN_SUBS="${PERMUTE_MIN_SUBS:-25}" # skip permutation unless at least this many real subs exist (it's a wildcard-scope tool; pointless on a handful of hosts)
 PERMUTE_MAX="${PERMUTE_MAX:-2000}"        # hard cap on generated permutations to resolve
 CORS_SCAN="${CORS_SCAN:-1}"              # Corsy CORS-misconfig pass on live hosts
+# OWASP Top 10 / API Top 10 lightweight detectors (all GET-only, capped, non-destructive)
+OPEN_DIR_CHECK="${OPEN_DIR_CHECK:-1}"    # flag open directory listings + extract linked confidential files
+OPEN_DIR_MAX="${OPEN_DIR_MAX:-60}"
+STACKTRACE_CHECK="${STACKTRACE_CHECK:-1}"  # harvest stack traces / DB errors from 500 pages
+STACKTRACE_MAX="${STACKTRACE_MAX:-5}"
+UNAUTH_API_CHECK="${UNAUTH_API_CHECK:-1}"  # probe mined /api//rest/ endpoints anonymously for data exposure
+UNAUTH_API_MAX="${UNAUTH_API_MAX:-40}"
+OPENREDIR_CHECK="${OPENREDIR_CHECK:-1}"  # deterministic open-redirect confirmation (canary in redirect params)
+OPENREDIR_MAX="${OPENREDIR_MAX:-25}"
+JWT_CHECK="${JWT_CHECK:-1}"              # passive JWT weakness analysis (alg=none, HS*, missing exp, sensitive claims)
 CORS_MAX="${CORS_MAX:-50}"               # cap hosts sent to Corsy
 TAKEOVER_CHECK="${TAKEOVER_CHECK:-1}"    # flag dangling CNAMEs (subdomain takeover) that httpx drops because they don't answer HTTP
 TAKEOVER_RE="${TAKEOVER_RE:-s3\\.amazonaws\\.com|s3-website|cloudfront\\.net|github\\.io|herokuapp\\.com|herokudns|azurewebsites\\.net|trafficmanager\\.net|cloudapp\\.(net|azure)|blob\\.core\\.windows|fastly\\.net|readthedocs\\.io|ghost\\.io|wpengine|pantheonsite|surge\\.sh|bitbucket\\.io|netlify\\.(app|com)|shopify|myshopify|zendesk\\.com|statuspage\\.io|helpscoutdocs|unbouncepages|wixdns|firebaseapp\\.com|appspot\\.com|gitlab\\.io}"
