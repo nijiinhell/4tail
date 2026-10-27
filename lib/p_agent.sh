@@ -28,9 +28,12 @@ else
     { echo "# $1"; printf '%s\n' "$2"; } > "$f"
     printf '[SECRET-LOOT] %s | raw response with credentials saved -> %s\n' "$1" "$f" >> "$agent_file"
   }
+  # Scope string for the AI: in single-host / custom-port mode, hand it the exact seed URL
+  # (http://localhost:3000) so it keeps the scheme+port; otherwise the wildcard host scope.
+  agent_scope="*.$domain"; [ "${SINGLE:-0}" = 1 ] && agent_scope="${SEED_URL:-$agent_scope}"
   # Compact "situation" brief: the juiciest, most actionable signals only.
   situation="$( {
-      echo "TARGET SCOPE: *.$domain"
+      echo "TARGET SCOPE: $agent_scope"
       [ -s "${stale_file:-/dev/null}" ] && { echo "LEGACY HOSTS (older=prioritize):"; head -5 "$stale_file"; }
       [ -s "$dast_file" ] && { echo "CONFIRMED DAST (nuclei):"; head -20 "$dast_file"; }
       [ -s "$nuclei_file" ] && { echo "CONFIRMED NUCLEI (cves/exposures/misconfig/tech):"; head -20 "$nuclei_file"; }
@@ -60,7 +63,9 @@ else
     [ "$AGENT_MAX_TIME" -gt 0 ] 2>/dev/null && [ $((SECONDS-astart)) -ge "$AGENT_MAX_TIME" ] && break
     set_stage $S_AGENT running "round $round/$AGENT_ROUNDS: AI thinking"
     aout="$(mktemp)"
-    ai_call "$LLM_MODEL_PLAN" 2200 \
+    # Reasoning models (GLM/DeepSeek) spend tokens on internal CoT before emitting .content;
+    # too small a budget => finish_reason=length with empty content => "no probes proposed".
+    ai_call "$LLM_MODEL_PLAN" "${LLM_MAX_TOKENS_PLAN:-6000}" \
 "You are an autonomous web-app pentester on an AUTHORIZED target, working in rounds. You keep a running NOTES block (your hypotheses: what you suspect, why, and what is confirmed / refuted / still-unconfirmed), update it each round from the latest results, then take the next ACTIONS to chase the hottest lead, then decide whether to keep going.
 Three kinds of action:
   GET <url> | why | success-regex            -> a passive fetch you confirm by regex (LFI reads, redirects, param mining, IDOR id-walking).
@@ -68,7 +73,7 @@ Three kinds of action:
   TOOL <name> <url> | tags=...               -> run a real tool. ONLY these are installed: ${agent_tools:-none}. Use them to CONFIRM, e.g. sqlmap on a SQLi-looking param (it always runs capped at --level=1 --risk=1; higher levels are ignored), dalfox on a reflecting param, nuclei <url> tags=iis,cve on a fingerprinted host, git-dumper on an exposed /.git, nuclei-dast to fuzz a param URL. Prefer a TOOL to prove a lead over guessing.
 Ideas: confirmed/possible LFI (Templatize.asp?item=) -> read ../web.config, ../global.asa, ../../../windows/win.ini (if it holds a connection string / machineKey, 4tail saves the raw file for the human - you just confirm the read with a regex like connectionString); empty/small 200 endpoints -> add params ?id=1&debug=1; redirect params -> //example.org/ and watch Location; exposed /.git -> git-dumper.
 For the MINED API ENDPOINTS (SPA /rest + /api) go further than GET: (a) PATH-IDOR/BOLA - a numeric path segment like /api/Users/1 or /rest/basket/3 is an object id, so GET the neighbour (/2, /4) and compare; a readable neighbour you should not own is a lead; (b) AUTH/SQLi - POST a JSON body to a login/authentication endpoint with a single-quote injected into the email/username field and look for a SQL error or an unexpected auth success; (c) MASS ASSIGNMENT - POST/register with an extra JSON field such as role set to admin, or isAdmin true, and check whether it sticks. Use the POST action for (b) and (c); a body that starts with a brace is sent as application/json.
-All URLs MUST be on the target scope *.$domain. Respond in EXACTLY this structure, nothing else:
+All URLs MUST be on the target scope $agent_scope (keep the scheme and port exactly as given). Respond in EXACTLY this structure, nothing else:
 NOTES:
 <2-6 short lines: updated hypotheses + status>
 ACTIONS:

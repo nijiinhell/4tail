@@ -14,6 +14,10 @@
 set -u
 set -o pipefail
 
+# Defined first thing: sourced sections (cli.sh's JWT pre-flight, config, …) call `have`
+# before the dependency-check block runs, so it must exist from the very top.
+have() { command -v "$1" >/dev/null 2>&1; }
+
 # Snapshot which tuning vars the user set explicitly, BEFORE we apply any defaults,
 # so a loaded blueprint never overrides a value the user chose on the CLI/env.
 for _v in CRAWL_MAX_URLS CRAWL_MAX_TIME DAST_MAX_URLS NUCLEI_MAX_HOSTS NUCLEI_SEVERITY \

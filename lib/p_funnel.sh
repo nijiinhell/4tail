@@ -75,10 +75,27 @@ else
         grep -aoE "[\"'\`]/[a-zA-Z0-9_./?=&%-]{2,}[\"'\`]" <<<"$jb" | tr -d "\"'\`" | sed "s#^#${jorg}#"
         grep -aoE "[\"'\`](rest|api|graphql|v[0-9]+)/[a-zA-Z0-9_./?=&%-]{2,}[\"'\`]" <<<"$jb" | tr -d "\"'\`" | sed "s#^#${jorg}/#"
       } 2>/dev/null >> "$js_endpoints_file"
+      # source map for this newly found bundle (Juice Shop & most SPAs ship .js.map): the
+      # readable original source leaks endpoints + the secrets minification hid. Mine its
+      # sourcesContent directly (no file reconstruction needed here).
+      if [ "$SOURCEMAPS" = 1 ] && have jq; then
+        mb="$(curl -s -L --max-time 12 ${CURL_NET[@]+"${CURL_NET[@]}"} "${dj%%\?*}.map" 2>/dev/null | head -c 8000000)"
+        if printf '%s' "$mb" | jq -e '.sourcesContent | length > 0' >/dev/null 2>&1; then
+          printf '%s\n' "${dj%%\?*}.map" >> "${sourcemap_file:-/dev/null}"
+          msrc="$(printf '%s' "$mb" | jq -r '.sourcesContent[]? // empty' 2>/dev/null)"
+          printf '%s' "$msrc" | grep -aoE "$SECRET_RE" 2>/dev/null | sort -u | sed "s#^#sourcemap:${dj}\t#" >> "$js_secrets_file"
+          printf '%s' "$msrc" | grep -aoiE "https?://([a-z0-9._-]+\.)?${esc_domain}[a-z0-9._/?=&%:-]*" 2>/dev/null >> "${smap_endpoints_file:-/dev/null}"
+        fi
+      fi
       printf '%s\n' "$dj" >> "$js_urls_file"
     done <<< "$deep_js"
     sort -u -o "$js_secrets_file" "$js_secrets_file"
-    [ -s "$js_endpoints_file" ] && grep -ivE '\.(png|jpe?g|gif|svg|woff2?|ttf|eot|css|ico|map)([?#]|$)' "$js_endpoints_file" | sort -u > "$js_endpoints_file.t" && mv "$js_endpoints_file.t" "$js_endpoints_file"
+    [ -s "${sourcemap_file:-/dev/null}" ] && sort -u -o "$sourcemap_file" "$sourcemap_file"
+    [ -s "${smap_endpoints_file:-/dev/null}" ] && sort -u -o "$smap_endpoints_file" "$smap_endpoints_file"
+    [ -s "$js_endpoints_file" ] && grep -ivE '\.(png|jpe?g|gif|svg|woff2?|ttf|eot|css|ico|map)([?#]|$)' "$js_endpoints_file" | sed -E '/\?/ s/=(&|$)/=1\1/g' | sort -u > "$js_endpoints_file.t" && mv "$js_endpoints_file.t" "$js_endpoints_file"
+    # keep the JS dashboard row in sync with what the deep re-mine added (was frozen at the
+    # pre-funnel count, so the TUI showed "0 secret hits" while the tally said js-secrets:N).
+    set_stage $S_JS done "$(nlines "$js_urls_file") JS, $(nlines "$js_secrets_file") secret hits, $(nlines "${sourcemap_file:-/dev/null}") maps"
   fi
   # fold in endpoints mined from source maps + JS bundles (SPA API surface); scoped+deduped below
   [ -s "${smap_endpoints_file:-/dev/null}" ] && cat "$smap_endpoints_file" >> "$urls_file"
@@ -363,7 +380,13 @@ $(cat "$OUTDIR/.patterns_numbered.txt")" >"$jout" 2>>"$llm_log" || true
   fi
   # SQLi confirmation: sqlmap on the gf-sqli URLs ONLY, tightly capped (not discovery)
   if has_spec sqlmap && [ "$SQLMAP_CONFIRM" = 1 ] && have sqlmap && [ "${ACT_MAX_SQLMAP:-0}" -gt 0 ] 2>/dev/null; then
-    sq="$findings_dir/.sqliq.txt"; grep -iE '^sqli\t' "$gf_file" 2>/dev/null | cut -f2 | head -n "$ACT_MAX_SQLMAP" > "$sq"
+    sq="$findings_dir/.sqliq.txt"
+    # gf's sqli list keys on id=/search=/query=/filter= but misses ?q= on REST/API search
+    # endpoints (e.g. Juice Shop /rest/products/search?q=1). Supplement with any active API/
+    # search URL that has a populated query param; dedup; cap at ACT_MAX_SQLMAP.
+    { grep -iE '^sqli\t' "$gf_file" 2>/dev/null | cut -f2
+      grep -aiE '[?&][a-z0-9_]+=[^&]' "$targets_active_file" 2>/dev/null | grep -iE '/rest/|/api/|search|query|filter'
+    } | awk 'NF && !seen[$0]++' | head -n "$ACT_MAX_SQLMAP" > "$sq"
     if [ -s "$sq" ]; then
       ( tmo "$SQLMAP_MAX_TIME" sqlmap -m "$sq" --batch --smart --level=1 --risk=1 --technique=BEU \
           --output-dir="$findings_dir/sqlmap" >/dev/null 2>>"$llm_log"
@@ -392,12 +415,21 @@ $(cat "$OUTDIR/.patterns_numbered.txt")" >"$jout" 2>>"$llm_log" || true
   # CORS misconfiguration (Corsy) on the live hosts + juicy URLs (bug class we don't cover elsewhere).
   if [ "$CORS_SCAN" = 1 ] && have corsy; then
     { ranked_hosts; head -n 30 "$targets_active_file" 2>/dev/null; } | awk '!seen[$0]++' | head -n "$CORS_MAX" > "$OUTDIR/.cors_in.txt"
-    # Strip Corsy's ANSI colors, drop its "No misconfigurations found" banner, and keep only
-    # lines that are an actual finding (carry a URL or a named misconfig class).
+    # Corsy prints multi-line blocks: the URL on a header line, the misconfig on an indented
+    # "- Class: ..." line below it. Keep each class ATTACHED to its parent URL (awk carries the
+    # last URL seen), drop plain "wildcard value" (ACAO:* without credentials is standard on
+    # public APIs/SPAs and not a finding), and dedupe by (origin, class) so one host doesn't
+    # emit the same class dozens of times.
     [ -s "$OUTDIR/.cors_in.txt" ] && tmo 180 corsy -i "$OUTDIR/.cors_in.txt" 2>/dev/null \
       | sed -E 's/\x1b\[[0-9;]*m//g' \
-      | grep -viE 'no misconfig|not vulnerable|unreachable|could not|timed out|invalid|connection (refused|error)|^[[:space:]]*-?[[:space:]]*$' \
-      | grep -iE 'reflect|wildcard|null origin|arbitrary origin|post-domain|pre-domain|trusted|credentials|origin reflected' > "$corsy_file" || true
+      | awk '
+          match($0,/https?:\/\/[^ ]+/){ u=substr($0,RSTART,RLENGTH); gsub(/[],")>]+$/,"",u) }
+          /[Cc]lass[[:space:]]*:/ { c=$0; sub(/.*[Cc]lass[[:space:]]*:[[:space:]]*/,"",c); sub(/[[:space:]]+$/,"",c);
+            if (u!="" && c!="") print u "\t" c }
+        ' \
+      | grep -iE 'reflect|null origin|arbitrary|post-domain|pre-domain|trusted|credential' \
+      | awk -F'\t' '{ o=$1; sub(/(https?:\/\/[^\/]+).*/,"\\1",o); k=o"|"$2; if(!s[k]++) printf "%s — %s\n",$1,$2 }' \
+      > "$corsy_file" || true
     rm -f "$OUTDIR/.cors_in.txt"
   fi; render
 

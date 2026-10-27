@@ -84,6 +84,7 @@ else
   if [ -s "$js_endpoints_file" ]; then
     grep -iE "^https?://([a-z0-9._-]+\.)?${esc_domain}([:/]|$)" "$js_endpoints_file" 2>/dev/null \
       | grep -ivE '\.(png|jpe?g|gif|svg|woff2?|ttf|eot|css|ico|map)([?#]|$)' \
+      | sed -E '/\?/ s/=(&|$)/=1\1/g' \
       | sort -u | head -n 4000 > "$js_endpoints_file.tmp" && mv "$js_endpoints_file.tmp" "$js_endpoints_file"
   fi
   if [ -n "$js_dir" ] && [ -n "$(ls -A "$js_dir" 2>/dev/null)" ]; then

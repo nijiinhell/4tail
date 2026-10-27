@@ -135,7 +135,7 @@ fi
 # ---------------------------------------------------------------------------
 # Dependency checks
 # ---------------------------------------------------------------------------
-have() { command -v "$1" >/dev/null 2>&1; }
+# have() is defined in 00-prelude.sh (needed earlier, e.g. the JWT pre-flight above).
 missing=()
 for tool in httpx nuclei; do have "$tool" || missing+=("$tool"); done
 # subfinder is only needed to enumerate subdomains; single-host mode doesn't use it.
