@@ -113,7 +113,10 @@ try_403_bypass() {
     # turning the trick into a plain request before it leaves the machine).
     bctl="$(curl -s -o /dev/null -w '%{http_code} %{size_download}' --path-as-is --max-time 8 ${CURL_NET[@]+"${CURL_NET[@]}"} "$origin/4tbz${RANDOM}x" 2>/dev/null || echo '000 0')"
     bcode="${bctl%% *}"; bsz="${bctl##* }"
-    for t in "$path/" "$path/." "/.$path" "$path%2e" "$path%20" "$path%09" "$path..;/" "$path?" ; do
+    # path tricks + poison-null-byte suffixes: an extension allowlist ("only .md/.pdf allowed")
+    # that rejects /x.bak with 403 is bypassed by /x.bak%2500.md (the %00 truncates server-side).
+    for t in "$path/" "$path/." "/.$path" "$path%2e" "$path%20" "$path%09" "$path..;/" "$path?" \
+             "$path%2500.md" "$path%2500.pdf" "$path%00.md" ; do
       r="$(curl -s -o /dev/null -w '%{http_code} %{size_download}' --path-as-is --max-time 8 ${CURL_NET[@]+"${CURL_NET[@]}"} "$origin$t" 2>/dev/null || echo '000 0')"
       code="${r%% *}"; sz="${r##* }"
       case "$code" in 200|201|202|203|206) ;; *) continue ;; esac   # a real bypass serves the resource; a 3xx is a redirect, not access
@@ -303,22 +306,44 @@ open_dir_scan() {
   [ "${OPEN_DIR_CHECK:-1}" = 1 ] || return 0
   : > "$open_dir_file"
   local u body href fu origin
+  # Candidates: 200 dirs + trailing-slash urls + the PARENT directory of any 403 path (e.g. a 403
+  # on /ftp/order_ means /ftp itself is worth listing).
   { [ -s "${fuzz_findings_file:-/dev/null}" ] && awk -F'\t' '$1==200{print $3}' "$fuzz_findings_file" 2>/dev/null
+    [ -s "${fuzz_findings_file:-/dev/null}" ] && awk -F'\t' '$1==403 || $1==401 {u=$3; sub(/[^/]*$/,"",u); print u}' "$fuzz_findings_file" 2>/dev/null
     [ -s "${urls_file:-/dev/null}" ] && grep -iE '/$' "$urls_file" 2>/dev/null
   } | awk 'NF && !seen[$0]++' | head -n "${OPEN_DIR_MAX:-60}" | while IFS= read -r u; do
     [ -n "$u" ] || continue
     body="$(curl -s -L --max-time 10 ${CURL_NET[@]+"${CURL_NET[@]}"} "$u" 2>/dev/null | head -c 20000)"
-    printf '%s' "$body" | grep -qiE 'Index of /|<title>Directory listing|Directory listing for|Parent Directory|\[To Parent Directory\]' || continue
-    printf '[open-directory] %s\n' "$u" >> "$open_dir_file"
     origin="$(printf '%s' "$u" | sed -E 's#(https?://[^/]+).*#\1#')"
-    printf '%s' "$body" | grep -aoE 'href="[^"]+"' | sed -E 's/^href="//; s/"$//' \
-      | grep -iE '\.(bak|old|sql|env|ya?ml|zip|conf|cfg|json|md|log|tar|gz|tgz|pem|key|ini)$' \
+    _children=""
+    if printf '%s' "$body" | grep -qiE 'Index of /|<title>Directory listing|Directory listing for|Parent Directory|\[To Parent Directory\]'; then
+      # HTML autoindex: pull href filenames
+      _children="$(printf '%s' "$body" | grep -aoE 'href="[^"]+"' | sed -E 's/^href="//; s/"$//')"
+    elif printf '%s' "$body" | grep -qaE '^\s*\[\s*"[a-zA-Z0-9._-]+"'; then
+      # JSON filename array (e.g. ["jwt.pub","package.json.bak"]) - common custom "ftp" listings
+      _children="$(printf '%s' "$body" | grep -aoE '"[a-zA-Z0-9._/-]+"' | tr -d '"')"
+    else
+      continue
+    fi
+    printf '[open-directory] %s\n' "$u" >> "$open_dir_file"
+    printf '%s\n' "$_children" \
+      | grep -iE '\.(bak|old|sql|env|ya?ml|zip|conf|cfg|json|md|log|tar|gz|tgz|pem|key|ini|pub|txt|csv)$' \
       | while IFS= read -r href; do
+          [ -n "$href" ] || continue
           case "$href" in http*) fu="$href";; /*) fu="$origin$href";; *) fu="${u%/}/$href";; esac
           printf '%s\n' "$fu" >> "$urls_file"
           printf '  -> %s\n' "$fu" >> "$open_dir_file"
+          # dependency manifests -> feed versioned_components for CVE / typosquat / supply-chain triage
+          case "$href" in
+            package.json*|composer.json*|requirements.txt*|pom.xml*|Gemfile.lock*|yarn.lock*)
+              curl -s -L --max-time 10 ${CURL_NET[@]+"${CURL_NET[@]}"} "$fu" 2>/dev/null | head -c 60000 \
+                | grep -aoE '"[a-zA-Z0-9@._/-]+"[[:space:]]*:[[:space:]]*"[~^><= ]*[0-9][0-9A-Za-z.+-]*"' \
+                | sed -E 's/"[[:space:]]*:[[:space:]]*"/ /; s/"//g; s/[~^><= ]*//' \
+                | head -n 150 >> "${versions_file:-/dev/null}" 2>/dev/null || true ;;
+          esac
         done
   done
+  [ -s "${versions_file:-/dev/null}" ] && sort -u -o "$versions_file" "$versions_file" 2>/dev/null || true
 }
 # A05/A03: 500 pages leaking stack traces / DB errors.
 stacktrace_harvest() {
@@ -440,7 +465,22 @@ probe_mined_endpoints() {
       [ -n "$f" ] && [ -f "$f" ] && awk -F'?' 'NR==FNR{bad[$1]=1;next}{ if($1 in bad) next; print }' "$catch.base" "$f" > "$f.t" 2>/dev/null && mv "$f.t" "$f"
     done
     [ -f "${gf_file:-/dev/null}" ] && awk -F'\t' 'NR==FNR{bad[$1]=1;next}{u=$2; sub(/\?.*/,"",u); if(u in bad) next; print}' "$catch.base" "$gf_file" > "$gf_file.t" 2>/dev/null && mv "$gf_file.t" "$gf_file"
+    # POST-only API routes: a mined /api//rest//b2b/ path that GET-returns the SPA shell may be a
+    # live POST endpoint (e.g. /b2b/v2/orders). One non-destructive POST {} probe; a validation/
+    # auth/parse status (not the GET catch-all) means it's real -> record it + feed the agent.
+    local pu pr pc pl
+    grep -iE '/(api|rest|graphql|v[0-9]+|b2b|auth|oauth|webhook|internal|admin)(/|$)' "$catch.base" 2>/dev/null \
+      | awk '!seen[$0]++' | head -n "${POSTPROBE_MAX:-30}" | while IFS= read -r pu; do
+        [ -n "$pu" ] || continue
+        pr="$(curl -s -o /dev/null -w '%{http_code} %{size_download}' -L --max-time 8 ${CURL_PROXY[@]+"${CURL_PROXY[@]}"} -H 'Content-Type: application/json' -d '{}' "$pu" 2>/dev/null || echo '000 0')"
+        pc="${pr%% *}"; pl="${pr##* }"
+        case "$pc" in
+          400|401|403|405|415|422|500|201) printf '%s\t%s\t%s [POST]\n' "$pc" "$pl" "$pu" >> "$fuzz_findings_file" ;;
+          200) [ "${pl:-0}" != "${cl:-x}" ] && printf '%s\t%s\t%s [POST]\n' "$pc" "$pl" "$pu" >> "$fuzz_findings_file" ;;
+        esac
+      done
     rm -f "$catch.base"
+    [ -s "$fuzz_findings_file" ] && sort -u -o "$fuzz_findings_file" "$fuzz_findings_file"
   fi
 }
 # Run all lightweight detectors (called from the funnel correlation pass).
