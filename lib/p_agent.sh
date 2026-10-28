@@ -55,9 +55,19 @@ else
     tok="$(printf '%s' "$1" | grep -aoiE '"(access[_-]?token|id[_-]?token|jwt|token)"[[:space:]]*:[[:space:]]*"[A-Za-z0-9._-]{20,}"' | head -1 | grep -aoE '[A-Za-z0-9._-]{20,}' | head -1)"
     if [ -n "$tok" ]; then
       agent_captured_auth="Authorization: Bearer $tok"
-      # log only (not agent_file) - this is a capability, not a vulnerability finding
-      printf '[auth-captured] bearer token acquired - applied to subsequent probes\n' >> "$agent_log"
-      results="$results"$'\n'"[auth-captured] a bearer token was captured and is now applied to all further probes - re-test the 401/403 endpoints and id-walk resource paths"
+      # Decode the JWT payload: label the privilege level (so the agent knows admin vs low-priv for
+      # BOLA/BFLA), flag sensitive claims leaked in the token, and save a token that carries secrets.
+      local _pj _role _uid _claims
+      _pj="$(_b64url_decode "$(printf '%s' "$tok" | cut -d. -f2)" 2>/dev/null)"
+      _role="$(printf '%s' "$_pj" | jq -r '(.role // .isAdmin // .admin // .data.role // "?")' 2>/dev/null)"; [ -n "$_role" ] || _role="?"
+      _uid="$(printf '%s' "$_pj" | jq -r '(.id // .userId // .data.id // .sub // "?")' 2>/dev/null)"; [ -n "$_uid" ] || _uid="?"
+      _claims="$(printf '%s' "$_pj" | grep -aoiE '"(password|hash|totpSecret|secret|privateKey|ssn|card|role|isAdmin)"' | tr -d '"' | sort -u | tr '\n' ',' | sed 's/,$//')"
+      printf '[auth-captured] bearer token acquired (role=%s, id=%s) - applied to subsequent probes\n' "$_role" "$_uid" >> "$agent_log"
+      if [ -n "$_claims" ] && [ "$AGENT_LOOT" = 1 ]; then
+        mkdir -p "$agent_loot_dir"; printf '# JWT from %s\n%s\n' "$1" "$_pj" > "$agent_loot_dir/jwt_claims.txt" 2>/dev/null
+        printf '[JWT-CLAIMS-EXPOSURE] token payload carries sensitive claims: %s (saved to agent_loot/jwt_claims.txt)\n' "$_claims" >> "$agent_file"
+      fi
+      results="$results"$'\n'"[auth-captured role=$_role id=$_uid] bearer token applied to all further probes - re-test the 401/403 endpoints and id-walk resource paths (role=$_role means $([ "$_role" = "?" ] && echo 'unknown privilege' || echo "privilege=$_role"))"
       return 0
     fi
     ck="$(printf '%s' "$1" | grep -aoiE '^set-cookie:[[:space:]]*[^;[:space:]]+' | head -1 | sed -E 's/^set-cookie:[[:space:]]*//I')"
@@ -118,13 +128,13 @@ else
 "You are an autonomous web-app pentester on an AUTHORIZED target, working in rounds. You keep a running NOTES block (your hypotheses: what you suspect, why, and what is confirmed / refuted / still-unconfirmed), update it each round from the latest results, then take the next ACTIONS to chase the hottest lead, then decide whether to keep going.
 Three kinds of action:
   GET <url> | why | success-regex            -> a passive fetch you confirm by regex (LFI reads, redirects, param mining, IDOR id-walking).
-  POST <url> | body | why | success-regex    -> a form/JSON POST to test BODY-based bugs: login/register logic, body IDOR/SQLi, mass assignment. body is raw urlencoded (e.g. tfUName=%27&tfUPass=x) or JSON. NON-DESTRUCTIVE only: benign markers, id=1/id=2, a single quote for SQLi - never DROP/DELETE/TRUNCATE/SHUTDOWN/xp_cmdshell or mass writes (those are refused).
+  POST|PUT|PATCH <url> | body | why | success-regex  -> a body-based write to test login/register logic, body IDOR/SQLi, mass assignment, forged-review / product-tampering (PUT/PATCH on a REST item you do not own). body is raw urlencoded, JSON, or XML. Content-Type is auto-set: {/[ -> json, </<?xml -> xml, else form. NON-DESTRUCTIVE only: benign markers, id=1/id=2, a single quote for SQLi - never DROP/DELETE/TRUNCATE/SHUTDOWN/xp_cmdshell or mass writes (refused).
   TOOL <name> <url> | tags=...               -> run a real tool. ONLY these are installed: ${agent_tools:-none}. Use them to CONFIRM, e.g. sqlmap on a SQLi-looking param (it always runs capped at --level=1 --risk=1; higher levels are ignored), dalfox on a reflecting param, nuclei <url> tags=iis,cve on a fingerprinted host, git-dumper on an exposed /.git, nuclei-dast to fuzz a param URL. Prefer a TOOL to prove a lead over guessing.
 Work from first principles on THIS target - do not assume any framework's specific paths or field names. Methodology:
 - SCHEMA FIRST: before POSTing to an endpoint whose body fields you do not already know from the DISCOVERED FORMS/FIELDS or an API spec, send an empty JSON body {} (or a single dummy field) once. A 400/422 validation error usually names the required fields (e.g. a message like: field NAME is required); use those exact names next round. Do NOT invent field names.
 - LFI / path traversal: on a param that names a file/template/page, read common sensitive files relative to it (../ up to the web root: app config, env files, /etc/passwd, source) and confirm with a content signature (connectionString, root:.*:0:0:, BEGIN PRIVATE KEY). 4tail saves any raw credential file for the human.
 - empty/small 200 endpoints -> add plausible params (?id=1&debug=1); redirect-looking params -> set an off-site absolute URL and watch the Location header; an exposed /.git -> git-dumper.
-For the MINED API ENDPOINTS go further than GET: (a) PATH-IDOR/BOLA - a numeric or UUID path segment is an object id, so GET a neighbour id and compare; a readable record you should not own is a lead; (b) AUTH/SQLi - POST to a login/auth endpoint with a single quote in the identifier field and look for a SQL error or an unexpected auth success; (c) MASS ASSIGNMENT - when registering or updating a profile, add standard privilege attributes alongside the REAL required fields: role (e.g. admin), isAdmin/is_admin true, permissions, group, plan - then read the response to see if they stuck. Use the POST action for (b)/(c); a body starting with a brace is sent as application/json.
+For the MINED API ENDPOINTS go further than GET: (a) PATH-IDOR/BOLA - a numeric or UUID path segment is an object id, so GET a neighbour id and compare; a readable record you should not own is a lead; (b) AUTH/SQLi - POST to a login/auth endpoint with a single quote in the identifier field and look for a SQL error or an unexpected auth success; (c) MASS ASSIGNMENT - when registering or updating a profile, add standard privilege attributes alongside the REAL required fields: role (e.g. admin), isAdmin/is_admin true, permissions, group, plan; (d) BFLA/WRITE-AUTHZ - try PUT/PATCH on a REST item you do not own (e.g. a product or another user's review) to change it (forged review / product tampering); (e) NoSQLi - if a login/search endpoint ignores a SQL quote, POST a JSON operator body like {"email":{"\$gt":""},"password":{"\$gt":""}} or {"\$ne":null}; (f) SSTI - on a reflected text field, send {{7*7}} or #{7*7} and check if 49 appears; (g) XXE - on a B2B/order/import/upload route that takes XML, POST a body starting with <?xml declaring an external entity reading a benign file (file:///etc/hostname) and look for the file content echoed back. Use POST/PUT/PATCH for these.
 If an unauthenticated probe returns a session token or creates an account, 4tail auto-captures it and applies it to your later probes - so next round PIVOT to re-testing the 401/403 endpoints and sequential/UUID resource paths for BOLA/IDOR with that new access.
 All URLs MUST be on the target scope $agent_scope (keep the scheme and port exactly as given). Respond in EXACTLY this structure, nothing else:
 NOTES:
@@ -162,7 +172,7 @@ $situation"; printf '\n=== end head ===\n'; } >> "$agent_log" 2>/dev/null
     printf '=== round %s notes ===\n%s\n' "$round" "$agent_notes" >> "$agent_log"
     [ -n "$probes" ] || { [ "$round" -eq 1 ] && SUP_NOTE="agent: no probes proposed"; break; }
     # Default "looks sensitive" markers so a probe can confirm even when the model gives no regex.
-    agent_default_rx='connectionString|<configuration|<\?xml|root:.{0,40}:0:0:|\[fonts\]|\[extensions\]|16-bit app support|BEGIN [A-Z ]*PRIVATE KEY|DB_PASSWORD|SA_PASSWORD|Microsoft OLE DB|ODBC|SQL syntax.*MySQL|ORA-[0-9]{4,}|Directory of |<web-app|runtime error'
+    agent_default_rx='connectionString|<configuration|<\?xml|root:.{0,40}:0:0:|\[fonts\]|\[extensions\]|16-bit app support|BEGIN [A-Z ]*PRIVATE KEY|DB_PASSWORD|SA_PASSWORD|Microsoft OLE DB|ODBC|SQL syntax.*MySQL|ORA-[0-9]{4,}|Directory of |<web-app|runtime error|SQLITE_ERROR|SequelizeDatabaseError|MongoError|CastError|BSONTypeError|\$where|SyntaxError: Unexpected token|ReferenceError|Traceback \(most recent call last\)|\b49\b.{0,10}(result|output|eval)|<!DOCTYPE[^>]*ENTITY'
     results=""; np=0
     while IFS= read -r pline; do
       # TOOL action: the agent runs a real tool itself (capped, scope-locked, whitelisted).
@@ -186,24 +196,28 @@ $situation"; printf '\n=== end head ===\n'; } >> "$agent_log" 2>/dev/null
       fi
       # POST probe: the agent tests a BODY-based bug itself (login/register logic, body
       # IDOR/SQLi, mass assignment). Scope-locked, capped, destructive bodies refused.
-      if [ "$AGENT_POST" = 1 ] && printf '%s' "$pline" | grep -qiE '(^|[^a-z])POST[: ]+https?://'; then
+      if [ "$AGENT_POST" = 1 ] && printf '%s' "$pline" | grep -qiE '(^|[^a-z])(POST|PUT|PATCH)[: ]+https?://'; then
         [ "$np" -ge "$AGENT_MAX_PROBES" ] && continue
         [ "$agent_post_n" -ge "$AGENT_MAX_POST" ] && continue
-        purl="$(printf '%s' "$pline" | sed -E 's/.*POST[: ]+//I' | awk -F'|' '{print $1}' | grep -oiE 'https?://[^ "'"'"'`<>]+' | head -1)"
+        pmethod="$(printf '%s' "$pline" | grep -oiE '(POST|PUT|PATCH)[: ]+https?://' | head -1 | grep -oiE '^(POST|PUT|PATCH)' | tr 'a-z' 'A-Z')"
+        purl="$(printf '%s' "$pline" | sed -E 's/.*(POST|PUT|PATCH)[: ]+//I' | awk -F'|' '{print $1}' | grep -oiE 'https?://[^ "'"'"'`<>]+' | head -1)"
         pbody="$(printf '%s' "$pline" | awk -F'|' 'NF>=2{print $2}' | sed 's/^ *//;s/ *$//')"
-        pwhy="$(printf '%s'  "$pline" | awk -F'|' 'NF>=3{print $3}' | sed 's/^ *//;s/ *$//')"; [ -n "$pwhy" ] || pwhy="agent POST probe"
+        pwhy="$(printf '%s'  "$pline" | awk -F'|' 'NF>=3{print $3}' | sed 's/^ *//;s/ *$//')"; [ -n "$pwhy" ] || pwhy="agent $pmethod probe"
         prx="$(printf '%s'   "$pline" | awk -F'|' 'NF>=4{print $4}' | sed 's/^ *//;s/ *$//')"; [ -n "$prx" ] || prx="$agent_default_rx"
         [ -n "$purl" ] || continue
         printf '%s' "$purl" | grep -qiE "^https?://([a-z0-9._-]+\.)?${esc_domain}([:/]|$)" || continue   # scope lock
-        # refuse clearly destructive bodies (quote probes / OR 1=1 / mass-assignment are allowed)
+        # refuse clearly destructive bodies (quote probes / OR 1=1 / mass-assignment / NoSQL ops ok)
         if printf '%s' "$pbody" | grep -qiE 'drop[[:space:]]+table|truncate[[:space:]]+table|delete[[:space:]]+from|shutdown|xp_cmdshell|sp_configure|;[[:space:]]*drop|rm[[:space:]]+-rf|format[[:space:]]+c:'; then
-          printf '[r%s] POST refused (destructive body): %s\n' "$round" "$purl" >> "$agent_log"; continue
+          printf '[r%s] %s refused (destructive body): %s\n' "$round" "$pmethod" "$purl" >> "$agent_log"; continue
         fi
-        grep -qxF "POST $purl $pbody" "$agent_seen" 2>/dev/null && continue
-        printf 'POST %s %s\n' "$purl" "$pbody" >> "$agent_seen"; np=$((np+1)); agent_post_n=$((agent_post_n+1))
-        set_stage $S_AGENT running "round $round: POST probe ($agent_post_n/$AGENT_MAX_POST)"; render
-        pct="application/x-www-form-urlencoded"; case "$pbody" in \{*|\[*) pct="application/json" ;; esac
-        presp="$(_cap curl -s -i -L -X POST --max-time 15 ${CURL_NET[@]+"${CURL_NET[@]}"} ${agent_captured_auth:+-H "$agent_captured_auth"} -H "Content-Type: $pct" --data "$pbody" "$purl" 2>/dev/null | head -c 65536)"
+        grep -qxF "$pmethod $purl $pbody" "$agent_seen" 2>/dev/null && continue
+        printf '%s %s %s\n' "$pmethod" "$purl" "$pbody" >> "$agent_seen"; np=$((np+1)); agent_post_n=$((agent_post_n+1))
+        set_stage $S_AGENT running "round $round: $pmethod probe ($agent_post_n/$AGENT_MAX_POST)"; render
+        # content-type by body shape: JSON for {/[ (incl. NoSQL operators like {"$gt":""}), XML for
+        # <?xml/< (so XXE/SOAP payloads reach the XML parser), else form-urlencoded.
+        pct="application/x-www-form-urlencoded"
+        case "$pbody" in \{*|\[*) pct="application/json" ;; \<*) pct="application/xml" ;; esac
+        presp="$(_cap curl -s -i -L -X "$pmethod" --max-time 15 ${CURL_NET[@]+"${CURL_NET[@]}"} ${agent_captured_auth:+-H "$agent_captured_auth"} -H "Content-Type: $pct" --data "$pbody" "$purl" 2>/dev/null | head -c 65536)"
         agent_capture_secret "$purl" "$presp"
         phit=""; printf '%s' "$presp" | grep -qiE -- "$prx" 2>/dev/null && phit="HIT"
         pstatus="$(_http_status "$presp")"; pcode="$(_status_code "$pstatus")"
@@ -211,16 +225,16 @@ $situation"; printf '\n=== end head ===\n'; } >> "$agent_log" 2>/dev/null
         pbody_raw="$(_http_body "$presp")"; pkeyh="$(_http_keyhdrs "$presp")"
         pbody_red="$(printf '%s' "$pbody_raw" | sed -E 's/((pass(word|wd)?|connection[-_ ]?string|accountkey|secret|api[-_]?key|token)[^[:cntrl:]]{0,8}[:=])[^[:cntrl:]"'"'"']{1,}/\1<redacted>/Ig')"
         psnip="$(_body_snip "$pbody_red")"
-        printf '[r%s] POST %-4s %s (body: %.60s)\n   why: %s\n   resp: %s | %s | %s\n' "$round" "${phit:-...}" "$purl" "$pbody" "$pwhy" "$pstatus" "$pkeyh" "$psnip" >> "$agent_log"
-        results="$results"$'\n'"POST $purl => ${phit:-no-match} [$pstatus] ${pkeyh} ${psnip}"
+        printf '[r%s] %s %-4s %s (body: %.60s)\n   why: %s\n   resp: %s | %s | %s\n' "$round" "$pmethod" "${phit:-...}" "$purl" "$pbody" "$pwhy" "$pstatus" "$pkeyh" "$psnip" >> "$agent_log"
+        results="$results"$'\n'"$pmethod $purl => ${phit:-no-match} [$pstatus] ${pkeyh} ${psnip}"
         # Record CONFIRMED once per (method,url); never on a 4xx; and not when the match is only the
         # SPA catch-all HTML shell (auth-bypass/mass-assignment artifacts are JSON/headers, not index.html).
         if [ "$phit" = HIT ]; then
           _pshell=0; printf '%s' "$pbody_raw" | head -c 80 | grep -qiE '^[[:space:]]*<(!doctype|html)' \
             && ! printf '%s' "$prx" | grep -qiE 'html|doctype|<' && _pshell=1
           case "$pcode" in 4[0-9][0-9]) : ;; *) [ "$_pshell" = 1 ] || grep -qxF "$purl" "$OUTDIR/.agent_loot_urls" 2>/dev/null \
-              || grep -qF "[CONFIRMED] POST $purl " "$agent_file" 2>/dev/null \
-              || printf '[CONFIRMED] POST %s (body: %s) | %s\n' "$purl" "$pbody" "$pwhy" >> "$agent_file" ;; esac
+              || grep -qF "[CONFIRMED] $pmethod $purl " "$agent_file" 2>/dev/null \
+              || printf '[CONFIRMED] %s %s (body: %s) | %s\n' "$pmethod" "$purl" "$pbody" "$pwhy" >> "$agent_file" ;; esac
         fi
         continue
       fi
