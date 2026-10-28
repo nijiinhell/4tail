@@ -49,8 +49,9 @@ $(head -c 2000 "${verified_file:-/dev/null}" 2>/dev/null)" >"$poc_out" 2>>"$llm_
       # the user overrides it with their real cookie/token when testing authed endpoints.
       echo ': "${SESSION:=Cookie: 4tail=none}"'
       echo
-      # strip code fences AND any shebang the model emitted inside the body (we add our own above)
-      sed -E '/^```/d; /^#!\/.*(bash|sh)[[:space:]]*$/d' "$poc_out"
+      # strip code fences, any shebang the model emitted, AND any SESSION=/TARGET= reassignment
+      # (the model likes to emit SESSION="PASTE_...HERE", which would clobber the user's real value)
+      sed -E '/^```/d; /^#!\/.*(bash|sh)[[:space:]]*$/d; /^[[:space:]]*(export[[:space:]]+)?(SESSION|TARGET|BASE)=/d' "$poc_out"
     } > "$poc_file"
     chmod +x "$poc_file" 2>/dev/null || true
   fi

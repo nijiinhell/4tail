@@ -154,9 +154,26 @@ resolve_blueprint() {
     return
   fi
   local chosen="" n pick out
+  # SPA detection from the ROOT HTML markup (httpx -td often can't fingerprint a JS framework, and
+  # js_endpoints doesn't exist yet at this stage): an <app-root>/ng-version/__NEXT_DATA__/react root
+  # means it's a single-page app -> pick spa NOW, before p_fuzz blasts 90k requests under the
+  # webapp_bounty default. Cheap: one GET of the seed/first host.
+  if [ -z "$chosen" ] && _bp_av spa; then
+    local _root _rhtml
+    _root="${SEED_URL:-$(ranked_hosts 1 2>/dev/null | head -1)}"
+    [ -n "$_root" ] || _root="$(head -1 "${alive_file:-/dev/null}" 2>/dev/null)"
+    if [ -n "$_root" ]; then
+      _rhtml="$(curl -s -L --max-time 10 ${CURL_NET[@]+"${CURL_NET[@]}"} "$_root" 2>/dev/null | head -c 60000)"
+      if printf '%s' "$_rhtml" | grep -qiE '<app-root|ng-version=|__NEXT_DATA__|data-reactroot|id="root"[^>]*></div>|id="app"[^>]*></div>|<div id="root">|<div id="app">'; then
+        chosen=spa
+        [ "$ASSUME_YES" = 1 ] || log "Blueprint: spa (SPA markup detected in root HTML)"
+      fi
+    fi
+  fi
   # PRIMARY = the dominant stack only (a lone outlier host must not force its profile on the
   # whole scope). Priority order applies when more than one stack clears the threshold.
-  if   _bp_av wordpress         && _stack_dominant 'wordpress|wp-content|wp-includes|wp-json'; then chosen=wordpress
+  if [ -n "$chosen" ]; then :
+  elif _bp_av wordpress         && _stack_dominant 'wordpress|wp-content|wp-includes|wp-json'; then chosen=wordpress
   elif _bp_av graphql           && _stack_dominant 'graphql|graphiql|apollo'; then chosen=graphql
   elif _bp_av spa               && _stack_dominant 'angular|react|vue\.?js|next\.?js|nuxt|svelte|ember|backbone|single[ -]?page'; then chosen=spa
   elif _bp_av cloud_devops      && _stack_dominant 'kubernetes|kubelet|docker|jenkins|gitlab|grafana|kibana|prometheus|consul|vault|argocd|rancher|harbor|spring ?boot'; then chosen=cloud_devops

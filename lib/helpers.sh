@@ -441,6 +441,7 @@ probe_mined_endpoints() {
   local infile="$OUTDIR/.mined_in.txt"
   { [ -s "${js_endpoints_file:-/dev/null}" ] && cat "$js_endpoints_file"
     [ -s "${smap_endpoints_file:-/dev/null}" ] && cat "$smap_endpoints_file"
+    [ -s "${targets_active_file:-/dev/null}" ] && cat "$targets_active_file"
   } 2>/dev/null \
     | grep -iE "^https?://([a-z0-9._-]+\.)?${esc_domain}([:/]|$)" \
     | grep -ivE '\.(png|jpe?g|gif|svg|woff2?|ttf|eot|css|ico|map|js)([?#]|$)' \

@@ -36,6 +36,7 @@ else
         esac; done
   done >> "$js_urls_file"
   sort -u -o "$js_urls_file" "$js_urls_file"
+  printf '[js] after scrape/subjs/getJS: %s urls (from %s hosts)\n' "$(nlines "$js_urls_file")" "$(printf '%s\n' "$scan_targets" | grep -c .)" >> "$llm_log" 2>/dev/null || true
   # SPA fallback: if scraping + subjs/getJS came up nearly empty (some SPAs inject their
   # scripts dynamically, so there's nothing to scrape), probe common entry-bundle names on
   # each host root directly and keep the ones that are actually served as JS. This is what
@@ -56,10 +57,16 @@ else
   # (google-analytics, gtag, cloudflare, jquery cdn...) carry public keys and produce
   # false positives that aren't the target's to fix. Override with JS_FIRST_PARTY=0.
   if [ "${JS_FIRST_PARTY:-1}" = 1 ] && [ -s "$js_urls_file" ]; then
+    _pre="$(nlines "$js_urls_file")"
     grep -iE "^https?://([a-z0-9._-]+\.)?${esc_domain}([:/]|$)" "$js_urls_file" > "$js_urls_file.fp" 2>/dev/null || true
-    mv "$js_urls_file.fp" "$js_urls_file"
+    # Safety: if the first-party filter wiped EVERYTHING (e.g. esc_domain mismatch on an IP/port
+    # target), keep the pre-filter list rather than mining 0 JS.
+    if [ -s "$js_urls_file.fp" ]; then mv "$js_urls_file.fp" "$js_urls_file"
+    else rm -f "$js_urls_file.fp"; printf '[js] WARN first-party filter matched 0/%s urls (esc_domain=%s) - keeping all\n' "$_pre" "$esc_domain" >> "$llm_log" 2>/dev/null || true; fi
   fi
   js_total="$(nlines "$js_urls_file")"
+  printf '[js] final js_urls: %s\n' "$js_total" >> "$llm_log" 2>/dev/null || true
+  [ "$js_total" = 0 ] && printf '[js] WARN 0 JS collected - target may be unreachable/slow, or served no <script src> and no common bundle responded as JS\n' >> "$llm_log" 2>/dev/null || true
   # 2) fetch each JS and scan for secrets. If trufflehog is present, save the JS and let it
   #    do entropy + verification (far fewer false positives than regex); else regex fallback.
   : > "$js_secrets_file"; : > "$js_endpoints_file"; : > "${spa_routes_file:-/dev/null}"; : > "${dom_xss_file:-/dev/null}"; ji=0

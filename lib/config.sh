@@ -201,6 +201,7 @@ NUCLEI_TIMEOUT="${NUCLEI_TIMEOUT:-8}"    # per-request timeout (s) - stops hangi
 NUCLEI_RETRIES="${NUCLEI_RETRIES:-1}"
 NUCLEI_MHE="${NUCLEI_MHE:-15}"           # skip a host after this many errors (kills dead-host error spam)
 NUCLEI_MAX_TIME="${NUCLEI_MAX_TIME:-3600}"  # hard cap on the whole nuclei stage (s); 0 = unlimited
+DAST_MAX_TIME="${DAST_MAX_TIME:-300}"       # dedicated cap for the nuclei -dast fuzzing pass (s) - must NOT inherit the 1h nuclei cap
 NUCLEI_CONC="${NUCLEI_CONC:-40}"         # template concurrency (-c); higher = faster, more load/errors
 NUCLEI_BULK="${NUCLEI_BULK:-25}"         # hosts scanned in parallel per template (-bulk-size)
 NUCLEI_DEDUPE="${NUCLEI_DEDUPE:-1}"      # 1 = scan one representative per origin+response signature

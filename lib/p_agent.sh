@@ -49,8 +49,9 @@ else
   # pivot into authenticated BOLA/IDOR/priv-esc on its own. Reads the UNREDACTED response.
   agent_autoauth=0; { [ -z "${AUTH_HEADER:-}" ] && [ -z "${AUTH_COOKIE:-}" ] && [ -z "${AUTH_A:-}" ]; } && agent_autoauth=1
   agent_captured_auth=""
-  agent_try_capture_auth() {  # $1 = raw (unredacted) response
+  agent_try_capture_auth() {  # $1 = raw (unredacted) response, $2 = source url
     [ "$agent_autoauth" = 1 ] && [ -z "$agent_captured_auth" ] || return 0
+    local _src="${2:-}"
     local tok ck
     tok="$(printf '%s' "$1" | grep -aoiE '"(access[_-]?token|id[_-]?token|jwt|token)"[[:space:]]*:[[:space:]]*"[A-Za-z0-9._-]{20,}"' | head -1 | grep -aoE '[A-Za-z0-9._-]{20,}' | head -1)"
     if [ -n "$tok" ]; then
@@ -65,7 +66,7 @@ else
       printf '[auth-captured] bearer token acquired (role=%s, id=%s) - applied to subsequent probes\n' "$_role" "$_uid" >> "$agent_log"
       if [ -n "$_claims" ] && [ "$AGENT_LOOT" = 1 ]; then
         mkdir -p "$agent_loot_dir"; printf '# JWT from %s\n%s\n' "$1" "$_pj" > "$agent_loot_dir/jwt_claims.txt" 2>/dev/null
-        printf '[JWT-CLAIMS-EXPOSURE] token payload carries sensitive claims: %s (saved to agent_loot/jwt_claims.txt)\n' "$_claims" >> "$agent_file"
+        printf '[CONFIRMED] [JWT-CLAIMS-EXPOSURE] %s | token payload carries sensitive claims: %s (saved to agent_loot/jwt_claims.txt)\n' "${_src:-$domain}" "$_claims" >> "$agent_file"
       fi
       results="$results"$'\n'"[auth-captured role=$_role id=$_uid] bearer token applied to all further probes - re-test the 401/403 endpoints and id-walk resource paths (role=$_role means $([ "$_role" = "?" ] && echo 'unknown privilege' || echo "privilege=$_role"))"
       agent_jwt_altcheck "$tok"   # one-shot alg:none forgery + RS256 key-confusion check
@@ -252,15 +253,25 @@ $situation"; printf '\n=== end head ===\n'; } >> "$agent_log" 2>/dev/null
         agent_capture_secret "$purl" "$presp"
         phit=""; printf '%s' "$presp" | grep -qiE -- "$prx" 2>/dev/null && phit="HIT"
         pstatus="$(_http_status "$presp")"; pcode="$(_status_code "$pstatus")"
-        case "$pcode" in 200|201) agent_try_capture_auth "$presp" ;; esac
+        case "$pcode" in 200|201) agent_try_capture_auth "$presp" "$purl" ;; esac
         pbody_raw="$(_http_body "$presp")"; pkeyh="$(_http_keyhdrs "$presp")"
         pbody_red="$(printf '%s' "$pbody_raw" | sed -E 's/((pass(word|wd)?|connection[-_ ]?string|accountkey|secret|api[-_]?key|token)[^[:cntrl:]]{0,8}[:=])[^[:cntrl:]"'"'"']{1,}/\1<redacted>/Ig')"
         psnip="$(_body_snip "$pbody_red")"
         printf '[r%s] %s %-4s %s (body: %.60s)\n   why: %s\n   resp: %s | %s | %s\n' "$round" "$pmethod" "${phit:-...}" "$purl" "$pbody" "$pwhy" "$pstatus" "$pkeyh" "$psnip" >> "$agent_log"
         results="$results"$'\n'"$pmethod $purl => ${phit:-no-match} [$pstatus] ${pkeyh} ${psnip}"
-        # Record CONFIRMED once per (method,url); never on a 4xx; and not when the match is only the
-        # SPA catch-all HTML shell (auth-bypass/mass-assignment artifacts are JSON/headers, not index.html).
-        if [ "$phit" = HIT ]; then
+        # Classify the write: a privilege body echoed back = mass-assignment (CONFIRM); a CLEAN
+        # registration (no privilege fields, no injection) = low-priv setup, NOT a finding.
+        _haspriv=0; printf '%s' "$pbody" | grep -qiE '"(role|isadmin|is_admin|admin|privilege|permissions|group)"' && _haspriv=1
+        _isreg=0;   printf '%s' "$purl"  | grep -qiE '/(users|register|signup|sign-up|account)(/|\?|$)' && _isreg=1
+        _hasinj=0;  printf '%s' "$pbody" | grep -qiE "'|\\\$ne|\\\$gt|\\\$where|union[[:space:]]+select|<!doctype" && _hasinj=1
+        if [ "$_haspriv" = 1 ] && printf '%s' "$pbody_raw" | grep -qiE '"role"[[:space:]]*:[[:space:]]*"admin"|"isadmin"[[:space:]]*:[[:space:]]*true|"admin"[[:space:]]*:[[:space:]]*true'; then
+          case "$pcode" in 200|201) grep -qF "[CONFIRMED] [MASS-ASSIGNMENT] $purl" "$agent_file" 2>/dev/null \
+              || printf '[CONFIRMED] [MASS-ASSIGNMENT] %s (body: %s) | privilege field accepted and echoed in the response\n' "$purl" "$pbody" >> "$agent_file" ;; esac
+        elif [ "$_isreg" = 1 ] && [ "$_haspriv" = 0 ] && [ "$_hasinj" = 0 ]; then
+          printf '[r%s] low-priv registration (test setup, not a finding): %s\n' "$round" "$purl" >> "$agent_log"
+        elif [ "$phit" = HIT ]; then
+          # Record CONFIRMED once per (method,url); never on a 4xx; and not when the match is only the
+          # SPA catch-all HTML shell (auth-bypass artifacts are JSON/headers, not index.html).
           _pshell=0; printf '%s' "$pbody_raw" | head -c 80 | grep -qiE '^[[:space:]]*<(!doctype|html)' \
             && ! printf '%s' "$prx" | grep -qiE 'html|doctype|<' && _pshell=1
           case "$pcode" in 4[0-9][0-9]) : ;; *) [ "$_pshell" = 1 ] || grep -qxF "$purl" "$OUTDIR/.agent_loot_urls" 2>/dev/null \
@@ -285,7 +296,7 @@ $situation"; printf '\n=== end head ===\n'; } >> "$agent_log" 2>/dev/null
       # (body is redacted below before it is shown to the LLM)
       hit=""; [ -n "$rx" ] && printf '%s' "$resp" | grep -qiE -- "$rx" 2>/dev/null && hit="HIT"
       local_status="$(_http_status "$resp")"; gcode="$(_status_code "$local_status")"
-      case "$gcode" in 200|201) agent_try_capture_auth "$resp" ;; esac
+      case "$gcode" in 200|201) agent_try_capture_auth "$resp" "$url" ;; esac
       gbody="$(_http_body "$resp")"; gkeyh="$(_http_keyhdrs "$resp")"
       gbody_red="$(printf '%s' "$gbody" | sed -E 's/((pass(word|wd)?|connection[-_ ]?string|accountkey|secret|api[-_]?key|token|aws[_-]?secret[_-]?access[_-]?key)[^[:cntrl:]]{0,8}[:=])[^[:cntrl:]"'"'"']{1,}/\1<redacted>/Ig')"
       snippet="$(_body_snip "$gbody_red")"

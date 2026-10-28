@@ -252,7 +252,7 @@ $(cat "$OUTDIR/.patterns_numbered.txt")" >"$jout" 2>>"$llm_log" || true
       if [ "$AI_ENABLED" = 1 ] && budget_ok; then
         aout="$(mktemp)"
         ai_call "$LLM_MODEL_PLAN" 2000 \
-          "You are an API security tester. Below is an API spec (OpenAPI/Swagger JSON/YAML, or a GraphQL/GraphiQL page) fetched from $spec. Build concrete HTTP GET test URLs (absolute, same origin) that exercise the riskiest endpoints for IDOR, broken authz, SQLi, SSRF and mass-assignment: substitute realistic probe values for path/query params (ids=1, user=1, q=test', url=http://169.254.169.254/, file=/etc/passwd as appropriate). Only GET-able URLs, one per line, no commentary, no markdown, max $API_MAX_TESTS lines." \
+          "You are an API security tester. Below is an API spec (OpenAPI/Swagger JSON/YAML, or a GraphQL/GraphiQL page) fetched from $spec. Build concrete HTTP GET test URLs (absolute, same origin) ONLY for operations the spec defines as HTTP GET - exercise IDOR/broken-authz/SQLi/SSRF: substitute realistic probe values for path/query params (ids=1, user=1, q=test', url=http://169.254.169.254/, file=/etc/passwd as appropriate). CRITICAL: do NOT invent GET ?query= URLs for POST/PUT/PATCH/DELETE-only paths (their body fields are tested separately) - skip those paths entirely. Only GET-able URLs, one per line, no commentary, no markdown, max $API_MAX_TESTS lines." \
           "$body" >"$aout" 2>>"$llm_log" || true
         grep -oE 'https?://[^ "'"'"'`<>]+' "$aout" 2>/dev/null \
           | grep -iE "^https?://([a-z0-9._-]+\.)?${esc_domain}([:/]|$)" \
@@ -420,7 +420,11 @@ $(cat "$OUTDIR/.patterns_numbered.txt")" >"$jout" 2>>"$llm_log" || true
           -timeout "$NUCLEI_TIMEOUT" -retries "$NUCLEI_RETRIES" -mhe "$NUCLEI_MHE" -o "$dast_file")
     [ -n "$ACT_DAST_TAGS" ] && dcmd+=(-tags "$ACT_DAST_TAGS")
     [ "${#NUCLEI_NET[@]}" -gt 0 ] && dcmd+=("${NUCLEI_NET[@]}")
-    [ "$NUCLEI_MAX_TIME" -gt 0 ] 2>/dev/null && have timeout && dcmd=(timeout "${NUCLEI_MAX_TIME}s" "${dcmd[@]}")
+    # DAST fuzzing gets its OWN short cap (not the 1h whole-nuclei cap): time-based templates on an
+    # SPA catch-all can otherwise burn 30-50 min. Use the smaller of DAST_MAX_TIME / NUCLEI_MAX_TIME.
+    _dast_cap="${DAST_MAX_TIME:-300}"
+    [ "$NUCLEI_MAX_TIME" -gt 0 ] 2>/dev/null && [ "$NUCLEI_MAX_TIME" -lt "$_dast_cap" ] && _dast_cap="$NUCLEI_MAX_TIME"
+    [ "$_dast_cap" -gt 0 ] 2>/dev/null && have timeout && dcmd=(timeout "${_dast_cap}s" "${dcmd[@]}")
     ( "${dcmd[@]}" >/dev/null 2>>"$llm_log" ) & SPIDS+=($!)
   fi
   # Blind SSRF / open-redirect confirmation via OAST: inject unique payloads into
