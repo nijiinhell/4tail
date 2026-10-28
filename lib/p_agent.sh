@@ -98,6 +98,8 @@ else
         awk -F'\t' '$1==401||$1==403{print $3}' "$fuzz_findings_file" | head -20; }
       [ -s "${forms_file:-/dev/null}" ] && { echo "HARVESTED FORMS (page<TAB>method<TAB>action<TAB>fields - use these REAL field names for POST probes: auth SQLi, mass assignment, CSRF):"; head -20 "$forms_file"; }
       [ -s "${js_fields_file:-/dev/null}" ] && { echo "MINED REQUEST FIELD NAMES (from JS bundles - the app's real body/param vocabulary; prefer these over guessing, and send {} to an unknown POST to learn the rest from its 400/422 error):"; paste -sd, "$js_fields_file" | head -c 1000; echo; }
+      [ -s "${spa_routes_file:-/dev/null}" ] && { echo "SPA CLIENT ROUTES (from the JS router - hidden/privileged views to GET; guards are client-side only, so the API behind them may be open):"; grep -iE '/(admin|account|internal|debug|config|audit|score|board|wallet|payment|deluxe|b2b|support|logs|sandbox|web3)' "$spa_routes_file" 2>/dev/null | head -15 || head -15 "$spa_routes_file"; }
+      [ -s "${dom_xss_file:-/dev/null}" ] && { echo "DOM-XSS SINKS (client-side; a URL/hash param flowing into one of these is DOM XSS):"; head -6 "$dom_xss_file"; }
       [ "$OAST" = 1 ] && [ -n "${OAST_DOMAIN:-}" ] && echo "OAST DOMAIN: you have an out-of-band collaborator. Put a unique subdomain like agent-r<round>.$OAST_DOMAIN into url/redirect/callback params or SSRF-able fields; a DNS/HTTP callback to it CONFIRMS blind SSRF/RCE."
     } | head -c 12000 )"
   astart=$SECONDS; round=0; results="(none yet - this is the first round)"
@@ -377,6 +379,12 @@ if [ "$VERIFY" = 1 ]; then set_stage $S_TRIAGE running "verifying findings"; ver
   fi
   if [ -s "${sourcemap_file:-/dev/null}" ]; then
     echo "## Recovered source maps (.js.map)"; echo; echo '```'; head -n 40 "$sourcemap_file"; echo '```'; echo
+  fi
+  if [ -s "${spa_routes_file:-/dev/null}" ]; then
+    echo "## SPA client routes (from JS router — client-side guards only)"; echo; echo '```'; head -n 60 "$spa_routes_file"; echo '```'; echo
+  fi
+  if [ -s "${dom_xss_file:-/dev/null}" ]; then
+    echo "## DOM-XSS sinks (client-side; review param/hash flow into these)"; echo; echo '```'; head -n 40 "$dom_xss_file"; echo '```'; echo
   fi
   if [ -s "${dns_hygiene_file:-/dev/null}" ]; then
     echo "## DNS hygiene (SPF/DMARC/zone-transfer)"; echo; echo '```'; cat "$dns_hygiene_file"; echo '```'; echo

@@ -270,6 +270,8 @@ if have jq; then
     [ -f "${unauth_api_file:-}" ] && while IFS= read -r l; do [ -n "$l" ] && emit_f unauth-api-exposure high api-probe "$(nurl "$l")" "$l"; done < "$unauth_api_file"
     [ -f "${openredir_file:-}" ]  && while IFS= read -r l; do [ -n "$l" ] && emit_f open-redirect medium redirect-probe "$(nurl "$l")" "$l"; done < "$openredir_file"
     [ -f "${jwt_file:-}" ]        && while IFS= read -r l; do [ -n "$l" ] && emit_f jwt-weakness medium jwt-analysis "" "$l"; done < "$jwt_file"
+    [ -f "${dom_xss_file:-}" ]    && while IFS=$'\t' read -r u m; do [ -n "$m" ] && emit_f dom-xss-sink medium js-mining "$u" "$m"; done < "$dom_xss_file"
+    [ -f "${spa_routes_file:-}" ] && grep -iE '/(admin|account|internal|debug|config|audit|score|board|wallet|payment|deluxe|b2b|support|logs|sandbox|web3)' "$spa_routes_file" 2>/dev/null | while IFS= read -r l; do emit_f spa-route info js-mining "$l" "client-side SPA route (often privileged/hidden): $l"; done
     [ -f "${api_specs_file:-}" ] && while IFS= read -r l; do [ -n "$l" ] && emit_f api-spec info api-discovery "$l" "exposed API spec: $l"; done < "$api_specs_file"
     [ -f "${gql_schema_file:-}" ] && grep '^== GraphQL introspection OPEN: ' "$gql_schema_file" 2>/dev/null \
       | sed 's/^== GraphQL introspection OPEN: //; s/ ==$//' \

@@ -6,7 +6,7 @@ params_file="$OUTDIR/params.txt"
 # The generic keyword branch REQUIRES a quote immediately before the value, so a minified
 # variable reference (password:t.applicationSecretKey, password:t.projectSecret) is NOT flagged
 # as a hardcoded secret - only a literal "secret":"<value>" / secret='<value>' / secret=`<value>` is.
-SECRET_RE='AKIA[0-9A-Z]{16}|AIza[0-9A-Za-z_-]{35}|xox[baprs]-[0-9A-Za-z-]{10,}|ghp_[0-9A-Za-z]{36}|eyJ[A-Za-z0-9_-]{10,}\.[A-Za-z0-9_-]{10,}\.[A-Za-z0-9_-]{10,}|-----BEGIN [A-Z ]*PRIVATE KEY-----|[a-z0-9.-]+\.s3\.amazonaws\.com|(api[_-]?key|secret|access[_-]?token|client[_-]?secret|aws_secret|password)["]?[[:space:]]*[:=][[:space:]]*["`][0-9A-Za-z._+/=-]{12,}'
+SECRET_RE='AKIA[0-9A-Z]{16}|AIza[0-9A-Za-z_-]{35}|xox[baprs]-[0-9A-Za-z-]{10,}|ghp_[0-9A-Za-z]{36}|eyJ[A-Za-z0-9_-]{10,}\.[A-Za-z0-9_-]{10,}\.[A-Za-z0-9_-]{10,}|-----BEGIN [A-Z ]*PRIVATE KEY-----|[a-z0-9.-]+\.s3\.amazonaws\.com|0x[a-fA-F0-9]{64}|["`]([a-z]{3,8} ){11,23}[a-z]{3,8}["`]|(api[_-]?key|secret|access[_-]?token|client[_-]?secret|aws_secret|password|passwd|pwd|mnemonic|seed[_-]?phrase|private[_-]?key)["]?[[:space:]]*[:=][[:space:]]*["`][0-9A-Za-z._+/=-]{8,}'
 
 if [ "$JSMINE" != 1 ]; then
   set_stage $S_JS skip "off (-j to enable)"
@@ -62,7 +62,7 @@ else
   js_total="$(nlines "$js_urls_file")"
   # 2) fetch each JS and scan for secrets. If trufflehog is present, save the JS and let it
   #    do entropy + verification (far fewer false positives than regex); else regex fallback.
-  : > "$js_secrets_file"; : > "$js_endpoints_file"; ji=0
+  : > "$js_secrets_file"; : > "$js_endpoints_file"; : > "${spa_routes_file:-/dev/null}"; : > "${dom_xss_file:-/dev/null}"; ji=0
   js_dir=""; [ "$TRUFFLEHOG_JS" = 1 ] && have trufflehog && { js_dir="$OUTDIR/jsfiles"; mkdir -p "$js_dir"; }
   while read -r j; do
     [ -z "$j" ] && continue
@@ -71,9 +71,12 @@ else
     jtmp="$(mktemp)"
     curl -s -L --max-time 15 ${CURL_NET[@]+"${CURL_NET[@]}"} "$j" 2>/dev/null > "$jtmp"
     [ -s "$jtmp" ] || { rm -f "$jtmp"; continue; }
-    # secrets: trufflehog on the saved file (verified) else inline regex
-    if [ -n "$js_dir" ]; then cp "$jtmp" "$js_dir/$(printf '%s' "$j" | tr -c 'A-Za-z0-9._-' '_' | tail -c 120).js"
-    else grep -aoE "$SECRET_RE" "$jtmp" 2>/dev/null | sort -u | sed "s#^#${j}\t#" >> "$js_secrets_file"; fi
+    # secrets: ALWAYS run the regex scan (catches hardcoded passwords/keys/mnemonics that
+    # trufflehog --only-verified discards), and ADDITIONALLY save the file for trufflehog's
+    # verified cloud-key check. (The old `if js_dir; then cp; else regex` skipped the regex
+    # whenever trufflehog was installed -> js-secrets:0 even with creds in the bundle.)
+    grep -aoE "$SECRET_RE" "$jtmp" 2>/dev/null | sort -u | sed "s#^#${j}\t#" >> "$js_secrets_file"
+    [ -n "$js_dir" ] && cp "$jtmp" "$js_dir/$(printf '%s' "$j" | tr -c 'A-Za-z0-9._-' '_' | tail -c 120).js"
     # endpoints: a SPA's API surface (/rest, /api, absolute URLs) lives in its JS bundles; mine
     # them so they feed the funnel even with no archive data and no source map. Origin = this JS's.
     jorigin="$(printf '%s' "$j" | sed -E 's#(https?://[^/]+).*#\1#')"
@@ -95,8 +98,22 @@ else
     # version banners for CVE mapping (httpx only sees response headers): "/*! lib vX.Y.Z */"
     grep -aoE '[A-Za-z][A-Za-z.@/_-]{2,40} v?[0-9]+\.[0-9]+\.[0-9]+' "$jtmp" 2>/dev/null \
       | grep -viE 'chunk|webpack|sourcemap|node_modules' | head -8 >> "${versions_file:-/dev/null}" 2>/dev/null || true
+    # SPA router paths: Angular/React/Vue declare routes as path:"administration" (NO leading slash),
+    # so the /-anchored endpoint patterns miss them. Mine them -> they are often privileged/hidden.
+    grep -aoE '\bpath[[:space:]]*:[[:space:]]*["'"'"'][a-zA-Z0-9_/:.-]{3,60}["'"'"']' "$jtmp" 2>/dev/null \
+      | sed -E 's/^path[[:space:]]*:[[:space:]]*["'"'"']\/?//; s/["'"'"']$//' | grep -E '[a-zA-Z]{3,}' \
+      | sed "s#^#${jorigin}/#" >> "${spa_routes_file:-/dev/null}" 2>/dev/null || true
+    # client-side DOM-XSS sinks (kxss/dalfox only see server responses; SPA DOM XSS lives in JS)
+    grep -aoE '.{0,30}(bypassSecurityTrust(Html|Script|ResourceUrl|Url)|dangerouslySetInnerHTML|v-html=|\.(inner|outer)HTML[[:space:]]*=|document\.write\(|insertAdjacentHTML\().{0,50}' "$jtmp" 2>/dev/null \
+      | head -4 | sed "s#^#${j}\t#" >> "${dom_xss_file:-/dev/null}" 2>/dev/null || true
     rm -f "$jtmp"
   done < "$js_urls_file"
+  # fold SPA routes into the endpoint pool (probed + fed to the funnel) and dedupe both artifacts
+  if [ -s "${spa_routes_file:-/dev/null}" ]; then
+    sort -u -o "$spa_routes_file" "$spa_routes_file"
+    cat "$spa_routes_file" >> "$js_endpoints_file"
+  fi
+  [ -s "${dom_xss_file:-/dev/null}" ] && sort -u -o "$dom_xss_file" "$dom_xss_file"
   # ng-version from the root HTML + a runtime version from /metrics (both exact, both missed by httpx)
   {
     ranked_hosts 3 | while IFS= read -r _h; do [ -n "$_h" ] && curl -s -L --max-time 10 ${CURL_NET[@]+"${CURL_NET[@]}"} "$_h" 2>/dev/null \
