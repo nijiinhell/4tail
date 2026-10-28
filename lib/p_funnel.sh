@@ -174,7 +174,7 @@ $(cat "$OUTDIR/.patterns_numbered.txt")" >"$jout" 2>>"$llm_log" || true
   if [ "$API_SPECS" = 1 ]; then
     set_stage $S_CRAWL running "probing for API specs (swagger/openapi/graphql)"
     # (a) specs already seen in collected URLs
-    grep -iE '(swagger|openapi|api-docs|v[0-9]+/api-docs|/graphql|/graphiql|apispec|/\.well-known/)' \
+    grep -iE '(swagger|openapi|api-docs|v[0-9]+/api-docs|/graphql|/graphiql|apispec|/\.well-known/(openid-configuration|oauth-authorization-server|openapi|swagger))' \
       "$urls_file" 2>/dev/null | grep -iE 'https?://' | sort -u >> "$api_specs_file" || true
     # (b) probe common spec paths on each live host (capped, auth-aware)
     api_probe_paths=(/swagger.json /swagger/v1/swagger.json /openapi.json /v2/api-docs /v3/api-docs \
@@ -364,6 +364,10 @@ $(cat "$OUTDIR/.patterns_numbered.txt")" >"$jout" 2>>"$llm_log" || true
   # Final clean of the set that feeds every slow specialist: drop static assets, then dedupe.
   drop_static < "$targets_active_file" 2>/dev/null | sort -u > "$targets_active_file.tmp" \
     && mv "$targets_active_file.tmp" "$targets_active_file"
+  # Probe the mined endpoints NOW (before gf + specialists): folds their real statuses into
+  # fuzz_findings AND purges SPA catch-all URLs (/b2b/v2/orders, /v1/userinfo) from targets_active
+  # so the specialists and gf don't waste their caps on index.html shells.
+  set_stage $S_CRAWL running "probing mined API endpoints"; probe_mined_endpoints; render
   active_total="$(nlines "$targets_active_file")"
 
   # (E) gf bucketing on the active set (candidate classes for routing)
@@ -431,11 +435,16 @@ $(cat "$OUTDIR/.patterns_numbered.txt")" >"$jout" 2>>"$llm_log" || true
     # gf's sqli list keys on id=/search=/query=/filter= but misses ?q= on REST/API search
     # endpoints (e.g. Juice Shop /rest/products/search?q=1). Supplement with any active API/
     # search URL that has a populated query param; dedup; cap at ACT_MAX_SQLMAP.
-    { grep -iE '^sqli\t' "$gf_file" 2>/dev/null | cut -f2
-      grep -aiE '[?&][a-z0-9_]+=[^&]' "$targets_active_file" 2>/dev/null | grep -iE '/rest/|/api/|search|query|filter'
+    # Prioritise REAL parameterised API/search URLs (…/search?q=1) over gf's generic matches, and
+    # fold in any URL nuclei-dast already flagged sqli on, so the tight cap isn't spent on a
+    # synthetic ?cid=1 before the genuine injection point is tested.
+    { [ -s "${dast_file:-/dev/null}" ] && grep -iaE 'sqli' "$dast_file" 2>/dev/null | grep -oE 'https?://[^ ]+'
+      grep -aiE '[?&][a-z0-9_]+=[^&]' "$targets_active_file" 2>/dev/null | grep -iE '/rest/|/api/|search|query|filter|[?&]q='
+      grep -iE '^sqli\t' "$gf_file" 2>/dev/null | cut -f2
     } | awk 'NF && !seen[$0]++' | head -n "$ACT_MAX_SQLMAP" > "$sq"
     if [ -s "$sq" ]; then
-      ( tmo "$SQLMAP_MAX_TIME" sqlmap -m "$sq" --batch --smart --level=1 --risk=1 --technique=BEU \
+      # no --smart (we feed only high-suspicion URLs) and --level=2 so parenthesis closures ') ')' are tried
+      ( tmo "$SQLMAP_MAX_TIME" sqlmap -m "$sq" --batch --level=2 --risk=2 --technique=BEU \
           --output-dir="$findings_dir/sqlmap" >/dev/null 2>>"$llm_log"
         grep -rhiE 'parameter .* is vulnerable|is injectable|Type: ' "$findings_dir/sqlmap" 2>/dev/null \
           | sort -u > "$findings_dir/sqlmap.txt" ) & SPIDS+=($!)
@@ -453,10 +462,8 @@ $(cat "$OUTDIR/.patterns_numbered.txt")" >"$jout" 2>>"$llm_log" || true
 
   # (G) Correlation / exploitation passes that connect findings into verdicts.
   : > "$bypass_file"; : > "$prop_file"; : > "$idor_file"; : > "$corsy_file"
-  # Status-probe the mined JS/source-map endpoints FIRST and fold them into fuzz_findings, so the
-  # 403-bypass / stack-trace / open-dir passes below (and the report table) see the REST surface,
-  # not just ffuf's root-path hits. Without this, 88 mined /api//rest/ endpoints went untested.
-  set_stage $S_CRAWL running "probing mined API endpoints"; probe_mined_endpoints; render
+  # (mined endpoints were already status-probed + catch-all-purged before the specialists above,
+  # so fuzz_findings holds the real REST surface here for the 403-bypass/stack-trace/open-dir passes)
   set_stage $S_CRAWL running "403 bypass · path propagation · authz diff · CORS"
   awk -F'\t' '$1==401||$1==403' "$fuzz_findings_file" 2>/dev/null \
     | grep -viE 'google\.com|%2e%2e|\\\.\\\.|etc.{0,3}passwd' \

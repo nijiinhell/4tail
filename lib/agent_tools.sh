@@ -39,7 +39,9 @@ agent_tool_run() {   # name  target  extra
           *) ;;  # ignore everything else: escalation (--level/--risk), shells, file R/W, tamper, technique (stays BEU)
         esac
       done
-      raw="$(_cap sqlmap -u "$tgt" --batch --smart --level=1 --risk=1 --technique=BEU --disable-coloring ${sqx[@]+"${sqx[@]}"} 2>/dev/null | tail -c 4000)"
+      # Agent calls sqlmap on ONE high-suspicion URL, so drop --smart and use --level=2 --risk=2
+      # (tests parenthesis closures like ') and ')) that --level=1 skips). Still capped and BEU-only.
+      raw="$(_cap sqlmap -u "$tgt" --batch --level=2 --risk=2 --technique=BEU --disable-coloring ${sqx[@]+"${sqx[@]}"} 2>/dev/null | tail -c 4000)"
       printf '%s' "$raw" | grep -qiE 'is vulnerable|is injectable|Parameter:.*|Type: ' && hit="CONFIRMED sqli"
       res="$(printf '%s' "$raw" | grep -iE 'vulnerable|injectable|Type:|back-end DBMS' | head -3 | tr '\n' ';')" ;;
     dalfox)

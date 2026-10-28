@@ -12,7 +12,7 @@ elif ! budget_ok; then
   set_stage $S_AGENT skip "budget reached ($(cost_fmt))"
 else
   set_stage $S_AGENT running "building situation"
-  agent_seen="$OUTDIR/.agent_seen"; : > "$agent_seen"
+  agent_seen="$OUTDIR/.agent_seen"; : > "$agent_seen"; : > "$OUTDIR/.agent_loot_urls"
   agent_loot_dir="$OUTDIR/agent_loot"; agent_post_n=0
   # Harvest real <form> fields NOW (before the probe loop) so the agent's POST probes use the
   # actual login/register field names instead of guessing. (PoC gen later reuses forms_file.)
@@ -26,7 +26,9 @@ else
     mkdir -p "$agent_loot_dir"
     local f="$agent_loot_dir/$(printf '%s' "$1" | tr -c 'A-Za-z0-9._-' '_' | tail -c 120).txt"
     { echo "# $1"; printf '%s\n' "$2"; } > "$f"
+    grep -qF "[SECRET-LOOT] $1 " "$agent_file" 2>/dev/null && return 0   # already looted this url
     printf '[SECRET-LOOT] %s | raw response with credentials saved -> %s\n' "$1" "$f" >> "$agent_file"
+    printf '%s\n' "$1" >> "$OUTDIR/.agent_loot_urls" 2>/dev/null || true   # so confirm doesn't double-log it
   }
   # curl -i responses carry the HTTP headers first; Juice Shop's headers alone are ~330 bytes, so
   # head -c 240 of the whole thing never reached the JSON body. These split headers from body
@@ -35,6 +37,13 @@ else
   _http_status() { printf '%s' "$1" | grep -aiE '^HTTP/' | tail -1 | tr -d '\r'; }
   _http_keyhdrs() { printf '%s' "$1" | grep -aiE '^(location|set-cookie|content-type):' | tr -d '\r' | tr '\n' ' ' | head -c 220; }
   _status_code() { printf '%s' "$1" | grep -aoE '[0-9]{3}' | head -1; }   # 3-digit code from a status line
+  # Body snippet for the LLM: small bodies in full; large ones as head + tail, so UNION-appended
+  # rows at the END of a JSON array (e.g. a dumped Users table after the products) are still seen.
+  _body_snip() {
+    local b="$1"
+    if [ "${#b}" -le 600 ]; then printf '%s' "$b" | tr '\n\r\t' '   ' | sed -E 's/  +/ /g' | head -c 520
+    else { printf '%s' "$b" | head -c 260; printf ' … [%sB body, tail:] ' "${#b}"; printf '%s' "$b" | tail -c 260; } | tr '\n\r\t' '   ' | sed -E 's/  +/ /g'; fi
+  }
   # Autonomous auth capture: when the user supplied NO session, a token/cookie the agent earns from
   # a 200/201 (register/login/leak) is captured ONCE and applied to every later probe, so it can
   # pivot into authenticated BOLA/IDOR/priv-esc on its own. Reads the UNREDACTED response.
@@ -46,14 +55,15 @@ else
     tok="$(printf '%s' "$1" | grep -aoiE '"(access[_-]?token|id[_-]?token|jwt|token)"[[:space:]]*:[[:space:]]*"[A-Za-z0-9._-]{20,}"' | head -1 | grep -aoE '[A-Za-z0-9._-]{20,}' | head -1)"
     if [ -n "$tok" ]; then
       agent_captured_auth="Authorization: Bearer $tok"
-      printf '[auth-captured] bearer token acquired - applied to subsequent probes\n' >> "$agent_file"
+      # log only (not agent_file) - this is a capability, not a vulnerability finding
+      printf '[auth-captured] bearer token acquired - applied to subsequent probes\n' >> "$agent_log"
       results="$results"$'\n'"[auth-captured] a bearer token was captured and is now applied to all further probes - re-test the 401/403 endpoints and id-walk resource paths"
       return 0
     fi
     ck="$(printf '%s' "$1" | grep -aoiE '^set-cookie:[[:space:]]*[^;[:space:]]+' | head -1 | sed -E 's/^set-cookie:[[:space:]]*//I')"
     if [ -n "$ck" ]; then
       agent_captured_auth="Cookie: $ck"
-      printf '[auth-captured] session cookie acquired - applied to subsequent probes\n' >> "$agent_file"
+      printf '[auth-captured] session cookie acquired - applied to subsequent probes\n' >> "$agent_log"
       results="$results"$'\n'"[auth-captured] a session cookie was captured and is now applied to all further probes - re-test the 401/403 endpoints and id-walk resource paths"
     fi
   }
@@ -191,14 +201,14 @@ $situation"; printf '\n=== end head ===\n'; } >> "$agent_log" 2>/dev/null
         printf 'POST %s %s\n' "$purl" "$pbody" >> "$agent_seen"; np=$((np+1)); agent_post_n=$((agent_post_n+1))
         set_stage $S_AGENT running "round $round: POST probe ($agent_post_n/$AGENT_MAX_POST)"; render
         pct="application/x-www-form-urlencoded"; case "$pbody" in \{*|\[*) pct="application/json" ;; esac
-        presp="$(_cap curl -s -i -L -X POST --max-time 15 ${CURL_NET[@]+"${CURL_NET[@]}"} ${agent_captured_auth:+-H "$agent_captured_auth"} -H "Content-Type: $pct" --data "$pbody" "$purl" 2>/dev/null | head -c 6000)"
+        presp="$(_cap curl -s -i -L -X POST --max-time 15 ${CURL_NET[@]+"${CURL_NET[@]}"} ${agent_captured_auth:+-H "$agent_captured_auth"} -H "Content-Type: $pct" --data "$pbody" "$purl" 2>/dev/null | head -c 65536)"
         agent_capture_secret "$purl" "$presp"
         phit=""; printf '%s' "$presp" | grep -qiE -- "$prx" 2>/dev/null && phit="HIT"
         pstatus="$(_http_status "$presp")"; pcode="$(_status_code "$pstatus")"
         case "$pcode" in 200|201) agent_try_capture_auth "$presp" ;; esac
         pbody_raw="$(_http_body "$presp")"; pkeyh="$(_http_keyhdrs "$presp")"
         pbody_red="$(printf '%s' "$pbody_raw" | sed -E 's/((pass(word|wd)?|connection[-_ ]?string|accountkey|secret|api[-_]?key|token)[^[:cntrl:]]{0,8}[:=])[^[:cntrl:]"'"'"']{1,}/\1<redacted>/Ig')"
-        psnip="$(printf '%s' "$pbody_red" | tr '\n\r\t' '   ' | sed -E 's/  +/ /g' | head -c 400)"
+        psnip="$(_body_snip "$pbody_red")"
         printf '[r%s] POST %-4s %s (body: %.60s)\n   why: %s\n   resp: %s | %s | %s\n' "$round" "${phit:-...}" "$purl" "$pbody" "$pwhy" "$pstatus" "$pkeyh" "$psnip" >> "$agent_log"
         results="$results"$'\n'"POST $purl => ${phit:-no-match} [$pstatus] ${pkeyh} ${psnip}"
         # Record CONFIRMED once per (method,url); never on a 4xx; and not when the match is only the
@@ -206,7 +216,8 @@ $situation"; printf '\n=== end head ===\n'; } >> "$agent_log" 2>/dev/null
         if [ "$phit" = HIT ]; then
           _pshell=0; printf '%s' "$pbody_raw" | head -c 80 | grep -qiE '^[[:space:]]*<(!doctype|html)' \
             && ! printf '%s' "$prx" | grep -qiE 'html|doctype|<' && _pshell=1
-          case "$pcode" in 4[0-9][0-9]) : ;; *) [ "$_pshell" = 1 ] || grep -qF "[CONFIRMED] POST $purl " "$agent_file" 2>/dev/null \
+          case "$pcode" in 4[0-9][0-9]) : ;; *) [ "$_pshell" = 1 ] || grep -qxF "$purl" "$OUTDIR/.agent_loot_urls" 2>/dev/null \
+              || grep -qF "[CONFIRMED] POST $purl " "$agent_file" 2>/dev/null \
               || printf '[CONFIRMED] POST %s (body: %s) | %s\n' "$purl" "$pbody" "$pwhy" >> "$agent_file" ;; esac
         fi
         continue
@@ -222,7 +233,7 @@ $situation"; printf '\n=== end head ===\n'; } >> "$agent_log" 2>/dev/null
       grep -qxF "$url" "$agent_seen" 2>/dev/null && continue
       printf '%s\n' "$url" >> "$agent_seen"; np=$((np+1))
       set_stage $S_AGENT running "round $round: probing ($(nlines "$agent_seen") sent)"; render
-      resp="$(curl -s -i -L --max-time 12 ${CURL_NET[@]+"${CURL_NET[@]}"} ${agent_captured_auth:+-H "$agent_captured_auth"} "$url" 2>/dev/null | head -c 6000)"
+      resp="$(curl -s -i -L --max-time 12 ${CURL_NET[@]+"${CURL_NET[@]}"} ${agent_captured_auth:+-H "$agent_captured_auth"} "$url" 2>/dev/null | head -c 65536)"
       agent_capture_secret "$url" "$resp"   # save raw creds locally (not to the LLM) if present
       # (body is redacted below before it is shown to the LLM)
       hit=""; [ -n "$rx" ] && printf '%s' "$resp" | grep -qiE -- "$rx" 2>/dev/null && hit="HIT"
@@ -230,7 +241,7 @@ $situation"; printf '\n=== end head ===\n'; } >> "$agent_log" 2>/dev/null
       case "$gcode" in 200|201) agent_try_capture_auth "$resp" ;; esac
       gbody="$(_http_body "$resp")"; gkeyh="$(_http_keyhdrs "$resp")"
       gbody_red="$(printf '%s' "$gbody" | sed -E 's/((pass(word|wd)?|connection[-_ ]?string|accountkey|secret|api[-_]?key|token|aws[_-]?secret[_-]?access[_-]?key)[^[:cntrl:]]{0,8}[:=])[^[:cntrl:]"'"'"']{1,}/\1<redacted>/Ig')"
-      snippet="$(printf '%s' "$gbody_red" | tr '\n\r\t' '   ' | sed -E 's/  +/ /g' | head -c 400)"
+      snippet="$(_body_snip "$gbody_red")"
       printf '[r%s] %-4s %s\n   why: %s\n   resp: %s | %s | %s\n' "$round" "${hit:-...}" "$url" "$why" "$local_status" "$gkeyh" "$snippet" >> "$agent_log"
       results="$results"$'\n'"$url => ${hit:-no-match} [$local_status] ${gkeyh} ${snippet}"
       # CONFIRM only once per url; never on a 4xx rejection; and not when the regex only matched the
@@ -240,7 +251,8 @@ $situation"; printf '\n=== end head ===\n'; } >> "$agent_log" 2>/dev/null
           && ! printf '%s' "$rx" | grep -qiE 'html|doctype|<' && _shell=1
         case "$gcode" in
           4[0-9][0-9]) : ;;
-          *) [ "$_shell" = 1 ] || grep -qF "[CONFIRMED] $url |" "$agent_file" 2>/dev/null \
+          *) [ "$_shell" = 1 ] || grep -qxF "$url" "$OUTDIR/.agent_loot_urls" 2>/dev/null \
+               || grep -qF "[CONFIRMED] $url |" "$agent_file" 2>/dev/null \
                || printf '[CONFIRMED] %s | %s\n' "$url" "$why" >> "$agent_file" ;;
         esac
       fi

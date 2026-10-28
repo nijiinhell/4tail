@@ -79,7 +79,8 @@ fuzz_distinct() { [ -f "$1" ] && awk -F'\t' 'NF>=2 && !s[$1"-"$2]++{c++} END{pri
 agent_sev() {
   local l; l="$(printf '%s' "$1" | tr 'A-Z' 'a-z')"
   case "$l" in
-    *web.config*|*global.asa*|*machinekey*|*connectionstring*|*/.git*|*id_rsa*|*.env*|*win.ini*|*/etc/passwd*|*boot.ini*|*.sql*|*wp-config*|*application.properties*|*.pem*) printf 'high' ;;
+    *secret-loot*|*union*select*|*sqli*|*sql*injection*|*auth*bypass*|*rce*|*machinekey*|*connectionstring*|*id_rsa*|*.pem*|*private?key*) printf 'critical' ;;
+    *bola*|*idor*|*mass*assign*|*privilege*|*priv*esc*|*pii*|*/admin*|*web.config*|*global.asa*|*/.git*|*.env*|*win.ini*|*/etc/passwd*|*wp-config*|*application.properties*) printf 'high' ;;
     *robots.txt*|*sitemap*|*about.htm*|*favicon*|*.css*|*.png*|*.jpg*|*.svg*|*humans.txt*) printf 'low' ;;
     *) printf 'medium' ;;
   esac
@@ -278,8 +279,8 @@ verify_findings() {
     [ -f "${unauth_api_file:-}" ] && grep -oiE 'https?://[^ |]+' "$unauth_api_file"
   } 2>/dev/null | sort -u | head -n 60 | while IFS= read -r u; do
     [ -n "$u" ] || continue
-    r1="$(curl -s -o /dev/null -w '%{http_code} %{size_download}' -L --max-time 12 ${CURL_NET[@]+"${CURL_NET[@]}"} "$u" 2>/dev/null || echo '000 0')"
-    r2="$(curl -s -o /dev/null -w '%{http_code} %{size_download}' -L --max-time 12 ${CURL_NET[@]+"${CURL_NET[@]}"} "$u" 2>/dev/null || echo '000 0')"
+    r1="$(curl -s -o /dev/null -w '%{http_code} %{size_download}' -L --max-time 12 ${CURL_NET[@]+"${CURL_NET[@]}"} ${agent_captured_auth:+-H "$agent_captured_auth"} "$u" 2>/dev/null || echo '000 0')"
+    r2="$(curl -s -o /dev/null -w '%{http_code} %{size_download}' -L --max-time 12 ${CURL_NET[@]+"${CURL_NET[@]}"} ${agent_captured_auth:+-H "$agent_captured_auth"} "$u" 2>/dev/null || echo '000 0')"
     s1="${r1%% *}"; z1="${r1##* }"; s2="${r2%% *}"; z2="${r2##* }"
     # A client-error rejection (400/403/404/405/406/410/...) is NOT a finding, even when its body
     # echoes our input and so differs from the SPA catch-all. Only verify success/redirect codes.
@@ -288,7 +289,7 @@ verify_findings() {
     # a path segment before the query -> /page.php/ctl?id=1 still executes page.php via PathInfo
     # on PHP/IIS and returned the real page, falsely nuking valid findings.)
     cu="$(printf '%s' "$u" | sed -E 's#^(https?://[^/]+/([^?]*/)?)[^/?]*(\?.*)?$#\14tctl'"${RANDOM}"'\3#')"
-    rc="$(curl -s -o /dev/null -w '%{http_code} %{size_download}' -L --max-time 12 ${CURL_NET[@]+"${CURL_NET[@]}"} "$cu" 2>/dev/null || echo '000 0')"
+    rc="$(curl -s -o /dev/null -w '%{http_code} %{size_download}' -L --max-time 12 ${CURL_NET[@]+"${CURL_NET[@]}"} ${agent_captured_auth:+-H "$agent_captured_auth"} "$cu" 2>/dev/null || echo '000 0')"
     sc="${rc%% *}"; zc="${rc##* }"
     if [ "$s1" = "$s2" ] && _near "$z1" "$z2" && [ "$s1" != 000 ] && { [ "$s1" != "$sc" ] || ! _near "$z1" "$zc"; }; then
       printf 'VERIFIED %s [%s, %sB] (bogus control -> %s/%sB, differs)\n' "$u" "$s1" "$z1" "$sc" "$zc" >> "$verified_file"
@@ -421,14 +422,26 @@ probe_mined_endpoints() {
   corigin="$(head -1 "$infile" | sed -E 's#(https?://[^/]+).*#\1#')"
   cfp="$(curl -s -o /dev/null -w '%{http_code} %{size_download}' -L --max-time 10 ${CURL_NET[@]+"${CURL_NET[@]}"} "$corigin/4tail_spa_${RANDOM}${RANDOM}" 2>/dev/null || echo '')"
   cs="${cfp%% *}"; cl="${cfp##* }"; case "$cs" in ''|*[!0-9]*) cs=""; esac
+  local catch="$OUTDIR/.spa_catchall_urls.txt"; : > "$catch"
   httpx -silent -status-code -content-length -l "$infile" ${HTTPX_NET[@]+"${HTTPX_NET[@]}"} 2>/dev/null \
     | sed -E 's/\x1b\[[0-9;]*m//g' \
-    | awk -v cs="$cs" -v cl="$cl" '{ u=$1; sc=$2; c=$3; gsub(/[][]/,"",sc); gsub(/[][]/,"",c);
+    | awk -v cs="$cs" -v cl="$cl" -v catch="$catch" '{ u=$1; sc=$2; c=$3; gsub(/[][]/,"",sc); gsub(/[][]/,"",c);
              if (sc !~ /^[0-9]+$/) next; if (c=="") c=0;
-             if (cs!="" && sc==cs && c+0>=cl-64 && c+0<=cl+64) next;   # SPA catch-all shell -> skip
+             if (cs!="" && sc==cs && c+0>=cl-64 && c+0<=cl+64) { print u > catch; next }   # SPA catch-all shell
              print sc"\t"c"\t"u }' >> "$fuzz_findings_file"
   rm -f "$infile"
   [ -s "$fuzz_findings_file" ] && sort -u -o "$fuzz_findings_file" "$fuzz_findings_file"
+  # Purge the catch-all URLs (and their synthetic ?param= variants) from the sets that feed the
+  # specialists, gf buckets and the triage tables, so /b2b/v2/orders etc. don't flood the report.
+  if [ -s "$catch" ]; then
+    cut -d'?' -f1 "$catch" | sort -u > "$catch.base"
+    local f
+    for f in "${urls_file:-}" "${targets_active_file:-}"; do
+      [ -n "$f" ] && [ -f "$f" ] && awk -F'?' 'NR==FNR{bad[$1]=1;next}{ if($1 in bad) next; print }' "$catch.base" "$f" > "$f.t" 2>/dev/null && mv "$f.t" "$f"
+    done
+    [ -f "${gf_file:-/dev/null}" ] && awk -F'\t' 'NR==FNR{bad[$1]=1;next}{u=$2; sub(/\?.*/,"",u); if(u in bad) next; print}' "$catch.base" "$gf_file" > "$gf_file.t" 2>/dev/null && mv "$gf_file.t" "$gf_file"
+    rm -f "$catch.base"
+  fi
 }
 # Run all lightweight detectors (called from the funnel correlation pass).
 run_owasp_detectors() {
