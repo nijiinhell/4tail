@@ -499,6 +499,10 @@ $(cat "$OUTDIR/.patterns_numbered.txt")" >"$jout" 2>>"$llm_log" || true
   # open-redirect confirmation, JWT weaknesses) - GET-only, capped, non-destructive.
   set_stage $S_CRAWL running "OWASP detectors (dirs · errors · unauth-api · redirect · jwt)"
   run_owasp_detectors; render
+  # Final dedupe of fuzz_findings by URL: probing (/metrics twice, once by ffuf, once by the mined
+  # prober - Prometheus byte-length drifts each scrape) and the [POST]/mined appends can introduce
+  # same-URL duplicates. Keep the first occurrence per URL.
+  [ -s "$fuzz_findings_file" ] && awk -F'\t' '!seen[$3]++' "$fuzz_findings_file" > "$fuzz_findings_file.dd" 2>/dev/null && mv "$fuzz_findings_file.dd" "$fuzz_findings_file"
 
   touch "$OUTDIR/.done_crawl"
   set_stage $S_CRAWL done "$url_total urls -> $active_total active | dast:$(nlines "$dast_file") dalfox:$(nlines "$findings_dir/dalfox.txt") kxss:$(nlines "$findings_dir/kxss.txt") sqlmap:$(nlines "$findings_dir/sqlmap.txt") bypass:$(nlines "$bypass_file") prop:$(nlines "$prop_file") idor:$(nlines "$idor_file")"

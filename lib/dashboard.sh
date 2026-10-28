@@ -88,6 +88,7 @@ loot_scan() {  # file  src  mode
       sqlmap)  sev=high;   txt="$l" ;;
       secret)  sev=medium; txt="$(printf '%s' "$l" | tr '\t' ' ')" ;;
       apispec) sev=info;   txt="spec: $l" ;;
+      agent)   sev="$(agent_sev "$l" 2>/dev/null)"; [ -n "$sev" ] || sev=medium; txt="$(printf '%s' "$l" | tr '\t' ' ' | head -c 160)" ;;
       *)       sev=info;   txt="$l" ;;
     esac
     [ -n "$sev" ] || sev=info
@@ -109,7 +110,7 @@ loot_refresh() {
   loot_scan "${js_secrets_file:-}"         js      secret
   loot_scan "${api_specs_file:-}"          api     apispec
   loot_scan "${oast_hits_file:-}"          oast    sqlmap
-  loot_scan "${agent_file:-}"              agent   sqlmap
+  loot_scan "${agent_file:-}"              agent   agent
   loot_scan "${bypass_file:-}"             bypass  sqlmap
   loot_scan "${idor_file:-}"               idor    sqlmap
   loot_scan "${corsy_file:-}"              cors    secret

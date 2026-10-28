@@ -9,7 +9,7 @@ if [ "$CRAWL" = 1 ] && [ "$POC_GEN" = 1 ] && [ "$AI_ENABLED" = 1 ] && budget_ok;
   harvest_forms   # no-op if the agent stage already harvested them
   # (b) AI writes the PoCs from the harvested forms + the injectable/authz signals we already have
   set_stage $S_TRIAGE running "AI writing manual PoCs"
-  poc_sys='You are a bug-bounty exploitation assistant on an AUTHORIZED engagement. Write a runnable bash script of curl PoCs for the BODY-BASED / state-changing bug classes a GET-only scanner cannot fire: POST auth & logic flaws (login, register, password-reset), body-based IDOR and SQLi, mass assignment (extra JSON fields like "role":"admin","isAdmin":true), GraphQL mutations, and CSRF (missing anti-CSRF token). Rules: one PoC per block; above each, a "# WHAT:" line (bug class + why this endpoint) and a "# CONFIRM:" line (the exact response signal that proves it). Use the real form fields and parameters given. Same-origin only. NON-DESTRUCTIVE: no DELETE/DROP/mass writes - use benign markers (e.g. value "4tailPoC"), id=1/id=2 for IDOR, a single quote for SQLi. Reference the session as the shell var $SESSION in a -H header so the human pastes their cookie/token. Output ONLY the bash script body (no markdown fences, no prose outside comments). If the data shows no plausible body-based test, output just: # no body-based PoC candidates from the collected data'
+  poc_sys='You are a bug-bounty exploitation assistant on an AUTHORIZED engagement. Write a runnable bash script of curl PoCs for the BODY-BASED / state-changing bug classes a GET-only scanner cannot fire: POST auth & logic flaws (login, register, password-reset), body-based IDOR and SQLi, mass assignment (extra JSON fields like "role":"admin","isAdmin":true), GraphQL mutations, and CSRF (missing anti-CSRF token). Rules: one PoC per block; above each, a "# WHAT:" line (bug class + why this endpoint) and a "# CONFIRM:" line (the exact response signal that proves it). Use the real form fields and parameters given. Same-origin only. NON-DESTRUCTIVE: no DELETE/DROP/mass writes - use benign markers (e.g. value "4tailPoC"), id=1/id=2 for IDOR, a single quote for SQLi. Reference the session as the shell var $SESSION in a -H header so the human pastes their cookie/token. Output ONLY the bash script body (no markdown fences, no prose outside comments). Keep internal reasoning brief (under 1500 tokens) and write AT MOST 6 high-impact PoC blocks so the complete script fits in the token budget - start emitting curl commands immediately, do not plan all blocks first. If the data shows no plausible body-based test, output just: # no body-based PoC candidates from the collected data'
   poc_out="$(mktemp)"
   ai_call "$LLM_MODEL_TRIAGE" "${LLM_MAX_TOKENS_TRIAGE:-8000}" "$poc_sys" "Target: $domain
 
@@ -37,7 +37,9 @@ $(head -c 3000 "${api_specs_file:-/dev/null}" 2>/dev/null)
 === agent-confirmed / verified issues (anchor PoCs to these first) ===
 $(head -c 3000 "$agent_file" 2>/dev/null)
 $(head -c 2000 "${verified_file:-/dev/null}" 2>/dev/null)" >"$poc_out" 2>>"$llm_log" || true
-  if [ -s "$poc_out" ] && ! grep -q 'no body-based PoC candidates' "$poc_out"; then
+  # Require at least one real curl command: a truncated reasoning header (model hit the token cap
+  # mid-comment) must NOT produce a curl-less "script" that still reports pocs:yes.
+  if [ -s "$poc_out" ] && ! grep -q 'no body-based PoC candidates' "$poc_out" && grep -qE '^[[:space:]]*curl\b' "$poc_out"; then
     {
       echo "#!/usr/bin/env bash"
       echo "# 4tail MANUAL PoCs for $domain - generated $(date -u +%FT%TZ)"

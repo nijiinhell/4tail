@@ -70,6 +70,7 @@ else
       fi
       results="$results"$'\n'"[auth-captured role=$_role id=$_uid] bearer token applied to all further probes - re-test the 401/403 endpoints and id-walk resource paths (role=$_role means $([ "$_role" = "?" ] && echo 'unknown privilege' || echo "privilege=$_role"))"
       agent_jwt_altcheck "$tok"   # one-shot alg:none forgery + RS256 key-confusion check
+      agent_post_auth_sweep       # batch-test all 401/403 endpoints with the new token
       return 0
     fi
     ck="$(printf '%s' "$1" | grep -aoiE '^set-cookie:[[:space:]]*[^;[:space:]]+' | head -1 | sed -E 's/^set-cookie:[[:space:]]*//I')"
@@ -77,6 +78,7 @@ else
       agent_captured_auth="Cookie: $ck"
       printf '[auth-captured] session cookie acquired - applied to subsequent probes\n' >> "$agent_log"
       results="$results"$'\n'"[auth-captured] a session cookie was captured and is now applied to all further probes - re-test the 401/403 endpoints and id-walk resource paths"
+      agent_post_auth_sweep
     fi
   }
   # One-shot JWT weakness check on the captured token: (1) alg:none forgery - re-sign the SAME
@@ -107,6 +109,30 @@ else
     case "$none" in 200|201) printf '[CONFIRMED] JWT alg:none signature bypass - unsigned token accepted at %s\n' "$ep" >> "$agent_file" ;; esac
   }
   agent_jwt_checked=0
+  # The instant a token is captured, batch-probe every 401/403 endpoint with it (no LLM cost): a
+  # flip to 200 is newly-accessible surface, and a flip on a numeric/UUID object id is a BOLA (an
+  # auth-gated object readable with this token). Feeds the diff into the next agent round.
+  agent_sweep_done=0
+  agent_post_auth_sweep() {
+    [ -n "$agent_captured_auth" ] || return 0
+    [ "$agent_sweep_done" = 1 ] && return 0; agent_sweep_done=1
+    local u st flips="" n=0
+    while IFS= read -r u; do
+      [ -n "$u" ] || continue
+      [ "$n" -ge "${AGENT_SWEEP_MAX:-15}" ] && break
+      printf '%s' "$u" | grep -qiE "^https?://([a-z0-9._-]+\.)?${esc_domain}([:/]|$)" || continue
+      n=$((n+1))
+      st="$(curl -s -o /dev/null -w '%{http_code}' -L --max-time 8 ${CURL_NET[@]+"${CURL_NET[@]}"} -H "$agent_captured_auth" "$u" 2>/dev/null || echo 000)"
+      case "$st" in 200|201)
+        flips="$flips"$'\n'"  $u -> $st (was 401/403)"
+        if printf '%s' "$u" | grep -qiE '/[0-9]+/?([?]|$)|/[0-9a-f]{8}-[0-9a-f]{4}-'; then
+          grep -qF "[CONFIRMED] [BOLA] $u" "$agent_file" 2>/dev/null \
+            || printf '[CONFIRMED] [BOLA] %s [status=%s] | auth-gated object readable with the captured (non-owner) token\n' "$u" "$st" >> "$agent_file"
+        fi ;;
+      esac
+    done < <(awk -F'\t' '$1==401||$1==403{print $3}' "${fuzz_findings_file:-/dev/null}" 2>/dev/null | awk '!seen[$0]++')
+    [ -n "$flips" ] && results="$results"$'\n'"[post-auth-sweep] endpoints that opened with the captured token (re-test these for BOLA/IDOR):$flips"
+  }
   # Scope string for the AI: in single-host / custom-port mode, hand it the exact seed URL
   # (http://localhost:3000) so it keeps the scheme+port; otherwise the wildcard host scope.
   agent_scope="*.$domain"; [ "${SINGLE:-0}" = 1 ] && agent_scope="${SEED_URL:-$agent_scope}"
@@ -260,23 +286,28 @@ $situation"; printf '\n=== end head ===\n'; } >> "$agent_log" 2>/dev/null
         printf '[r%s] %s %-4s %s (body: %.60s)\n   why: %s\n   resp: %s | %s | %s\n' "$round" "$pmethod" "${phit:-...}" "$purl" "$pbody" "$pwhy" "$pstatus" "$pkeyh" "$psnip" >> "$agent_log"
         results="$results"$'\n'"$pmethod $purl => ${phit:-no-match} [$pstatus] ${pkeyh} ${psnip}"
         # Classify the write: a privilege body echoed back = mass-assignment (CONFIRM); a CLEAN
-        # registration (no privilege fields, no injection) = low-priv setup, NOT a finding.
+        # registration/login (no privilege fields, no injection) or a self-described SETUP step is
+        # NOT a finding - log it for the next round instead of stamping [CONFIRMED].
         _haspriv=0; printf '%s' "$pbody" | grep -qiE '"(role|isadmin|is_admin|admin|privilege|permissions|group)"' && _haspriv=1
-        _isreg=0;   printf '%s' "$purl"  | grep -qiE '/(users|register|signup|sign-up|account)(/|\?|$)' && _isreg=1
-        _hasinj=0;  printf '%s' "$pbody" | grep -qiE "'|\\\$ne|\\\$gt|\\\$where|union[[:space:]]+select|<!doctype" && _hasinj=1
+        _isreg=0;   printf '%s' "$purl"  | grep -qiE '/(users|register|signup|sign-up|account|login|signin|authenticate|auth)(/|\?|$)' && _isreg=1
+        _hasinj=0;  printf '%s' "$pbody" | grep -qiE "'|\\\$ne|\\\$gt|\\\$where|union[[:space:]]+select|<!doctype|\{\{" && _hasinj=1
+        _issetup=0; printf '%s' "$pwhy" | grep -qiE 'so (next|that) round|next round|set ?up|obtain .* so|capture .* so|for .* pivot|low[- ]priv|our own|test account' && _issetup=1
+        _sqlerr=0;  [ "$pcode" = 500 ] && printf '%s' "$pbody_raw" | grep -qiE 'SQLITE_[A-Z]+|SequelizeDatabaseError|SQL syntax|ORA-[0-9]|PDOException' && _sqlerr=1
+        _tag="[status=$pcode${_sqlerr:+, SQL-ERROR}]"
         if [ "$_haspriv" = 1 ] && printf '%s' "$pbody_raw" | grep -qiE '"role"[[:space:]]*:[[:space:]]*"admin"|"isadmin"[[:space:]]*:[[:space:]]*true|"admin"[[:space:]]*:[[:space:]]*true'; then
           case "$pcode" in 200|201) grep -qF "[CONFIRMED] [MASS-ASSIGNMENT] $purl" "$agent_file" 2>/dev/null \
-              || printf '[CONFIRMED] [MASS-ASSIGNMENT] %s (body: %s) | privilege field accepted and echoed in the response\n' "$purl" "$pbody" >> "$agent_file" ;; esac
-        elif [ "$_isreg" = 1 ] && [ "$_haspriv" = 0 ] && [ "$_hasinj" = 0 ]; then
-          printf '[r%s] low-priv registration (test setup, not a finding): %s\n' "$round" "$purl" >> "$agent_log"
+              || printf '[CONFIRMED] [MASS-ASSIGNMENT] %s %s (body: %s) | privilege field accepted and echoed in the response\n' "$purl" "$_tag" "$pbody" >> "$agent_file" ;; esac
+        elif { [ "$_isreg" = 1 ] && [ "$_haspriv" = 0 ] && [ "$_hasinj" = 0 ]; } || { [ "$_issetup" = 1 ] && [ "$_hasinj" = 0 ]; }; then
+          printf '[r%s] setup step (clean auth/registration or stated setup, not a finding): %s %s\n' "$round" "$pmethod" "$purl" >> "$agent_log"
         elif [ "$phit" = HIT ]; then
           # Record CONFIRMED once per (method,url); never on a 4xx; and not when the match is only the
-          # SPA catch-all HTML shell (auth-bypass artifacts are JSON/headers, not index.html).
+          # SPA catch-all HTML shell (auth-bypass artifacts are JSON/headers, not index.html). The
+          # [status=...] tag (and SQL-ERROR on a 500) stops Triage reading a 500 error as a 200 dump.
           _pshell=0; printf '%s' "$pbody_raw" | head -c 80 | grep -qiE '^[[:space:]]*<(!doctype|html)' \
             && ! printf '%s' "$prx" | grep -qiE 'html|doctype|<' && _pshell=1
           case "$pcode" in 4[0-9][0-9]) : ;; *) [ "$_pshell" = 1 ] || grep -qxF "$purl" "$OUTDIR/.agent_loot_urls" 2>/dev/null \
               || grep -qF "[CONFIRMED] $pmethod $purl " "$agent_file" 2>/dev/null \
-              || printf '[CONFIRMED] %s %s (body: %s) | %s\n' "$pmethod" "$purl" "$pbody" "$pwhy" >> "$agent_file" ;; esac
+              || printf '[CONFIRMED] %s %s %s (body: %s) | %s\n' "$pmethod" "$purl" "$_tag" "$pbody" "$pwhy" >> "$agent_file" ;; esac
         fi
         continue
       fi
@@ -307,11 +338,13 @@ $situation"; printf '\n=== end head ===\n'; } >> "$agent_log" 2>/dev/null
       if [ "$hit" = HIT ]; then
         _shell=0; printf '%s' "$gbody" | head -c 80 | grep -qiE '^[[:space:]]*<(!doctype|html)' \
           && ! printf '%s' "$rx" | grep -qiE 'html|doctype|<' && _shell=1
+        _gsql=0; [ "$gcode" = 500 ] && printf '%s' "$gbody" | grep -qiE 'SQLITE_[A-Z]+|SequelizeDatabaseError|SQL syntax|ORA-[0-9]|PDOException' && _gsql=1
+        _gtag="[status=$gcode${_gsql:+, SQL-ERROR}]"
         case "$gcode" in
           4[0-9][0-9]) : ;;
           *) [ "$_shell" = 1 ] || grep -qxF "$url" "$OUTDIR/.agent_loot_urls" 2>/dev/null \
-               || grep -qF "[CONFIRMED] $url |" "$agent_file" 2>/dev/null \
-               || printf '[CONFIRMED] %s | %s\n' "$url" "$why" >> "$agent_file" ;;
+               || grep -qF "[CONFIRMED] $url " "$agent_file" 2>/dev/null \
+               || printf '[CONFIRMED] %s %s | %s\n' "$url" "$_gtag" "$why" >> "$agent_file" ;;
         esac
       fi
     done <<< "$probes"

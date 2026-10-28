@@ -280,7 +280,9 @@ verify_findings() {
     [ -f "${dast_file:-}" ]   && grep -oiE 'https?://[^ |]+' "$dast_file"
     [ -f "${nuclei_file:-}" ] && grep -oiE 'https?://[^ |]+' "$nuclei_file"
     [ -f "${unauth_api_file:-}" ] && grep -oiE 'https?://[^ |]+' "$unauth_api_file"
-  } 2>/dev/null | sort -u | head -n 60 | while IFS= read -r u; do
+  } 2>/dev/null | sort -u \
+    | awk '{ k=$0; sub(/=[^&]*$/,"=",k); sub(/&[^=]*=[^&]*$/,"",k); if(!seen[k]++) print }' \
+    | head -n 60 | while IFS= read -r u; do
     [ -n "$u" ] || continue
     r1="$(curl -s -o /dev/null -w '%{http_code} %{size_download}' -L --max-time 12 ${CURL_NET[@]+"${CURL_NET[@]}"} ${agent_captured_auth:+-H "$agent_captured_auth"} "$u" 2>/dev/null || echo '000 0')"
     r2="$(curl -s -o /dev/null -w '%{http_code} %{size_download}' -L --max-time 12 ${CURL_NET[@]+"${CURL_NET[@]}"} ${agent_captured_auth:+-H "$agent_captured_auth"} "$u" 2>/dev/null || echo '000 0')"

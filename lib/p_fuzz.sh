@@ -300,9 +300,10 @@ if ls "$fuzz_dir"/*.json >/dev/null 2>&1; then
     END { for(i=1;i<=NR;i++){ b=uv[i];
             if (sub(/\.(bak|old|zip|sql|orig|save|swp|tmp|~)$/,"",b) && b!=uv[i] && (b in fp) && fp[b]==stv[i]"|"lnv[i]) continue
             print line[i] } }' "$OUTDIR/.fuzz_raw" > "$OUTDIR/.fuzz_raw2" 2>/dev/null && mv "$OUTDIR/.fuzz_raw2" "$OUTDIR/.fuzz_raw"
-  # Drop empty (200, 0B) hits on archive/backup/config extensions: a 0-byte .zip/.sql/.bak/.yml has
-  # no content and is never a real backup dump (the local server 200s nonexistent paths with len 0).
-  awk -F'\t' '!($1==200 && $2+0==0 && $3 ~ /\.(sql|zip|tar|tgz|gz|bak|old|orig|save|swp|ya?ml|conf|config|env|log)([?#]|$)/)' \
+  # Drop empty (200,0B) hits AND 500s on archive/backup/config extensions: a 0-byte file is never a
+  # real backup dump, and a real static backup returns 200/403 - never 500 (a 500 on x.bak just means
+  # the app's error handler echoed the requested path, so .bak/.old are a few bytes longer than x).
+  awk -F'\t' '!(($1==200 && $2+0==0 || $1==500) && $3 ~ /\.(sql|zip|tar|tgz|gz|bak|old|orig|save|swp|copy|ya?ml|conf|config|env|log)([?#]|$)/)' \
     "$OUTDIR/.fuzz_raw" > "$OUTDIR/.fuzz_raw2" 2>/dev/null && mv "$OUTDIR/.fuzz_raw2" "$OUTDIR/.fuzz_raw"
   { for s in 200 302 301 307 401 403 405 500 204; do awk -F'\t' -v s="$s" '$1==s' "$OUTDIR/.fuzz_raw"; done
     awk -F'\t' '$1!~/^(200|301|302|307|401|403|405|500|204)$/' "$OUTDIR/.fuzz_raw"; } > "$fuzz_findings_file"

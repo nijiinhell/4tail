@@ -82,7 +82,13 @@ else
     # trufflehog --only-verified discards), and ADDITIONALLY save the file for trufflehog's
     # verified cloud-key check. (The old `if js_dir; then cp; else regex` skipped the regex
     # whenever trufflehog was installed -> js-secrets:0 even with creds in the bundle.)
-    grep -aoE "$SECRET_RE" "$jtmp" 2>/dev/null | sort -u | sed "s#^#${j}\t#" >> "$js_secrets_file"
+    # Drop web3 bitmask/padding/curve constants (0x with a long run of 0s or fs - MaxUint256,
+    # ZeroHash, secp256k1 order, ERC-165 selectors) and placeholder values (password:`password`,
+    # secret:"secret", key:"changeme") - these are not real leaked secrets.
+    grep -aoE "$SECRET_RE" "$jtmp" 2>/dev/null \
+      | grep -aviE '^0x([0-9a-f]*0{12,}|[0-9a-f]*f{12,})' \
+      | grep -aviE '(password|passwd|pwd|secret|private[_-]?key|api[_-]?key|token)["]?[[:space:]]*[:=][[:space:]]*["`]?(password|passwd|secret|key|token|null|undefined|true|false|example|changeme|x{3,}|your[_-]?.*here)([^a-z0-9]|$)' \
+      | sort -u | sed "s#^#${j}\t#" >> "$js_secrets_file"
     [ -n "$js_dir" ] && cp "$jtmp" "$js_dir/$(printf '%s' "$j" | tr -c 'A-Za-z0-9._-' '_' | tail -c 120).js"
     # endpoints: a SPA's API surface (/rest, /api, absolute URLs) lives in its JS bundles; mine
     # them so they feed the funnel even with no archive data and no source map. Origin = this JS's.
