@@ -79,8 +79,8 @@ fuzz_distinct() { [ -f "$1" ] && awk -F'\t' 'NF>=2 && !s[$1"-"$2]++{c++} END{pri
 agent_sev() {
   local l; l="$(printf '%s' "$1" | tr 'A-Z' 'a-z')"
   case "$l" in
-    *secret-loot*|*union*select*|*sqli*|*sql*injection*|*auth*bypass*|*rce*|*machinekey*|*connectionstring*|*id_rsa*|*.pem*|*private?key*) printf 'critical' ;;
-    *bola*|*idor*|*mass*assign*|*privilege*|*priv*esc*|*pii*|*/admin*|*web.config*|*global.asa*|*/.git*|*.env*|*win.ini*|*/etc/passwd*|*wp-config*|*application.properties*) printf 'high' ;;
+    *secret-loot*|*union*select*|*sqli*|*sql*injection*|*auth*bypass*|*alg:none*|*rce*|*machinekey*|*connectionstring*|*id_rsa*|*.pem*|*private?key*|*jwt-claims-exposure*) printf 'critical' ;;
+    *bola*|*idor*|*mass*assign*|*privilege*|*priv*esc*|*pii*|*/admin*|*key-confusion*|*web.config*|*global.asa*|*/.git*|*.env*|*win.ini*|*/etc/passwd*|*wp-config*|*application.properties*) printf 'high' ;;
     *robots.txt*|*sitemap*|*about.htm*|*favicon*|*.css*|*.png*|*.jpg*|*.svg*|*humans.txt*) printf 'low' ;;
     *) printf 'medium' ;;
   esac
@@ -388,16 +388,24 @@ unauth_api_scan() {
 openredir_confirm() {
   [ "${OPENREDIR_CHECK:-1}" = 1 ] || return 0
   : > "$openredir_file"
-  local u inj loc canary='https://4tail-canary.example.org/'
+  local u inj loc can='4tail-canary.example.org' tdom pay
   local rparams='(to|redirect|redir|next|url|uri|return|returnurl|return_url|dest|destination|continue|out|goto)'
+  tdom="${domain:-target}"
   { [ -f "${gf_file:-/dev/null}" ] && grep -iE '^redirect\t' "$gf_file" 2>/dev/null | cut -f2
     [ -s "${targets_active_file:-/dev/null}" ] && grep -aiE "[?&]${rparams}=" "$targets_active_file" 2>/dev/null
   } | awk 'NF && !seen[$0]++' | head -n "${OPENREDIR_MAX:-25}" | while IFS= read -r u; do
     [ -n "$u" ] || continue
-    inj="$(printf '%s' "$u" | sed -E "s#([?&]${rparams})=[^&]*#\1=${canary//#/\\#}#Ig")"
-    [ "$inj" = "$u" ] && continue
-    loc="$(curl -s -o /dev/null -D - --max-time 8 ${CURL_NET[@]+"${CURL_NET[@]}"} "$inj" 2>/dev/null | grep -iE '^location:' | head -1 | tr -d '\r')"
-    printf '%s' "$loc" | grep -qiE '4tail-canary\.example\.org' && printf '[open-redirect] %s | %s\n' "$u" "$loc" >> "$openredir_file"
+    # Try the plain canary AND allowlist-bypass mutations (a naive "must contain target domain"
+    # allowlist is bypassed by target-as-subdomain, target-in-query, or scheme-relative forms).
+    for pay in "https://${can}/" "https://${can}/?${tdom}" "https://${tdom}.${can}/" "//${can}/" "https:/${can}/"; do
+      inj="$(printf '%s' "$u" | sed -E "s#([?&]${rparams})=[^&]*#\1=${pay//#/\\#}#Ig")"
+      [ "$inj" = "$u" ] && continue
+      loc="$(curl -s -o /dev/null -D - --max-time 8 ${CURL_NET[@]+"${CURL_NET[@]}"} "$inj" 2>/dev/null | grep -iE '^location:' | head -1 | tr -d '\r')"
+      # Confirmed only when the Location host is the canary (not merely reflecting the string).
+      if printf '%s' "$loc" | grep -qiE "^location:[[:space:]]*(https?:)?//([^/]*\.)?${can}([:/]|$)"; then
+        printf '[open-redirect] %s | payload=%s | %s\n' "$u" "$pay" "$loc" >> "$openredir_file"; break
+      fi
+    done
   done
 }
 # A07: passive JWT weakness analysis (alg=none, symmetric HS*, missing exp, sensitive claims).
@@ -484,11 +492,30 @@ probe_mined_endpoints() {
   fi
 }
 # Run all lightweight detectors (called from the funnel correlation pass).
+# A05/A09: observability & metadata exposure. Probe Prometheus/actuator/log/debug endpoints and
+# a public key store; record any 200 as an exposure and fold their embedded internal route strings
+# into the URL pool (brute-force wordlists never guess these).
+metrics_harvest() {
+  [ "${METRICS_HARVEST:-1}" = 1 ] || return 0
+  local base p u body routes
+  base="$(ranked_hosts 1)"; [ -n "$base" ] || return 0; base="${base%/}"
+  for p in /metrics /actuator /actuator/mappings /actuator/env /actuator/health /actuator/logfile \
+           /support/logs /logs /debug/pprof /server-status /.well-known/jwks.json /jwks.json /encryptionkeys; do
+    u="$base$p"
+    body="$(curl -s -i -L --max-time 8 ${CURL_PROXY[@]+"${CURL_PROXY[@]}"} "$u" 2>/dev/null | head -c 40000)"
+    printf '%s' "$body" | head -1 | grep -qE ' 20[0-6]' || continue
+    printf '%s' "$body" | grep -qiE '^content-type:.*(html)' && continue   # SPA shell, not a real exposure
+    printf '[observability-exposed] %s\n' "$u" >> "${unauth_api_file:-/dev/null}"
+    routes="$(printf '%s' "$body" | grep -aoE '(route|path|uri|endpoint|mapping)["=: ]+\{?/[a-zA-Z0-9_./{}-]{2,60}' | grep -aoE '/[a-zA-Z0-9_./{}-]{2,60}' | sort -u | head -n 40)"
+    [ -n "$routes" ] && printf '%s\n' "$routes" | sed "s#^#${base}#" >> "${urls_file:-/dev/null}"
+  done
+}
 run_owasp_detectors() {
   open_dir_scan; render 2>/dev/null || true
   stacktrace_harvest; render 2>/dev/null || true
   unauth_api_scan; render 2>/dev/null || true
   openredir_confirm; render 2>/dev/null || true
+  metrics_harvest; render 2>/dev/null || true
   jwt_analyze; render 2>/dev/null || true
 }
 

