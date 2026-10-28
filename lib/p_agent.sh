@@ -109,7 +109,7 @@ Three kinds of action:
   POST <url> | body | why | success-regex    -> a form/JSON POST to test BODY-based bugs: login/register logic, body IDOR/SQLi, mass assignment. body is raw urlencoded (e.g. tfUName=%27&tfUPass=x) or JSON. NON-DESTRUCTIVE only: benign markers, id=1/id=2, a single quote for SQLi - never DROP/DELETE/TRUNCATE/SHUTDOWN/xp_cmdshell or mass writes (those are refused).
   TOOL <name> <url> | tags=...               -> run a real tool. ONLY these are installed: ${agent_tools:-none}. Use them to CONFIRM, e.g. sqlmap on a SQLi-looking param (it always runs capped at --level=1 --risk=1; higher levels are ignored), dalfox on a reflecting param, nuclei <url> tags=iis,cve on a fingerprinted host, git-dumper on an exposed /.git, nuclei-dast to fuzz a param URL. Prefer a TOOL to prove a lead over guessing.
 Work from first principles on THIS target - do not assume any framework's specific paths or field names. Methodology:
-- SCHEMA FIRST: before POSTing to an endpoint whose body fields you do not already know from the DISCOVERED FORMS/FIELDS or an API spec, send an empty JSON body {} (or a single dummy field) once. A 400/422 validation error usually names the required fields (e.g. "field 'x' is required"); use those exact names next round. Do NOT invent field names.
+- SCHEMA FIRST: before POSTing to an endpoint whose body fields you do not already know from the DISCOVERED FORMS/FIELDS or an API spec, send an empty JSON body {} (or a single dummy field) once. A 400/422 validation error usually names the required fields (e.g. a message like: field NAME is required); use those exact names next round. Do NOT invent field names.
 - LFI / path traversal: on a param that names a file/template/page, read common sensitive files relative to it (../ up to the web root: app config, env files, /etc/passwd, source) and confirm with a content signature (connectionString, root:.*:0:0:, BEGIN PRIVATE KEY). 4tail saves any raw credential file for the human.
 - empty/small 200 endpoints -> add plausible params (?id=1&debug=1); redirect-looking params -> set an off-site absolute URL and watch the Location header; an exposed /.git -> git-dumper.
 For the MINED API ENDPOINTS go further than GET: (a) PATH-IDOR/BOLA - a numeric or UUID path segment is an object id, so GET a neighbour id and compare; a readable record you should not own is a lead; (b) AUTH/SQLi - POST to a login/auth endpoint with a single quote in the identifier field and look for a SQL error or an unexpected auth success; (c) MASS ASSIGNMENT - when registering or updating a profile, add standard privilege attributes alongside the REAL required fields: role (e.g. admin), isAdmin/is_admin true, permissions, group, plan - then read the response to see if they stuck. Use the POST action for (b)/(c); a body starting with a brace is sent as application/json.
@@ -131,14 +131,20 @@ $agent_notes
 
 LATEST RESULTS:
 $results" > "$aout" 2>>"$llm_log" || true
-    # --- parse the structured reply (robust to reasoning-model wrapping) ---
-    # NOTES: text between a NOTES marker and the PROBES/DECISION marker.
-    new_notes="$(awk 'BEGIN{p=0} /^[[:space:]]*NOTES[[:space:]]*:/{p=1;next} /^[[:space:]]*(ACTIONS|PROBES|DECISION)[[:space:]]*:/{p=0} p' "$aout" | sed '/^[[:space:]]*$/d' | head -n 8)"
+    # Round 1: log the head of what the model actually received, so a broken/empty situation brief
+    # (e.g. an arg-shift bug) is immediately visible in agent.log instead of silently failing.
+    [ "$round" -eq 1 ] && { printf '=== round 1 user-prompt head ===\n'; head -c 500 <<<"SITUATION:
+$situation"; printf '\n=== end head ===\n'; } >> "$agent_log" 2>/dev/null
+    # Strip markdown code fences first so headings like ``` ### NOTES ### ``` parse cleanly.
+    sed -i '/^[[:space:]]*```/d' "$aout" 2>/dev/null || true
+    # --- parse the structured reply (robust to reasoning-model + markdown wrapping) ---
+    # Match NOTES:/## NOTES/### NOTES ###/**NOTES** between it and the ACTIONS/PROBES/DECISION marker.
+    new_notes="$(awk 'BEGIN{p=0} /^[[:space:]#*]*NOTES[[:space:]#*:]*$|^[[:space:]#*]*NOTES[[:space:]]*:/{p=1;next} /^[[:space:]#*]*(ACTIONS|PROBES|DECISION)[[:space:]#*:]*$|^[[:space:]#*]*(ACTIONS|PROBES|DECISION)[[:space:]]*:/{p=0} p' "$aout" | sed '/^[[:space:]]*$/d' | head -n 8)"
     [ -n "$new_notes" ] && agent_notes="$new_notes"
     # DECISION: explicit STOP only (default is to continue while leads/probes remain).
-    decision="$(grep -ioE 'DECISION[[:space:]]*:[[:space:]]*(CONTINUE|STOP)' "$aout" | head -1 | grep -ioE '(CONTINUE|STOP)' | tr 'a-z' 'A-Z')"
+    decision="$(grep -ioE 'DECISION[[:space:]#*]*:?[[:space:]#*]*(CONTINUE|STOP)' "$aout" | head -1 | grep -ioE '(CONTINUE|STOP)' | tr 'a-z' 'A-Z')"
     # ACTIONS: lines under the ACTIONS/PROBES section (GET or TOOL); fall back to any URL line.
-    probes="$(awk 'BEGIN{p=0} /^[[:space:]]*(ACTIONS|PROBES)[[:space:]]*:/{p=1;next} /^[[:space:]]*DECISION[[:space:]]*:/{p=0} p' "$aout" | grep -iE 'https?://|^[[:space:]]*TOOL ')"
+    probes="$(awk 'BEGIN{p=0} /^[[:space:]#*]*(ACTIONS|PROBES)[[:space:]#*:]*$|^[[:space:]#*]*(ACTIONS|PROBES)[[:space:]]*:/{p=1;next} /^[[:space:]#*]*DECISION[[:space:]#*:]*$|^[[:space:]#*]*DECISION[[:space:]]*:/{p=0} p' "$aout" | grep -iE 'https?://|^[[:space:]]*TOOL ')"
     [ -n "$probes" ] || probes="$(grep -iE 'https?://|^[[:space:]]*TOOL ' "$aout")"
     probes="$(printf '%s\n' "$probes" | head -n $((AGENT_MAX_PROBES * 3)))"; rm -f "$aout"
     printf '=== round %s notes ===\n%s\n' "$round" "$agent_notes" >> "$agent_log"
@@ -288,24 +294,25 @@ if [ "$VERIFY" = 1 ]; then set_stage $S_TRIAGE running "verifying findings"; ver
     echo
     echo '| Status | Length | URL(s) | Count |'
     echo '|--------|--------|--------|-------|'
-    # Group by response fingerprint. For 500/403 (dynamic error pages that echo the requested
-    # path, so lengths differ by a few bytes each) bucket the length by 64 so they collapse into
-    # one row instead of hundreds. For other statuses keep exact length but carry up to 3 sample
-    # URLs so a popular (status,length) doesn't hide 39 distinct endpoints behind one. 0-byte 200s
-    # sort below non-empty 200s.
+    # Group by response fingerprint. 500/403 dynamic error pages (lengths differ by a few bytes)
+    # bucket by 64 and show 3 samples. For other statuses keep exact length and list ALL urls when
+    # the bucket is <=10 (so a critical API endpoint is never hidden behind "×5"); only collapse to
+    # 3 samples when a bucket has >10 urls. 0-byte 200s sort below non-empty 200s.
     awk -F'\t' '
       NF>=3 {
         st=$1; len=$2+0; u=$3
-        if (st==500 || st==403) { b=int(len/64)*64; k=st SUBSEP "b" b; disp="~"b }
-        else { k=st SUBSEP len; disp=len }
-        c[k]++; d[k]=disp; stv[k]=st; zero[k]=(len==0?1:0)
-        if (ns[k]<3) { smp[k]=(smp[k]==""?u:smp[k]" , "u); ns[k]++ }
+        if (st==500 || st==403) { b=int(len/64)*64; k=st SUBSEP "b" b; disp="~"b; cap=3 }
+        else { k=st SUBSEP len; disp=len; cap=10 }
+        c[k]++; d[k]=disp; stv[k]=st; zero[k]=(len==0?1:0); lim[k]=cap
+        if (ns[k]<cap) { smp[k]=(smp[k]==""?u:smp[k]" , "u); ns[k]++ }
       }
       END{ for(k in c) printf "%s\t%s\t%d\t%d\t%s\n", stv[k], d[k], c[k], zero[k], smp[k] }' "$fuzz_findings_file" \
-      | sort -t"$(printf '\t')" -k1,1n -k4,4n -k3,3nr | head -n 100 \
+      | sort -t"$(printf '\t')" -k1,1n -k4,4n -k3,3nr | head -n 120 \
       | while IFS=$'\t' read -r st len c z samples; do
           scell="$(printf '%s' "$samples" | sed -E 's# , #` `#g')"
-          echo "| $st | $len | \`$scell\` | $([ "$c" -gt 1 ] && echo "×$c" || echo 1) |"
+          # show ×count only when there are more urls than we listed
+          more=""; shown="$(printf '%s' "$samples" | awk -F' , ' '{print NF}')"; [ "$c" -gt "${shown:-1}" ] && more="×$c"
+          echo "| $st | $len | \`$scell\` | ${more:-$c} |"
         done
     echo
   fi

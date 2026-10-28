@@ -55,6 +55,10 @@ $user
         fi
         if [ -z "$text" ] && [ "$_fr" = "length" ]; then
           echo "[warn] model=$m truncated (finish_reason=length) with empty content - discarding partial reasoning, retrying/falling back. Raise LLM_MAX_TOKENS_PLAN/TRIAGE." >>"$llm_log"
+        elif [ -n "$text" ] && [ "$_fr" = "length" ]; then
+          # Non-empty but cut off mid-output (reasoning ate the budget): the caller's report/plan
+          # will be partial. Surface it so it's diagnosable; raising the token cap is the fix.
+          echo "[warn] model=$m finish_reason=length with PARTIAL content ($(printf '%s' "$text" | wc -c) bytes) - output truncated; raise LLM_MAX_TOKENS_TRIAGE/PLAN." >>"$llm_log"
         fi
         if [ -n "$text" ]; then
           # accrue estimated cost from token usage

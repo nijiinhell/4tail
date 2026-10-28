@@ -94,7 +94,8 @@ spoofing, zone transfer, clickjacking, missing HSTS/CSP, weak cookie flags - imp
 "## Attack surface notes" and "## Recommended manual follow-ups".
 Use ONLY the provided data - do not invent findings. Keep tables concise and do NOT repeat the
 same endpoint across multiple tables; prefer one row per issue. Finish every section - do not
-run long.
+run long. Keep your internal thinking brief; do NOT draft tables in reasoning before the output.
+Limit each table to the top 8 highest-signal rows.
 Output ONLY the final report starting exactly with the line "## Executive summary".
 Do NOT include any reasoning, planning, or preamble before it.'
   triage_out="$(mktemp)"
@@ -106,14 +107,17 @@ $(head -c 8000 "$tech_brief")
 === nuclei findings (severity-sorted) ===
 $(printf '%s\n' "$sorted_findings" | head -n 400 | head -c 30000)
 
-=== content-discovery hits (status  length  url  count; grouped by response fingerprint) ===
-$(awk -F'\t' 'NF>=3{k=$1"\t"$2; c[k]++; if(!(k in r)) r[k]=$3} END{for(k in c) printf "%s\t%s\tx%d\n", k, r[k], c[k]}' "$fuzz_findings_file" 2>/dev/null | sort -t"$(printf '\t')" -k1,1n -k3,3r | head -n 150 | head -c 12000)
+=== content-discovery hits (status  length  urls; grouped by fingerprint - ALL urls listed for small buckets so nothing is hidden) ===
+$(awk -F'\t' 'NF>=3{ st=$1; len=$2; u=$3; if(st==500||st==403){cap=3}else{cap=10}
+    k=st"\t"len; c[k]++; if(ns[k]<cap){smp[k]=(smp[k]==""?u:smp[k]" "u); ns[k]++} }
+  END{ for(k in c){ extra=(c[k]>ns[k]?" (+"(c[k]-ns[k])" more)":""); printf "%s\t%s%s\n", k, smp[k], extra } }' \
+    "$fuzz_findings_file" 2>/dev/null | sort -t"$(printf '\t')" -k1,1n | head -n 200 | head -c 14000)
 
 === nuclei DAST findings ===
 $(head -c 8000 "$dast_file" 2>/dev/null)
 
 === mined REST/API surface (from JS bundles + source maps - the SPA's real endpoints; probed statuses are in the content-discovery table above) ===
-$(grep -iE '/api/|/rest/|/graphql' "${js_endpoints_file:-/dev/null}" 2>/dev/null | sort -u | head -n 80 | head -c 6000)
+$(grep -iE '/api/|/rest/|/graphql' "${js_endpoints_file:-/dev/null}" 2>/dev/null | sort -u | head -n 150 | head -c 8000)
 
 === OWASP/API detector hits (open dirs, verbose errors, unauth API exposure, open redirects, JWT) ===
 $({ cat "${open_dir_file:-/dev/null}" "${stacktrace_file:-/dev/null}" "${unauth_api_file:-/dev/null}" "${openredir_file:-/dev/null}" "${jwt_file:-/dev/null}"; } 2>/dev/null | head -c 6000)
@@ -198,6 +202,11 @@ else
   } >> "$report_file"
   set_stage $S_TRIAGE skip "$([ "$AI_ENABLED" = 1 ] && echo "nothing to triage" || echo "AI off")"
 fi
+
+# The report header's AI-spend line was written in p_agent BEFORE the two biggest calls (PoC gen +
+# triage) ran here. Rewrite it now with the final total so it matches the terminal summary.
+[ "$AI_ENABLED" = 1 ] && [ -f "$report_file" ] && \
+  sed -i -E "s|^(- \*\*Estimated AI spend:\*\* )\\\$?[0-9.]+|\\1$(cost_fmt)|" "$report_file" 2>/dev/null || true
 
 # Manual-PoC section: point the human at the runnable body-based PoCs 4tail generated but
 # did not fire. Kept as its own report section + standalone script artifact.
@@ -302,6 +311,7 @@ if [ "$CRAWL" = 1 ]; then
   tally="$tally  $(cov kxss kxss "$(has_spec kxss && echo 1 || echo 0)" "$(nlines "$findings_dir/kxss.txt")")"
   tally="$tally  $(cov sqlmap sqlmap "$({ has_spec sqlmap && [ "$SQLMAP_CONFIRM" = 1 ] && [ "${ACT_MAX_SQLMAP:-0}" -gt 0 ] 2>/dev/null; } && echo 1 || echo 0)" "$(nlines "$findings_dir/sqlmap.txt")")"
   tally="$tally  bypass:$(nlines "${bypass_file:-/dev/null}")  $(cov idor "" "$([ -n "$AUTH_A" ] && echo 1 || echo 0)" "$(nlines "${idor_file:-/dev/null}")")  $(cov cors corsy "$([ "$CORS_SCAN" = 1 ] && echo 1 || echo 0)" "$(nlines "${corsy_file:-/dev/null}")")"
+  [ -s "${unauth_api_file:-/dev/null}" ] && tally="$tally  api-leak:$(nlines "$unauth_api_file")"
 fi
 [ "$OAST" = 1 ] && tally="$tally  $(cov oast interactsh-client 1 "$(nlines "${oast_hits_file:-/dev/null}")")"
 [ "$AGENT" = 1 ] && tally="$tally  agent:$(nlines "${agent_file:-/dev/null}")"

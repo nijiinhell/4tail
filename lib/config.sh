@@ -16,7 +16,7 @@ LLM_RETRIES="${LLM_RETRIES:-2}"
 LLM_MODEL_PLAN="${LLM_MODEL_PLAN:-}"        # scan planner; default = LLM_MODEL
 LLM_MODEL_TRIAGE="${LLM_MODEL_TRIAGE:-}"    # findings analyst; default = LLM_MODEL
 LLM_MAX_TOKENS_PLAN="${LLM_MAX_TOKENS_PLAN:-6000}"   # headroom for reasoning models (GLM/DeepSeek think first)
-LLM_MAX_TOKENS_TRIAGE="${LLM_MAX_TOKENS_TRIAGE:-}"  # default = LLM_MAX_TOKENS
+LLM_MAX_TOKENS_TRIAGE="${LLM_MAX_TOKENS_TRIAGE:-16000}"  # reasoning models cap reasoning+output together; a rich finding set overran 8000 mid-report
 LLM_FALLBACK_MODELS="${LLM_FALLBACK_MODELS:-deepseek-ai/DeepSeek-V4.1-Flash}"  # tried in order if the primary errors (resilience; only billed when used)
 # AI supervisor: periodic plain-language status during the long nuclei stage.
 SUPERVISOR="${SUPERVISOR:-1}"                        # 1 = on (needs API key); report-only
@@ -88,7 +88,7 @@ PERMUTE_MIN_SUBS="${PERMUTE_MIN_SUBS:-25}" # skip permutation unless at least th
 PERMUTE_MAX="${PERMUTE_MAX:-2000}"        # hard cap on generated permutations to resolve
 CORS_SCAN="${CORS_SCAN:-1}"              # Corsy CORS-misconfig pass on live hosts
 PROBE_MINED="${PROBE_MINED:-1}"          # status-probe JS/source-map-mined endpoints (fold into fuzz_findings)
-PROBE_MINED_MAX="${PROBE_MINED_MAX:-150}"
+PROBE_MINED_MAX="${PROBE_MINED_MAX:-250}"
 # OWASP Top 10 / API Top 10 lightweight detectors (all GET-only, capped, non-destructive)
 OPEN_DIR_CHECK="${OPEN_DIR_CHECK:-1}"    # flag open directory listings + extract linked confidential files
 OPEN_DIR_MAX="${OPEN_DIR_MAX:-60}"

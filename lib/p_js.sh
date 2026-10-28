@@ -92,8 +92,21 @@ else
       grep -aoE '(formControlName|ng-model|v-model|data-field|name|id)="[a-zA-Z_][a-zA-Z0-9_.-]{1,39}"' "$jtmp" 2>/dev/null | sed -E 's/.*="([^"]+)".*/\1/'
       grep -aoE '[{,][[:space:]]*"[a-zA-Z_][a-zA-Z0-9_]{2,30}"[[:space:]]*:' "$jtmp" 2>/dev/null | grep -aoE '"[a-zA-Z_][a-zA-Z0-9_]{2,30}"' | tr -d '"'
     } 2>/dev/null >> "$js_fields_file"
+    # version banners for CVE mapping (httpx only sees response headers): "/*! lib vX.Y.Z */"
+    grep -aoE '[A-Za-z][A-Za-z.@/_-]{2,40} v?[0-9]+\.[0-9]+\.[0-9]+' "$jtmp" 2>/dev/null \
+      | grep -viE 'chunk|webpack|sourcemap|node_modules' | head -8 >> "${versions_file:-/dev/null}" 2>/dev/null || true
     rm -f "$jtmp"
   done < "$js_urls_file"
+  # ng-version from the root HTML + a runtime version from /metrics (both exact, both missed by httpx)
+  {
+    ranked_hosts 3 | while IFS= read -r _h; do [ -n "$_h" ] && curl -s -L --max-time 10 ${CURL_NET[@]+"${CURL_NET[@]}"} "$_h" 2>/dev/null \
+      | grep -aoiE 'ng-version="[0-9][0-9.]+"' | head -1 | sed -E 's/ng-version="/Angular:/; s/"$//'; done
+    if grep -qaiE '/metrics([^a-z]|$)' "${fuzz_findings_file:-/dev/null}" "${nuclei_file:-/dev/null}" 2>/dev/null; then
+      curl -s -L --max-time 10 ${CURL_NET[@]+"${CURL_NET[@]}"} "$(ranked_hosts 1)/metrics" 2>/dev/null \
+        | grep -aoiE '(nodejs|process|runtime|go|python)[a-z_]*version[^0-9]{0,20}v?[0-9]+\.[0-9]+\.[0-9]+' | head -3
+    fi
+  } 2>/dev/null >> "${versions_file:-/dev/null}" || true
+  [ -s "${versions_file:-/dev/null}" ] && sort -u -o "$versions_file" "$versions_file" 2>/dev/null || true
   # Rank mined field names by frequency (real fields recur across the app), drop JS-internal noise,
   # cap, and record a compact vocab line in forms_file for the agent + PoC generator.
   if [ -s "$js_fields_file" ]; then

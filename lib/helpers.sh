@@ -275,6 +275,7 @@ verify_findings() {
     [ -f "${idor_file:-}" ]   && grep -oiE 'https?://[^ |]+' "$idor_file"
     [ -f "${dast_file:-}" ]   && grep -oiE 'https?://[^ |]+' "$dast_file"
     [ -f "${nuclei_file:-}" ] && grep -oiE 'https?://[^ |]+' "$nuclei_file"
+    [ -f "${unauth_api_file:-}" ] && grep -oiE 'https?://[^ |]+' "$unauth_api_file"
   } 2>/dev/null | sort -u | head -n 60 | while IFS= read -r u; do
     [ -n "$u" ] || continue
     r1="$(curl -s -o /dev/null -w '%{http_code} %{size_download}' -L --max-time 12 ${CURL_NET[@]+"${CURL_NET[@]}"} "$u" 2>/dev/null || echo '000 0')"
@@ -337,18 +338,24 @@ stacktrace_harvest() {
 unauth_api_scan() {
   [ "${UNAUTH_API_CHECK:-1}" = 1 ] || return 0
   : > "$unauth_api_file"
-  local u resp body f
-  { [ -s "${js_endpoints_file:-/dev/null}" ] && grep -iE '/api/|/rest/' "$js_endpoints_file" 2>/dev/null
-    [ -s "${targets_active_file:-/dev/null}" ] && grep -iE '/api/|/rest/' "$targets_active_file" 2>/dev/null
-  } | awk 'NF && !seen[$0]++' | head -n "${UNAUTH_API_MAX:-40}" | while IFS= read -r u; do
+  local u resp body f sz
+  { [ -s "${js_endpoints_file:-/dev/null}" ] && grep -iE '/api/|/rest/|/admin|/config|/internal|/debug|/actuator|/env|/settings' "$js_endpoints_file" 2>/dev/null
+    [ -s "${targets_active_file:-/dev/null}" ] && grep -iE '/api/|/rest/|/admin|/config|/internal|/debug|/actuator|/env|/settings' "$targets_active_file" 2>/dev/null
+  } | awk 'NF && !seen[$0]++' | head -n "${UNAUTH_API_MAX:-60}" | while IFS= read -r u; do
     [ -n "$u" ] || continue
-    resp="$(curl -s -i -L --max-time 10 ${CURL_PROXY[@]+"${CURL_PROXY[@]}"} "$u" 2>/dev/null | head -c 12000)"
+    resp="$(curl -s -i -L --max-time 10 ${CURL_PROXY[@]+"${CURL_PROXY[@]}"} "$u" 2>/dev/null | head -c 40000)"
     printf '%s' "$resp" | head -1 | grep -qE ' 20[0-6]' || continue
     printf '%s' "$resp" | grep -qiE '^content-type:.*json' || continue
     body="$(printf '%s' "$resp" | sed -E '1,/^\r{0,1}$/d')"
-    f="$(printf '%s' "$body" | grep -aoiE '"(email|password|hash|totpSecret|role|isAdmin|cardNum|ssn|balance|apiKey|token)"' | sort -u | tr -d '"' | tr '\n' ',' | sed 's/,$//' | head -c 140)"
-    [ -n "$f" ] || continue
-    printf '[unauth-api-exposure] %s | sensitive fields: %s\n' "$u" "$f" >> "$unauth_api_file"
+    sz="$(printf '%s' "$body" | wc -c | tr -d ' ')"; [ "${sz:-0}" -gt 100 ] || continue   # ignore tiny/empty JSON
+    # Broader PII / ownership / credential key set (not just login fields).
+    f="$(printf '%s' "$body" | grep -aoiE '"(email|password|passwd|hash|totpSecret|role|isAdmin|is_admin|permissions|UserId|userId|BasketId|cardNum|creditCard|ssn|balance|wallet|apiKey|secret|secretKey|privateKey|token|jwt|smtp|dbHost)"' | sort -u | tr -d '"' | tr '\n' ',' | sed 's/,$//' | head -c 160)"
+    if [ -n "$f" ]; then
+      printf '[unauth-api-exposure] %s (%sB) | sensitive fields: %s\n' "$u" "$sz" "$f" >> "$unauth_api_file"
+    elif printf '%s' "$u" | grep -qiE '/(admin|config|configuration|internal|debug|actuator|env|users|accounts|settings)(/|\?|$)'; then
+      # Privileged route name returning a sizeable unauthenticated JSON body is itself a finding.
+      printf '[unauth-api-exposure] %s (%sB) | unauthenticated JSON on a privileged route\n' "$u" "$sz" >> "$unauth_api_file"
+    fi
   done
 }
 # A01: deterministic open-redirect confirmation via a canary (no OAST needed).
@@ -403,7 +410,9 @@ probe_mined_endpoints() {
   } 2>/dev/null \
     | grep -iE "^https?://([a-z0-9._-]+\.)?${esc_domain}([:/]|$)" \
     | grep -ivE '\.(png|jpe?g|gif|svg|woff2?|ttf|eot|css|ico|map|js)([?#]|$)' \
-    | awk 'NF && !seen[$0]++' | head -n "${PROBE_MINED_MAX:-150}" > "$infile"
+    | awk 'NF && !seen[$0]++' \
+    | awk '{ p=2; if ($0 ~ /\?|\/rest\/|\/api\/|\/graphql|\/v[0-9]+\/|\/auth|\/admin|\/user|\/account|\/config|\/internal/) p=0; print p"\t"$0 }' \
+    | sort -k1,1n -s | cut -f2- | head -n "${PROBE_MINED_MAX:-250}" > "$infile"
   [ -s "$infile" ] || { rm -f "$infile"; return 0; }
   # SPA catch-all fingerprint: a single-page app serves index.html (same status+length) for EVERY
   # unknown path, so probe one random nonexistent path first and drop any mined result matching it

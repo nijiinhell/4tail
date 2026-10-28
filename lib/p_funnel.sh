@@ -229,6 +229,12 @@ $(cat "$OUTDIR/.patterns_numbered.txt")" >"$jout" 2>>"$llm_log" || true
             [ -n "$ib" ] && body="$ib"
           fi ;;
       esac
+      # Skip the bare HTML wrapper: if the body is HTML with no spec markers (openapi/swagger/paths/
+      # __schema/swaggerDoc), it carries zero endpoints - don't waste an LLM call on it.
+      if printf '%s' "$body" | grep -qiE '<(!doctype|html|div)\b' \
+         && ! printf '%s' "$body" | grep -qiE '"(openapi|swagger|paths|__schema)"|swaggerDoc|^\s*(openapi|swagger):'; then
+        continue
+      fi
       spec_n=$((spec_n+1))
       # Extract POST/PUT/PATCH request-body field names from the OpenAPI spec into forms_file, so
       # the agent/PoC know the real body schema of write endpoints (not just GET paths). Best-effort
@@ -467,10 +473,10 @@ $(cat "$OUTDIR/.patterns_numbered.txt")" >"$jout" 2>>"$llm_log" || true
     # emit the same class dozens of times.
     [ -s "$OUTDIR/.cors_in.txt" ] && tmo 180 corsy -i "$OUTDIR/.cors_in.txt" 2>/dev/null \
       | sed -E 's/\x1b\[[0-9;]*m//g' \
-      | awk '
-          match($0,/https?:\/\/[^ ]+/){ u=substr($0,RSTART,RLENGTH); gsub(/[],")>]+$/,"",u) }
+      | awk -v def="${SEED_URL:-$domain}" '
+          match($0,/https?:\/\/[^][:space:]"'"'"'<>]+/){ u=substr($0,RSTART,RLENGTH); gsub(/[],")>]+$/,"",u) }
           /[Cc]lass[[:space:]]*:/ { c=$0; sub(/.*[Cc]lass[[:space:]]*:[[:space:]]*/,"",c); sub(/[[:space:]]+$/,"",c);
-            if (u!="" && c!="") print u "\t" c }
+            if (c!="") print (u!=""?u:def) "\t" c }
         ' \
       | grep -iE 'reflect|null origin|arbitrary|post-domain|pre-domain|trusted|credential' \
       | awk -F'\t' '{ o=$1; sub(/(https?:\/\/[^\/]+).*/,"\\1",o); k=o"|"$2; if(!s[k]++) printf "%s — %s\n",$1,$2 }' \

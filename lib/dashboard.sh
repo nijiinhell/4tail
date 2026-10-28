@@ -74,12 +74,15 @@ loot_scan() {  # file  src  mode
                txt="$(printf '%s' "$l" | grep -oE 'https?://[^ ]+' | head -1)"
                [ -n "$txt" ] || txt="$l" ;;
       ffuf)    sev=info
-               # suppress by response fingerprint: only the first hit of each
-               # (status,length) reaches the feed, so WAF noise doesn't flood it.
+               # the live feed is for ACTIONABLE hits - skip 500/404 noise (dynamic error pages /
+               # SPA catch-alls) entirely, and suppress by (status,length) fingerprint so WAF noise
+               # doesn't flood it.
+               case "$l" in 500*|404*) continue ;; esac
                fp="$(printf '%s' "$l" | awk -F'\t' '{print $1"-"$2}')"
                if [ -n "${LOOT_FP[$fp]:-}" ]; then continue; fi
                LOOT_FP[$fp]=1
                txt="$(printf '%s' "$l" | awk -F'\t' '{print $1" "$3}')" ;;
+      apiexp)  sev=high;   txt="$l" ;;
       kxss)    sev=low;    txt="$(printf '%s' "$l" | sed -E 's/ Unfiltered.*//')" ;;
       dalfox)  sev=high;   txt="$(printf '%s' "$l" | grep -oE 'https?://[^ ]+' | head -1)"; [ -n "$txt" ] || txt="$l" ;;
       sqlmap)  sev=high;   txt="$l" ;;
@@ -110,6 +113,7 @@ loot_refresh() {
   loot_scan "${bypass_file:-}"             bypass  sqlmap
   loot_scan "${idor_file:-}"               idor    sqlmap
   loot_scan "${corsy_file:-}"              cors    secret
+  loot_scan "${unauth_api_file:-}"         api-exp apiexp
 }
 
 # _draw_panel: emit the panel body at the current cursor position (no positioning).

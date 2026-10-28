@@ -30,6 +30,9 @@ seclists_match() {  # tech-token -> abs paths
 host_wordlists() {
   local techs="$1" t key rel
   [ -f "$WORDLIST" ] && printf '%s\n' "$WORDLIST"
+  # Always include SecLists common.txt so standard dirs (ftp, admin, profile, backup, assets, ...)
+  # are present alongside Bo0oM/fuzz.txt (which is a config/leak list, not a general dir list).
+  [ -n "$SECLISTS_DIR" ] && [ -f "$SECLISTS_DIR/Discovery/Web-Content/common.txt" ] && printf '%s\n' "$SECLISTS_DIR/Discovery/Web-Content/common.txt"
   # Bo0oM api-endpoints.txt (if present next to base list) for API-ish hosts
   if [ -n "$API_ENDPOINTS_EXTRA" ]; then
     case ",$techs," in *api*|*graphql*|*swagger*|*rest*|*json*) printf '%s\n' "$API_ENDPOINTS_EXTRA" ;; esac
@@ -225,14 +228,16 @@ else
     fi
     combined="$fuzz_dir/.wl_${safe}.txt"
     # authenticated fuzzing: drop logout/session-kill words so ffuf doesn't nuke the session
-    # Strip a leading slash from every word (SecLists API lists ship "/api-docs" -> would make
-    # -u "$url/FUZZ" request "$url//api-docs"). Dedupe ORDER-PRESERVING (awk, not sort -u): the
-    # high-signal base list (Bo0oM/fuzz.txt) is placed FIRST by host_wordlists, so sorting then
-    # head -n would alphabetise all ~20k words and keep only a-c, dropping /ftp, /metrics, etc.
+    # ROUND-ROBIN interleave the wordlists (not plain cat): concatenation would put ALL of the
+    # first list (Bo0oM/fuzz.txt, ~5k lines) before any SecLists word, so `head -n $hw` kept only
+    # fuzz.txt and 0 SecLists dirs. Interleaving by per-file line number (FNR) guarantees the top
+    # lines of EVERY list survive the cap. Then strip leading slash + dedupe order-preserving.
     if [ "$AVOID_LOGOUT" = 1 ] && [ "${#AUTH_H[@]}" -gt 0 ]; then
-      cat "${wls[@]}" 2>/dev/null | sed 's#^/\+##' | grep -viE "$LOGOUT_RE" | awk 'NF && !seen[$0]++' | head -n "$hw" > "$combined"
+      awk '{print FNR"\t"NR"\t"$0}' "${wls[@]}" 2>/dev/null | sort -k1,1n -k2,2n -s | cut -f3- \
+        | sed 's#^/\+##' | grep -viE "$LOGOUT_RE" | awk 'NF && !seen[$0]++' | head -n "$hw" > "$combined"
     else
-      cat "${wls[@]}" 2>/dev/null | sed 's#^/\+##' | awk 'NF && !seen[$0]++' | head -n "$hw" > "$combined"
+      awk '{print FNR"\t"NR"\t"$0}' "${wls[@]}" 2>/dev/null | sort -k1,1n -k2,2n -s | cut -f3- \
+        | sed 's#^/\+##' | awk 'NF && !seen[$0]++' | head -n "$hw" > "$combined"
     fi
     # Prepend AI-generated, org-specific words (payments-v2, partner-portal, internal, ...) that
     # no static SecLists list carries. Added AFTER the cap so they always get fuzzed (they're few).
@@ -287,6 +292,14 @@ if ls "$fuzz_dir"/*.json >/dev/null 2>&1; then
   for jf in "$fuzz_dir"/*.json; do
     jq -r '.results[]? | [(.status|tostring), (.length|tostring), .url] | @tsv' "$jf" 2>/dev/null
   done | awk -F'\t' '!seen[$3]++' > "$OUTDIR/.fuzz_raw"
+  # Drop a backup-extension variant (<base>.bak/.old/.zip/...) when it has the SAME (status,length)
+  # as <base>: route-prefix/middleware matches return the base response for every appended ext, so
+  # those aren't real backup files - just ffuf's -e multiplier hitting a catch-all route.
+  awk -F'\t' '
+    { line[NR]=$0; stv[NR]=$1; lnv[NR]=$2; uv[NR]=$3; fp[$3]=$1"|"$2 }
+    END { for(i=1;i<=NR;i++){ b=uv[i];
+            if (sub(/\.(bak|old|zip|sql|orig|save|swp|tmp|~)$/,"",b) && b!=uv[i] && (b in fp) && fp[b]==stv[i]"|"lnv[i]) continue
+            print line[i] } }' "$OUTDIR/.fuzz_raw" > "$OUTDIR/.fuzz_raw2" 2>/dev/null && mv "$OUTDIR/.fuzz_raw2" "$OUTDIR/.fuzz_raw"
   { for s in 200 302 301 307 401 403 405 500 204; do awk -F'\t' -v s="$s" '$1==s' "$OUTDIR/.fuzz_raw"; done
     awk -F'\t' '$1!~/^(200|301|302|307|401|403|405|500|204)$/' "$OUTDIR/.fuzz_raw"; } > "$fuzz_findings_file"
   rm -f "$OUTDIR/.fuzz_raw"
