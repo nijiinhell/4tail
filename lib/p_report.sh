@@ -255,7 +255,7 @@ if have jq; then
           emit_f content-discovery info ffuf "$u" "$note"
         done
     [ -f "$findings_dir/dalfox.txt" ] && while IFS= read -r l; do [ -n "$l" ] && emit_f xss high dalfox "$(nurl "$l")" "$l"; done < "$findings_dir/dalfox.txt"
-    [ -f "$findings_dir/sqlmap.txt" ] && while IFS= read -r l; do [ -n "$l" ] && emit_f sqli high sqlmap "" "$l"; done < "$findings_dir/sqlmap.txt"
+    [ -f "$findings_dir/sqlmap.txt" ] && while IFS= read -r l; do [ -n "$l" ] && emit_f sqli high sqlmap "$(nurl "$l")" "$l"; done < "$findings_dir/sqlmap.txt"
     [ -f "$js_secrets_file" ] && while IFS=$'\t' read -r u m; do [ -n "$m" ] && emit_f secret medium js-mining "$u" "$m"; done < "$js_secrets_file"
     [ -f "${sourcemap_file:-}" ] && while IFS= read -r l; do [ -n "$l" ] && emit_f source-map medium js-mining "$l" "source map exposed - original source reconstructed from $l"; done < "$sourcemap_file"
     [ -f "${takeover_file:-}" ] && while IFS= read -r l; do [ -n "$l" ] || continue

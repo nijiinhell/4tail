@@ -33,14 +33,22 @@ sanitize_tags() {  # [allowlist]  (reads tags on stdin; defaults to the widened 
 build_nuclei_tag_index() {
   [ "$NUCLEI_TAG_INDEX" = 1 ] && have nuclei && have grep || return 0
   [ -s "$nuclei_tag_index" ] && return 0   # cached (e.g. resume)
-  local tpl; tpl="$(locate_nuclei_templates)"
-  [ -n "$tpl" ] || return 0
-  grep -rhoE '^[[:space:]]*tags:[[:space:]]*.*' "$tpl" 2>/dev/null \
-    | sed -E 's/^[[:space:]]*tags:[[:space:]]*//; s/["'"'"']//g' \
-    | tr ',' '\n' | sed 's/^[[:space:]]*//; s/[[:space:]]*$//' | tr 'A-Z' 'a-z' \
-    | grep -E '^[a-z0-9._-]{2,40}$' \
-    | grep -vE '^cve-[0-9]{4}-[0-9]+$|^[0-9]{4}$' \
-    | sort -u > "$nuclei_tag_index" 2>/dev/null || true
+  # Cross-run cache: the grep below scans 10k+ template YAMLs (tens of seconds, before nuclei even
+  # starts). Reuse a copy < 7 days old from the cache dir instead of rebuilding every scan.
+  local cache="${CACHE_DIR:-$HOME/.4tail/cache}/nuclei_tags.txt"
+  if [ -s "$cache" ] && [ -z "$(find "$cache" -mtime +7 2>/dev/null)" ]; then
+    cp "$cache" "$nuclei_tag_index" 2>/dev/null || true
+  else
+    local tpl; tpl="$(locate_nuclei_templates)"
+    [ -n "$tpl" ] || return 0
+    grep -rhoE '^[[:space:]]*tags:[[:space:]]*.*' "$tpl" 2>/dev/null \
+      | sed -E 's/^[[:space:]]*tags:[[:space:]]*//; s/["'"'"']//g' \
+      | tr ',' '\n' | sed 's/^[[:space:]]*//; s/[[:space:]]*$//' | tr 'A-Z' 'a-z' \
+      | grep -E '^[a-z0-9._-]{2,40}$' \
+      | grep -vE '^cve-[0-9]{4}-[0-9]+$|^[0-9]{4}$' \
+      | sort -u > "$nuclei_tag_index" 2>/dev/null || true
+    [ -s "$nuclei_tag_index" ] && { mkdir -p "$(dirname "$cache")" 2>/dev/null; cp "$nuclei_tag_index" "$cache" 2>/dev/null || true; }
+  fi
   if [ -s "$nuclei_tag_index" ]; then
     NUCLEI_TAG_ALLOWLIST="$NUCLEI_TAG_ALLOWLIST,$(paste -sd, "$nuclei_tag_index")"
   fi

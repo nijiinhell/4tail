@@ -108,6 +108,7 @@ SEC_HEADERS_MAX="${SEC_HEADERS_MAX:-25}" # cap hosts checked for security header
 VERIFY="${VERIFY:-1}"                     # re-test each CONFIRMED finding (anti-false-positive) before reporting
 DIFF_STATE="${DIFF_STATE:-1}"            # remember each target's surface and show what changed since last run
 STATE_DIR="${STATE_DIR:-$HOME/.4tail/state}"  # where per-target snapshots live
+CACHE_DIR="${CACHE_DIR:-$HOME/.4tail/cache}"  # cross-run caches (nuclei tag index, seclists index) - saves minutes/run
 
 # --- Blueprint (strategy profile) + active-phase caps -----------------------
 # BLUEPRINT: "auto" = AI picks from blueprints/ after recon; or a name / path.

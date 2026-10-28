@@ -292,7 +292,7 @@ $situation"; printf '\n=== end head ===\n'; } >> "$agent_log" 2>/dev/null
         _isreg=0;   printf '%s' "$purl"  | grep -qiE '/(users|register|signup|sign-up|account|login|signin|authenticate|auth)(/|\?|$)' && _isreg=1
         _hasinj=0;  printf '%s' "$pbody" | grep -qiE "'|\\\$ne|\\\$gt|\\\$where|union[[:space:]]+select|<!doctype|\{\{" && _hasinj=1
         _issetup=0; printf '%s' "$pwhy" | grep -qiE 'so (next|that) round|next round|set ?up|obtain .* so|capture .* so|for .* pivot|low[- ]priv|our own|test account' && _issetup=1
-        _sqlerr=0;  [ "$pcode" = 500 ] && printf '%s' "$pbody_raw" | grep -qiE 'SQLITE_[A-Z]+|SequelizeDatabaseError|SQL syntax|ORA-[0-9]|PDOException' && _sqlerr=1
+        _sqlerr=;   [ "$pcode" = 500 ] && printf '%s' "$pbody_raw" | grep -qiE 'SQLITE_[A-Z]+|SequelizeDatabaseError|SQL syntax|ORA-[0-9]|PDOException' && _sqlerr=1   # empty, not 0: ${x:+} treats "0" as set
         _tag="[status=$pcode${_sqlerr:+, SQL-ERROR}]"
         if [ "$_haspriv" = 1 ] && printf '%s' "$pbody_raw" | grep -qiE '"role"[[:space:]]*:[[:space:]]*"admin"|"isadmin"[[:space:]]*:[[:space:]]*true|"admin"[[:space:]]*:[[:space:]]*true'; then
           case "$pcode" in 200|201) grep -qF "[CONFIRMED] [MASS-ASSIGNMENT] $purl" "$agent_file" 2>/dev/null \
@@ -306,7 +306,7 @@ $situation"; printf '\n=== end head ===\n'; } >> "$agent_log" 2>/dev/null
           _pshell=0; printf '%s' "$pbody_raw" | head -c 80 | grep -qiE '^[[:space:]]*<(!doctype|html)' \
             && ! printf '%s' "$prx" | grep -qiE 'html|doctype|<' && _pshell=1
           case "$pcode" in 4[0-9][0-9]) : ;; *) [ "$_pshell" = 1 ] || grep -qxF "$purl" "$OUTDIR/.agent_loot_urls" 2>/dev/null \
-              || grep -qF "[CONFIRMED] $pmethod $purl " "$agent_file" 2>/dev/null \
+              || { grep -F CONFIRMED "$agent_file" 2>/dev/null | grep -qF " $purl "; } \
               || printf '[CONFIRMED] %s %s %s (body: %s) | %s\n' "$pmethod" "$purl" "$_tag" "$pbody" "$pwhy" >> "$agent_file" ;; esac
         fi
         continue
@@ -338,12 +338,12 @@ $situation"; printf '\n=== end head ===\n'; } >> "$agent_log" 2>/dev/null
       if [ "$hit" = HIT ]; then
         _shell=0; printf '%s' "$gbody" | head -c 80 | grep -qiE '^[[:space:]]*<(!doctype|html)' \
           && ! printf '%s' "$rx" | grep -qiE 'html|doctype|<' && _shell=1
-        _gsql=0; [ "$gcode" = 500 ] && printf '%s' "$gbody" | grep -qiE 'SQLITE_[A-Z]+|SequelizeDatabaseError|SQL syntax|ORA-[0-9]|PDOException' && _gsql=1
+        _gsql=;  [ "$gcode" = 500 ] && printf '%s' "$gbody" | grep -qiE 'SQLITE_[A-Z]+|SequelizeDatabaseError|SQL syntax|ORA-[0-9]|PDOException' && _gsql=1   # empty, not 0: ${x:+} treats "0" as set
         _gtag="[status=$gcode${_gsql:+, SQL-ERROR}]"
         case "$gcode" in
           4[0-9][0-9]) : ;;
           *) [ "$_shell" = 1 ] || grep -qxF "$url" "$OUTDIR/.agent_loot_urls" 2>/dev/null \
-               || grep -qF "[CONFIRMED] $url " "$agent_file" 2>/dev/null \
+               || { grep -F CONFIRMED "$agent_file" 2>/dev/null | grep -qF " $url "; } \
                || printf '[CONFIRMED] %s %s | %s\n' "$url" "$_gtag" "$why" >> "$agent_file" ;;
         esac
       fi
@@ -371,7 +371,7 @@ if [ "$VERIFY" = 1 ]; then set_stage $S_TRIAGE running "verifying findings"; ver
   echo "# 4tail recon report"; echo
   echo "- **Target:** \`$domain\`"
   echo "- **Generated:** $(date -u '+%Y-%m-%d %H:%M UTC')"
-  echo "- **Subdomains:** $sub_count | **Live:** $alive_count | **Nuclei findings:** $find_count | **Fuzz hits:** $(fuzz_distinct "$fuzz_findings_file") distinct (${fuzz_hits:-0} raw)"
+  echo "- **Subdomains:** $sub_count | **Live:** $alive_count | **Nuclei findings:** $find_count | **Fuzz hits:** $(fuzz_distinct "$fuzz_findings_file") distinct ($(nlines "$fuzz_findings_file") raw)"
   [ "$JSMINE" = 1 ] && echo "- **JS mined:** $(nlines "$js_urls_file") files, $(nlines "$js_secrets_file") secret hits, $(nlines "$params_file") params, $(nlines "${js_endpoints_file:-/dev/null}") endpoints, $(nlines "${sourcemap_file:-/dev/null}") source maps recovered"
   if [ "$CRAWL" = 1 ]; then
     echo "- **Active funnel (${BLUEPRINT_NAME:-defaults}):** $(nlines "$urls_file") urls → $(nlines "$url_patterns_file") patterns → **$(nlines "$targets_active_file") juicy**"

@@ -318,7 +318,7 @@ open_dir_scan() {
     body="$(curl -s -L --max-time 10 ${CURL_NET[@]+"${CURL_NET[@]}"} "$u" 2>/dev/null | head -c 20000)"
     origin="$(printf '%s' "$u" | sed -E 's#(https?://[^/]+).*#\1#')"
     _children=""
-    if printf '%s' "$body" | grep -qiE 'Index of /|<title>Directory listing|Directory listing for|Parent Directory|\[To Parent Directory\]'; then
+    if printf '%s' "$body" | grep -qiE 'Index of /|<title>Directory listing|Directory listing for|Parent Directory|\[To Parent Directory\]|listing directory|id="?files"?|class="?view-(tiles|details)"?'; then
       # HTML autoindex: pull href filenames
       _children="$(printf '%s' "$body" | grep -aoE 'href="[^"]+"' | sed -E 's/^href="//; s/"$//')"
     elif printf '%s' "$body" | grep -qaE '^\s*\[\s*"[a-zA-Z0-9._-]+"'; then

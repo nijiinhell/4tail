@@ -57,7 +57,10 @@ else
     [ "${#KATANA_NET[@]}" -gt 0 ] && kcmd+=("${KATANA_NET[@]}")
     # authenticated crawl: never follow logout/session-kill links (would drop the session)
     [ "$AVOID_LOGOUT" = 1 ] && [ "${#AUTH_H[@]}" -gt 0 ] && kcmd+=(-cos "$LOGOUT_RE")
-    [ "$CRAWL_MAX_TIME" -gt 0 ] 2>/dev/null && have timeout && kcmd=(timeout "${CRAWL_MAX_TIME}s" "${kcmd[@]}")
+    # A single SPA host converges in <60s; the 20-min default just lets katana spin on big media /
+    # JS parsing. Trim the default to 5 min for -s (any explicit CRAWL_MAX_TIME= is still honored).
+    _crawl_cap="$CRAWL_MAX_TIME"; [ "${SINGLE:-0}" = 1 ] && [ "$CRAWL_MAX_TIME" = 1200 ] && _crawl_cap=300
+    [ "$_crawl_cap" -gt 0 ] 2>/dev/null && have timeout && kcmd=(timeout "${_crawl_cap}s" "${kcmd[@]}")
     "${kcmd[@]}" >/dev/null 2>>"$llm_log" & kpid=$!
     kstart=$SECONDS
     while kill -0 "$kpid" 2>/dev/null; do
@@ -450,8 +453,18 @@ $(cat "$OUTDIR/.patterns_numbered.txt")" >"$jout" 2>>"$llm_log" || true
       # no --smart (we feed only high-suspicion URLs) and --level=2 so parenthesis closures ') ')' are tried
       ( tmo "$SQLMAP_MAX_TIME" sqlmap -m "$sq" --batch --level=2 --risk=2 --technique=BEU \
           --output-dir="$findings_dir/sqlmap" >/dev/null 2>>"$llm_log"
-        grep -rhiE 'parameter .* is vulnerable|is injectable|Type: ' "$findings_dir/sqlmap" 2>/dev/null \
-          | sort -u > "$findings_dir/sqlmap.txt" ) & SPIDS+=($!)
+        # attach the tested URL to each finding line (sqlmap keeps it in the per-target target.txt);
+        # without it the finding lands in findings.json with an empty "url".
+        : > "$findings_dir/sqlmap.txt"
+        _sqfallback="$(head -1 "$sq" 2>/dev/null | grep -oE 'https?://[^ ]+')"
+        for _sd in "$findings_dir/sqlmap"/*/; do
+          [ -d "$_sd" ] || continue
+          _turl="$(grep -hoE 'https?://[^ )]+' "$_sd/target.txt" 2>/dev/null | head -1)"; : "${_turl:=$_sqfallback}"
+          grep -rhiE 'parameter .* is vulnerable|is injectable|Type: ' "$_sd" 2>/dev/null \
+            | sort -u | sed "s#^#${_turl}  #" >> "$findings_dir/sqlmap.txt"
+        done
+        [ -s "$findings_dir/sqlmap.txt" ] || grep -rhiE 'parameter .* is vulnerable|is injectable|Type: ' "$findings_dir/sqlmap" 2>/dev/null \
+          | sort -u | sed "s#^#${_sqfallback:+$_sqfallback  }#" > "$findings_dir/sqlmap.txt" ) & SPIDS+=($!)
     fi
   fi
   # live progress while specialists run
@@ -502,7 +515,11 @@ $(cat "$OUTDIR/.patterns_numbered.txt")" >"$jout" 2>>"$llm_log" || true
   # Final dedupe of fuzz_findings by URL: probing (/metrics twice, once by ffuf, once by the mined
   # prober - Prometheus byte-length drifts each scrape) and the [POST]/mined appends can introduce
   # same-URL duplicates. Keep the first occurrence per URL.
-  [ -s "$fuzz_findings_file" ] && awk -F'\t' '!seen[$3]++' "$fuzz_findings_file" > "$fuzz_findings_file.dd" 2>/dev/null && mv "$fuzz_findings_file.dd" "$fuzz_findings_file"
+  # Also drop 200/0B rows (empty bodies / connection resets like /ak47.php - never a real hit).
+  [ -s "$fuzz_findings_file" ] && awk -F'\t' '!($1==200 && ($2==0 || $2=="0B")) && !seen[$3]++' "$fuzz_findings_file" > "$fuzz_findings_file.dd" 2>/dev/null && mv "$fuzz_findings_file.dd" "$fuzz_findings_file"
+  # p_funnel appended mined-endpoint + detector hits after p_fuzz set fuzz_hits, so the old snapshot
+  # could read smaller than the live distinct count ("47 distinct (39 raw)"). Recompute it here.
+  fuzz_hits="$(nlines "$fuzz_findings_file")"
 
   touch "$OUTDIR/.done_crawl"
   set_stage $S_CRAWL done "$url_total urls -> $active_total active | dast:$(nlines "$dast_file") dalfox:$(nlines "$findings_dir/dalfox.txt") kxss:$(nlines "$findings_dir/kxss.txt") sqlmap:$(nlines "$findings_dir/sqlmap.txt") bypass:$(nlines "$bypass_file") prop:$(nlines "$prop_file") idor:$(nlines "$idor_file")"

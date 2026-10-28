@@ -192,8 +192,17 @@ tui_end() {
   _draw_panel                     # static dump to normal screen
 }
 
+STAGE_START=("" "" "" "" "" "" "" "" "")
 set_stage() {
+  local _prev="${ST_STATE[$1]:-}"
   ST_STATE[$1]="$2"; [ -n "${3+x}" ] && ST_DETAIL[$1]="$3"
+  # stamp the elapsed seconds on completion so the dashboard + report show exactly where time goes
+  [ "$2" = running ] && [ "$_prev" != running ] && STAGE_START[$1]=$SECONDS
+  case "$2" in done|warn|skip)
+    if [ -n "${STAGE_START[$1]:-}" ]; then
+      ST_DETAIL[$1]="${ST_DETAIL[$1]:-$2} ($((SECONDS-STAGE_START[$1]))s)"; STAGE_START[$1]=""
+    fi ;;
+  esac
   if [ "$TUI" = 1 ]; then render
   else case "$2" in done|warn|skip) log "${ST_LABEL[$1]}: ${ST_DETAIL[$1]:-$2}";; esac; fi
 }

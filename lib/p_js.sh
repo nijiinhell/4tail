@@ -271,8 +271,10 @@ else
       done
       wait "$apid" 2>/dev/null || true
       # Fallback: arjun gets rate-limited a lot and x8 can whiff - if the primary found nothing,
-      # try the other tool on this host before moving on.
-      if [ ! -s "$ptmp" ]; then
+      # try the other tool on this host before moving on. But if the primary burned most of its
+      # timeout (a slow/empty host), the fallback would just double the wait for the same zero -
+      # only fall back when the primary whiffed FAST (< half the cap), i.e. it genuinely gave up.
+      if [ ! -s "$ptmp" ] && [ "$((SECONDS-ps))" -lt "$((ARJUN_MAX_TIME/2))" ]; then
         if [ "$param_primary" = x8 ] && have arjun; then
           ST_DETAIL[$S_JS]="param discovery $pi/$ptotal (arjun fallback)"; [ "$TUI" = 1 ] && render
           tmo "$ARJUN_MAX_TIME" arjun -u "$u" -q -oT "$ptmp" 2>/dev/null || true

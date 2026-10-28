@@ -10,11 +10,19 @@
 build_seclists_index() {
   [ "$SECLISTS_DYNAMIC" = 1 ] && [ -n "$SECLISTS_DIR" ] || return 0
   [ -s "$seclists_index" ] && return 0   # already built (e.g. resume)
+  # Cross-run cache (keyed on SECLISTS_DIR so a dir change rebuilds): skip the find/basename walk.
+  local sig cache
+  sig="$(printf '%s' "$SECLISTS_DIR" | cksum 2>/dev/null | awk '{print $1}')"
+  cache="${CACHE_DIR:-$HOME/.4tail/cache}/seclists_index_${sig:-x}.tsv"
+  if [ -s "$cache" ] && [ -z "$(find "$cache" -mtime +7 2>/dev/null)" ]; then
+    cp "$cache" "$seclists_index" 2>/dev/null || true; return 0
+  fi
   local root="$SECLISTS_DIR/Discovery/Web-Content"; [ -d "$root" ] || root="$SECLISTS_DIR"
   find "$root" -maxdepth 4 -type f \( -iname '*.txt' -o -iname '*.fuzz.txt' \) 2>/dev/null \
     | grep -viE 'raft-|big\.txt|directory-list|combined_|dirbuster|/all\.txt|/common\.txt' \
     | while IFS= read -r f; do printf '%s\t%s\n' "$(basename "$f" | tr 'A-Z' 'a-z')" "$f"; done \
     > "$seclists_index" 2>/dev/null || true
+  [ -s "$seclists_index" ] && { mkdir -p "$(dirname "$cache")" 2>/dev/null; cp "$seclists_index" "$cache" 2>/dev/null || true; }
 }
 # Real SecLists files whose basename contains a tech token (specific lists only).
 seclists_match() {  # tech-token -> abs paths
