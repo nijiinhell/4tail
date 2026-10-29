@@ -347,22 +347,47 @@ $(cat "$OUTDIR/.patterns_numbered.txt")" >"$jout" 2>>"$llm_log" || true
     fi
   fi
 
-  # (D) Hidden parameters -> real test URLs in the active set.
-  # (D1) Reuse params already discovered by the -j stage (params.txt: url<TAB>param)
-  #      instead of re-running arjun, and emit a testable URL (?param=1), not a bare ?param.
+  # (D) Hidden-parameter discovery (x8 preferred, arjun fallback). Moved here from the -j JS stage:
+  #     it is slow and needs the JS-mined + fuzz-discovered surface, so it now probes the REAL
+  #     endpoints (/api/*, /rest/*, parameterless 200s) rather than the SPA's static "/" root.
+  : > "$params_file"
+  if { { [ "$PREFER_X8" = 1 ] && have x8; } || have arjun; } && [ "${ACT_MAX_ARJUN:-0}" -gt 0 ] 2>/dev/null; then
+    _pwl="${SECLISTS_DIR:+$SECLISTS_DIR/Discovery/Web-Content/burp-parameter-names.txt}"
+    PARAM_HOSTS="${PARAM_HOSTS:-20}"
+    _ptargets="$( {
+        [ -s "${js_endpoints_file:-/dev/null}" ] && grep -iE '/api/|/rest/|/graphql|\?' "$js_endpoints_file" 2>/dev/null
+        [ -s "${fuzz_findings_file:-/dev/null}" ] && awk -F'\t' '$1==200 && $2+0>0 {print $3}' "$fuzz_findings_file" 2>/dev/null
+        grep -av '?' "$targets_active_file" 2>/dev/null
+        ranked_hosts "$PARAM_HOSTS"
+      } | awk 'NF && !seen[$0]++' )"
+    _ptotal="$(printf '%s\n' "$_ptargets" | head -n "$PARAM_HOSTS" | grep -c .)"
+    _pi=0
+    while read -r _pu; do
+      [ -z "$_pu" ] && continue
+      _pi=$((_pi + 1)); [ "$_pi" -gt "$PARAM_HOSTS" ] && break
+      _pt="$(mktemp)"
+      if [ "$PREFER_X8" = 1 ] && have x8; then
+        ( tmo "$ARJUN_MAX_TIME" x8 -u "$_pu" ${_pwl:+-w "$_pwl"} -O "$_pt" 2>/dev/null ) & _pa=$!; _pp=x8
+      else
+        ( tmo "$ARJUN_MAX_TIME" arjun -u "$_pu" -q -oT "$_pt" 2>/dev/null ) & _pa=$!; _pp=arjun
+      fi
+      _ps=$SECONDS
+      while kill -0 "$_pa" 2>/dev/null; do ST_DETAIL[$S_CRAWL]="param discovery $_pi/$_ptotal ($_pp)  $((SECONDS-_ps))s"; [ "$TUI" = 1 ] && render; sleep 0.3; done
+      wait "$_pa" 2>/dev/null || true
+      # fast-whiff fallback only: don't double a full timeout on a slow/empty host
+      if [ ! -s "$_pt" ] && [ "$((SECONDS-_ps))" -lt "$((ARJUN_MAX_TIME/2))" ]; then
+        if [ "$_pp" = x8 ] && have arjun; then tmo "$ARJUN_MAX_TIME" arjun -u "$_pu" -q -oT "$_pt" 2>/dev/null || true
+        elif [ "$_pp" = arjun ] && have x8; then tmo "$ARJUN_MAX_TIME" x8 -u "$_pu" ${_pwl:+-w "$_pwl"} -O "$_pt" 2>/dev/null || true; fi
+      fi
+      [ -s "$_pt" ] && grep -oiE '[a-z0-9_.\[\]-]{1,40}' "$_pt" 2>/dev/null | awk 'length>=2 && !seen[$0]++' | sed "s#^#${_pu}\t#" >> "$params_file"
+      rm -f "$_pt"
+    done <<< "$(printf '%s\n' "$_ptargets" | head -n "$PARAM_HOSTS")"
+  fi
+  # fold discovered params into the active set as testable ?param=1 URLs
   if [ -s "${params_file:-/dev/null}" ]; then
     set_stage $S_CRAWL running "folding $(nlines "$params_file") discovered params into tests"
     awk -F'\t' 'NF>=2{sep=($1 ~ /\?/)?"&":"?"; print $1 sep $2 "=1"}' "$params_file" >> "$targets_active_file"
     sort -u -o "$targets_active_file" "$targets_active_file"
-  # (D2) else run arjun here on the juicy hosts (also emitting ?param=1, not bare ?param)
-  elif has_spec arjun && have arjun && [ "${ACT_MAX_ARJUN:-0}" -gt 0 ] 2>/dev/null && [ "$active_total" -gt 0 ]; then
-    set_stage $S_CRAWL running "arjun param discovery"
-    # Run arjun on the actual parameterless ENDPOINTS (/api/Users, /rest/basket), not on the bare
-    # host root - the old `awk -F/ '{print $1"//"$3}'` stripped every path back to http://host and
-    # re-probed the same root x8 already covered, finding nothing.
-    grep -av '?' "$targets_active_file" 2>/dev/null | sort -u | head -n "$ACT_MAX_ARJUN" \
-      | while read -r h; do [ -n "$h" ] && tmo "$ARJUN_MAX_TIME" arjun -u "$h" -q -oT /dev/stdout 2>/dev/null \
-          | sed "s#^#${h}?#; s#\$#=1#" ; done >> "$targets_active_file" 2>/dev/null || true
   fi
   # Final clean of the set that feeds every slow specialist: drop static assets, then dedupe.
   drop_static < "$targets_active_file" 2>/dev/null | sort -u > "$targets_active_file.tmp" \

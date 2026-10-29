@@ -139,6 +139,7 @@ else
   # Compact "situation" brief: the juiciest, most actionable signals only.
   situation="$( {
       echo "TARGET SCOPE: $agent_scope"
+      [ -s "${plan_hypotheses_file:-/dev/null}" ] && { echo "PLANNER PRIORITIES (the scan planner's prioritized checklist from recon - start here, confirm or refute each):"; head -8 "$plan_hypotheses_file"; }
       [ -s "${stale_file:-/dev/null}" ] && { echo "LEGACY HOSTS (older=prioritize):"; head -5 "$stale_file"; }
       [ -s "$dast_file" ] && { echo "CONFIRMED DAST (nuclei):"; head -20 "$dast_file"; }
       [ -s "$nuclei_file" ] && { echo "CONFIRMED NUCLEI (cves/exposures/misconfig/tech):"; head -20 "$nuclei_file"; }

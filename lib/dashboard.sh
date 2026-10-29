@@ -4,8 +4,9 @@
 if [ -t 1 ] && [ "$NO_TUI" != "1" ]; then TUI=1; else TUI=0; fi
 
 # Stages (named indices so the order is easy to change).
-S_SUBS=0 S_LIVE=1 S_PLAN=2 S_FUZZ=3 S_JS=4 S_CRAWL=5 S_NUCLEI=6 S_AGENT=7 S_TRIAGE=8
-ST_LABEL=("Subdomains" "Live hosts" "AI scan plan" "Fuzzing" "JS & params" "Active funnel" "Nuclei scan" "AI agent" "AI triage")
+# Indices match the recon-first execution order: JS mining now runs before the AI scan plan.
+S_SUBS=0 S_LIVE=1 S_JS=2 S_PLAN=3 S_FUZZ=4 S_CRAWL=5 S_NUCLEI=6 S_AGENT=7 S_TRIAGE=8
+ST_LABEL=("Subdomains" "Live hosts" "JS & params" "AI scan plan" "Fuzzing" "Active funnel" "Nuclei scan" "AI agent" "AI triage")
 ST_STATE=(pending pending pending pending pending pending pending pending pending)
 ST_DETAIL=("" "" "" "" "" "" "" "" "")
 SUP_NOTE=""                              # latest AI-supervisor status line

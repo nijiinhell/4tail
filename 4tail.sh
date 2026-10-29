@@ -20,8 +20,11 @@ _4T_LIB="$_4T_DIR/lib"
 # Sections, in load order. 00-prelude sets -u/pipefail and snapshots the user's
 # explicit tuning vars BEFORE config applies defaults; the rest define helpers and
 # then run the pipeline top-to-bottom (same order as the monolith).
+# Recon-first order: p_js mines the real JS/API surface BEFORE p_plan, so the AI planner
+# (and the surface digest it reads) see the SPA's endpoints/specs instead of only the httpx
+# root page, then p_fuzz and p_funnel run guided by that plan.
 _4T_MODS="00-prelude config cli dashboard helpers agent_tools blueprints ai doctor \
-          p_recon p_plan p_fuzz p_js p_funnel p_nuclei p_agent p_report"
+          p_recon p_js p_plan p_fuzz p_funnel p_nuclei p_agent p_report"
 
 # Fail clearly if a section is missing (e.g. only 4tail.sh was copied without lib/).
 for _4t_mod in $_4T_MODS; do

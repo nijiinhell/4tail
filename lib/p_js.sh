@@ -1,4 +1,5 @@
-# Step 4.5: JS & secret mining + param discovery (opt-in with -j)
+# Step 2.5 (recon-first): JS, secret & sourcemap mining (opt-in with -j). Runs BEFORE the AI scan
+# plan so the planner sees the real JS/API surface. Param discovery (x8/arjun) moved to the funnel.
 js_urls_file="$OUTDIR/js_urls.txt"
 js_secrets_file="$OUTDIR/js_secrets.txt"
 params_file="$OUTDIR/params.txt"
@@ -236,61 +237,9 @@ else
     [ "$smaps" -gt 0 ] && set_stage $S_JS running "source maps: $smaps recovered, $(nlines "$smap_endpoints_file") endpoints"
   fi
   sort -u -o "$js_secrets_file" "$js_secrets_file"
-  # 3) param discovery (arjun if available) - arjun is slow, so background each host
-  #    and keep the dashboard ticking instead of freezing.
-  : > "$params_file"
-  # Param discovery: prefer x8 (Rust, faster/accurate) when installed, else arjun. Both
-  # emit one "host<TAB>param" line per finding so downstream (params folding) is unchanged.
-  pwl="${SECLISTS_DIR:+$SECLISTS_DIR/Discovery/Web-Content/burp-parameter-names.txt}"
-  if { { [ "$PREFER_X8" = 1 ] && have x8; } || have arjun; }; then
-    PARAM_HOSTS="${PARAM_HOSTS:-20}"
-    # Probe the real API/script surface, not just the SPA's static "/" (which serves index.html
-    # and yields params:0). Prefer mined /api//rest/ endpoints + non-static 200s, then host roots.
-    param_targets="$( {
-        [ -s "${js_endpoints_file:-/dev/null}" ] && grep -iE '/api/|/rest/|/graphql|\?' "$js_endpoints_file" 2>/dev/null
-        [ -s "${fuzz_findings_file:-/dev/null}" ] && awk -F'\t' '$1==200 && $2+0>0 {print $3}' "$fuzz_findings_file" 2>/dev/null
-        printf '%s\n' "$scan_targets"
-      } | awk 'NF && !seen[$0]++' )"
-    ptotal="$(printf '%s\n' "$param_targets" | head -n "$PARAM_HOSTS" | grep -c .)"
-    pi=0
-    while read -r u; do
-      [ -z "$u" ] && continue
-      pi=$((pi + 1)); [ "$pi" -gt "$PARAM_HOSTS" ] && break
-      ptmp="$(mktemp)"
-      if [ "$PREFER_X8" = 1 ] && have x8; then
-        ( tmo "$ARJUN_MAX_TIME" x8 -u "$u" ${pwl:+-w "$pwl"} -O "$ptmp" 2>/dev/null ) & apid=$!
-        param_primary=x8
-      else
-        ( tmo "$ARJUN_MAX_TIME" arjun -u "$u" -q -oT "$ptmp" 2>/dev/null ) & apid=$!
-        param_primary=arjun
-      fi
-      ps=$SECONDS
-      while kill -0 "$apid" 2>/dev/null; do
-        ST_DETAIL[$S_JS]="param discovery $pi/$ptotal ($param_primary)  $((SECONDS-ps))s"
-        [ "$TUI" = 1 ] && render; sleep 0.3
-      done
-      wait "$apid" 2>/dev/null || true
-      # Fallback: arjun gets rate-limited a lot and x8 can whiff - if the primary found nothing,
-      # try the other tool on this host before moving on. But if the primary burned most of its
-      # timeout (a slow/empty host), the fallback would just double the wait for the same zero -
-      # only fall back when the primary whiffed FAST (< half the cap), i.e. it genuinely gave up.
-      if [ ! -s "$ptmp" ] && [ "$((SECONDS-ps))" -lt "$((ARJUN_MAX_TIME/2))" ]; then
-        if [ "$param_primary" = x8 ] && have arjun; then
-          ST_DETAIL[$S_JS]="param discovery $pi/$ptotal (arjun fallback)"; [ "$TUI" = 1 ] && render
-          tmo "$ARJUN_MAX_TIME" arjun -u "$u" -q -oT "$ptmp" 2>/dev/null || true
-        elif [ "$param_primary" = arjun ] && have x8; then
-          ST_DETAIL[$S_JS]="param discovery $pi/$ptotal (x8 fallback)"; [ "$TUI" = 1 ] && render
-          tmo "$ARJUN_MAX_TIME" x8 -u "$u" ${pwl:+-w "$pwl"} -O "$ptmp" 2>/dev/null || true
-        fi
-      fi
-      # normalise either tool's output to bare param names, prefix the host.
-      if [ -s "$ptmp" ]; then
-        grep -oiE '[a-z0-9_.\[\]-]{1,40}' "$ptmp" 2>/dev/null | awk 'length>=2 && !seen[$0]++' \
-          | sed "s#^#${u}\t#" >> "$params_file"
-      fi
-      rm -f "$ptmp"
-    done <<< "$(printf '%s\n' "$param_targets" | head -n "$PARAM_HOSTS")"
-  fi
+  # NOTE: hidden-parameter discovery (x8/arjun) moved to p_funnel's (D) block - it is slow and
+  # needs the fuzz/crawl-discovered surface, so running it here (before p_fuzz) would both slow the
+  # JS stage and miss the real endpoints. p_js is now fast static JS/sourcemap extraction only.
   # Post-JS SPA fallback: httpx fingerprinted no server tech, but JS mining found a real SPA/API
   # surface. Record it in the brief and, if the auto-blueprint only fell back to the generic
   # default, apply spa traits now (sqlmap/nuclei-dast on the /rest+/api backend, light fuzzing) -
