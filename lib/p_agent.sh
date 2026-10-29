@@ -14,6 +14,7 @@ else
   set_stage $S_AGENT running "building situation"
   agent_seen="$OUTDIR/.agent_seen"; : > "$agent_seen"; : > "$OUTDIR/.agent_loot_urls"
   agent_loot_dir="$OUTDIR/agent_loot"; agent_post_n=0
+  agent_clues_file="$OUTDIR/.agent_clues"; : > "$agent_clues_file"; agent_ledger=""
   # Harvest real <form> fields NOW (before the probe loop) so the agent's POST probes use the
   # actual login/register field names instead of guessing. (PoC gen later reuses forms_file.)
   [ "$CRAWL" = 1 ] && harvest_forms
@@ -30,6 +31,28 @@ else
     printf '[SECRET-LOOT] %s | raw response with credentials saved -> %s\n' "$1" "$f" >> "$agent_file"
     printf '%s\n' "$1" >> "$OUTDIR/.agent_loot_urls" 2>/dev/null || true   # so confirm doesn't double-log it
   }
+  # Deterministic clue harvester (NO LLM): scan a FULL response body (before the snippet is
+  # truncated) for new leads - account emails, in-scope paths/files, and tech/dependency triggers -
+  # and accumulate them (deduped, bounded) so each later round's prompt can chase what earlier
+  # responses revealed instead of forgetting it. This is what makes coverage self-expanding cheaply.
+  agent_harvest_clues() {  # $1=url  $2=body
+    [ -n "$2" ] || return 0
+    {
+      # account identifiers -> usernames to test on login / reset-password / security-question
+      printf '%s' "$2" | grep -aoiE '[a-z0-9._%+-]+@[a-z0-9.-]+\.[a-z]{2,}' | sed 's/^/email: /'
+      # new in-scope URLs + sensitive file paths referenced in the body -> candidate targets
+      printf '%s' "$2" | grep -aoE "https?://([a-z0-9._-]+\.)?${esc_domain}[a-zA-Z0-9._/?=&%:-]*" | sed 's/^/url: /'
+      printf '%s' "$2" | grep -aoE "/[a-zA-Z0-9_./-]{2,}\.(bak|old|sql|env|ya?ml|json|log|conf|cfg|pem|key|zip|tar|gz|md)" | sed 's/^/path: /'
+      # tech/dependency triggers -> injection-class hints the agent can act on next round
+      printf '%s' "$2" | grep -aoiE 'marsdb|mongodb|mongoose|\bnedb\b' | head -1 | grep -q . && echo 'hint: NoSQL backend detected -> test JSON operator bodies {"$gt":""} / {"$ne":null} on login/search endpoints'
+      printf '%s' "$2" | grep -aoiE 'libxmljs|xml2js|<!ENTITY|<!DOCTYPE[^>]*ENTITY' | head -1 | grep -q . && echo 'hint: XML parser detected -> test XXE on XML-accepting (B2B/import/upload) routes with a benign external entity'
+      printf '%s' "$2" | grep -aoiE '\b(pug|ejs|handlebars|nunjucks|jade|mustache|twig)\b' | head -1 | grep -q . && echo 'hint: server-side template engine detected -> test SSTI {{7*7}} / #{7*7} on reflected fields'
+    } 2>/dev/null | tr -d '\r' | sed -E 's/[[:cntrl:]]//g' \
+      | awk 'NF && !seen[$0]++' >> "$agent_clues_file"
+    # keep the whole clue file deduped + bounded across the run
+    [ -s "$agent_clues_file" ] && awk 'NF && !seen[$0]++' "$agent_clues_file" 2>/dev/null | tail -n 80 > "$agent_clues_file.t" \
+      && mv "$agent_clues_file.t" "$agent_clues_file"
+  }
   # curl -i responses carry the HTTP headers first; Juice Shop's headers alone are ~330 bytes, so
   # head -c 240 of the whole thing never reached the JSON body. These split headers from body
   # (last block, so -L redirects resolve) so the agent actually SEES the body (JWT, "role":"admin").
@@ -40,9 +63,17 @@ else
   # Body snippet for the LLM: small bodies in full; large ones as head + tail, so UNION-appended
   # rows at the END of a JSON array (e.g. a dumped Users table after the products) are still seen.
   _body_snip() {
-    local b="$1"
-    if [ "${#b}" -le 600 ]; then printf '%s' "$b" | tr '\n\r\t' '   ' | sed -E 's/  +/ /g' | head -c 520
-    else { printf '%s' "$b" | head -c 260; printf ' … [%sB body, tail:] ' "${#b}"; printf '%s' "$b" | tail -c 260; } | tr '\n\r\t' '   ' | sed -E 's/  +/ /g'; fi
+    local b="$1" _j
+    if [ "${#b}" -le 600 ]; then printf '%s' "$b" | tr '\n\r\t' '   ' | sed -E 's/  +/ /g' | head -c 520; return; fi
+    # Large body: if it's JSON, show its SHAPE (top-level keys, or array length + first element) so the
+    # AI sees the whole structure of a big config/list instead of a blind byte-window. Else head+tail.
+    case "$b" in
+      \{*|\[*)
+        if _j="$(printf '%s' "$b" | jq -c 'if type=="object" then {keys:(keys_unsorted),sample:(to_entries|.[0:3]|from_entries)} elif type=="array" then {array_len:length,first:(.[0])} else . end' 2>/dev/null)" && [ -n "$_j" ]; then
+          printf 'JSON shape: %s' "$(printf '%s' "$_j" | tr '\n\r\t' '   ' | head -c 500)"; return
+        fi ;;
+    esac
+    { printf '%s' "$b" | head -c 260; printf ' … [%sB body, tail:] ' "${#b}"; printf '%s' "$b" | tail -c 260; } | tr '\n\r\t' '   ' | sed -E 's/  +/ /g'
   }
   # Autonomous auth capture: when the user supplied NO session, a token/cookie the agent earns from
   # a 200/201 (register/login/leak) is captured ONCE and applied to every later probe, so it can
@@ -130,6 +161,7 @@ else
         flips="$flips"$'\n'"  $u -> $st (was 401/403)"
         body="$(_http_body "$resp")"
         agent_capture_secret "$u" "$resp"   # loot creds locally (e.g. /rest/user/authentication-details/)
+        agent_harvest_clues "$u" "$body"    # mine the flipped body for new accounts/paths/tech
         # BOLA auto-confirm: a numeric/UUID object id in the PATH, OR a UserId/ownerId in the BODY that
         # isn't the captured (low-priv) token's own id -> an unambiguous cross-user read.
         _oid="$(printf '%s' "$body" | grep -aoiE '"(userid|ownerid|user_id)"[[:space:]]*:[[:space:]]*[0-9]+' | grep -aoE '[0-9]+' | head -1)"
@@ -211,6 +243,16 @@ else
     [ "$AGENT_MAX_TIME" -gt 0 ] 2>/dev/null && [ $((SECONDS-astart)) -ge "$AGENT_MAX_TIME" ] && break
     set_stage $S_AGENT running "round $round/$AGENT_ROUNDS: AI thinking"
     aout="$(mktemp)"
+    # Cross-round memory (cheap): the live clue harvest + a compact per-probe ledger, so a lead from
+    # an earlier round survives the per-round $results wipe instead of only living in the 6-line NOTES.
+    clues_block=""; [ -s "$agent_clues_file" ] && clues_block="DISCOVERED CLUES (live; harvested from response bodies - new accounts/paths/tech to chase):
+$(tail -n 40 "$agent_clues_file")
+
+"
+    ledger_block=""; [ -n "$agent_ledger" ] && ledger_block="PAST PROBES (compact, across earlier rounds):
+$(printf '%s' "$agent_ledger" | awk 'NF' | tail -n 40)
+
+"
     # Reasoning models (GLM/DeepSeek) spend tokens on internal CoT before emitting .content;
     # too small a budget => finish_reason=length with empty content => "no probes proposed".
     ai_call "$LLM_MODEL_PLAN" "${LLM_MAX_TOKENS_PLAN:-6000}" \
@@ -235,7 +277,7 @@ DECISION: CONTINUE
 "SITUATION:
 $situation
 
-AVAILABLE TOOLS: ${agent_tools:-none}
+${clues_block}${ledger_block}AVAILABLE TOOLS: ${agent_tools:-none}
 
 YOUR NOTES SO FAR:
 $agent_notes
@@ -281,6 +323,7 @@ $situation"; printf '\n=== end head ===\n'; } >> "$agent_log" 2>/dev/null
         tr_out="$(agent_tool_run "$tname" "$ttgt" "$textra")"
         printf '[r%s] %s\n' "$round" "$tr_out" >> "$agent_log"
         results="$results"$'\n'"$tr_out"
+        agent_ledger="$agent_ledger"$'\n'"[r$round] TOOL $tname $ttgt"
         continue
       fi
       # POST probe: the agent tests a BODY-based bug itself (login/register logic, body
@@ -316,6 +359,8 @@ $situation"; printf '\n=== end head ===\n'; } >> "$agent_log" 2>/dev/null
         psnip="$(_body_snip "$pbody_red")"
         printf '[r%s] %s %-4s %s (body: %.60s)\n   why: %s\n   resp: %s | %s | %s\n' "$round" "$pmethod" "${phit:-...}" "$purl" "$pbody" "$pwhy" "$pstatus" "$pkeyh" "$psnip" >> "$agent_log"
         results="$results"$'\n'"$pmethod $purl => ${phit:-no-match} [$pstatus] ${pkeyh} ${psnip}"
+        agent_harvest_clues "$purl" "$pbody_raw"
+        agent_ledger="$agent_ledger"$'\n'"[r$round] $pmethod $purl -> ${pcode:-?}${phit:+ HIT}"
         # Classify the write: a privilege body echoed back = mass-assignment (CONFIRM); a CLEAN
         # registration/login (no privilege fields, no injection) or a self-described SETUP step is
         # NOT a finding - log it for the next round instead of stamping [CONFIRMED].
@@ -366,6 +411,8 @@ $situation"; printf '\n=== end head ===\n'; } >> "$agent_log" 2>/dev/null
       snippet="$(_body_snip "$gbody_red")"
       printf '[r%s] %-4s %s\n   why: %s\n   resp: %s | %s | %s\n' "$round" "${hit:-...}" "$url" "$why" "$local_status" "$gkeyh" "$snippet" >> "$agent_log"
       results="$results"$'\n'"$url => ${hit:-no-match} [$local_status] ${gkeyh} ${snippet}"
+      agent_harvest_clues "$url" "$gbody"
+      agent_ledger="$agent_ledger"$'\n'"[r$round] GET $url -> ${gcode:-?}${hit:+ HIT}"
       # CONFIRM only once per url; never on a 4xx rejection; and not when the regex only matched the
       # SPA catch-all HTML shell (a real data/LFI leak is not the app's index.html).
       if [ "$hit" = HIT ]; then

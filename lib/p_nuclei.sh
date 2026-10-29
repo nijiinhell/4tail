@@ -23,6 +23,7 @@ enrich_plan_from_surface() {
   case "$blob" in *'/.env'*|*'/config'*|*'/.aws'*) extra="$extra,config,exposures" ;; esac
   case "$blob" in */jenkins/*|*/gitlab/*|*/grafana/*|*/kibana/*) extra="$extra,default-login,panel" ;; esac
   case "$blob" in *'/v2/_catalog'*|*'/dockerfile'*) extra="$extra,docker,exposures" ;; esac
+  case "$blob" in *'/metrics'*) extra="$extra,prometheus,exposure" ;; esac   # observability endpoint found in recon
   printf '%s' "${extra#,}"
 }
 surface_tags="$(enrich_plan_from_surface)"
