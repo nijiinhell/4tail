@@ -1,51 +1,38 @@
-#!/bin/bash
+#!/usr/bin/env bash
+#
+# 4tail - AI-assisted recon pipeline for AUTHORIZED bug-bounty / pentest work.
+#
+# Pipeline: subfinder -> httpx (tech detect) -> [AI plans the scan]
+#           -> ffuf (content discovery) -> nuclei -> [AI triages findings].
+#
+# This is the MODULAR entrypoint: the script is split into lib/*.sh sections for
+# easier maintenance and troubleshooting, loaded here in dependency order. The
+# split is purely structural - `make build` concatenates the sections back into a
+# single-file dist/4tail.sh identical to the classic standalone script, so you can
+# still copy one file to a box.
+#
+# USE ONLY against targets you are explicitly authorised to test.
 
-# Prompt user to input new names for subdomains file and alive subdomains file
-echo "Enter new name for subdomains file (default: subdomains.txt):"
-read subdomains_file
-subdomains_file=${subdomains_file:-"subdomains.txt"}
+# Resolve the directory this script lives in, so lib/ is found regardless of CWD.
+_4T_DIR="$(cd "$(dirname "${BASH_SOURCE[0]:-$0}")" && pwd)"
+_4T_LIB="$_4T_DIR/lib"
 
-echo "Enter new name for alive subdomains file (default: alivesubdomains.txt):"
-read alive_subdomains_file
-alive_subdomains_file=${alive_subdomains_file:-"alivesubdomains.txt"}
+# Sections, in load order. 00-prelude sets -u/pipefail and snapshots the user's
+# explicit tuning vars BEFORE config applies defaults; the rest define helpers and
+# then run the pipeline top-to-bottom (same order as the monolith).
+# Recon-first order: p_js mines the real JS/API surface BEFORE p_plan, so the AI planner
+# (and the surface digest it reads) see the SPA's endpoints/specs instead of only the httpx
+# root page, then p_fuzz and p_funnel run guided by that plan.
+_4T_MODS="00-prelude config cli dashboard helpers agent_tools blueprints ai doctor \
+          p_recon p_js p_plan p_fuzz p_funnel p_nuclei p_agent p_report"
 
-domain=$1
+# Fail clearly if a section is missing (e.g. only 4tail.sh was copied without lib/).
+for _4t_mod in $_4T_MODS; do
+  if [ ! -f "$_4T_LIB/$_4t_mod.sh" ]; then
+    echo "4tail: missing section lib/$_4t_mod.sh - copy the whole repo, or use the single-file build (make build -> dist/4tail.sh)" >&2
+    exit 1
+  fi
+done
 
-# Check for required argument
-if [ -z "$domain" ]; then
-  echo "Usage: $0 <domain>"
-  exit 1
-fi
-
-# Generate the name for the alive subdomains file
-filename_without_ext="${subdomains_file%.*}"
-alive_subdomains_file="alive_$filename_without_ext.txt"
-
-# Generate the name for the fuzzing results file
-fuzzing_results_file="fuzzying_$filename_without_ext.txt"
-
-# Check for subdomains and save to a file
-subfinder -d "$domain" -o "$subdomains_file"
-
-# Check aliveness of subdomains and save alive ones to another file
-cat "$subdomains_file" | httpx | anew "$alive_subdomains_file"
-
-echo "Alive subdomains saved to $alive_subdomains_file"
-
-# Perform fuzzing on alive subdomains and save results to a file
-echo "Performing fuzzing on alive subdomains..."
-while read -r url; do
-  echo "Fuzzing: $url"
-  echo "Results for $url:" >> "$fuzzing_results_file"
-  ffuf -u "$url/FUZZ" -w /root/Desktop/tool/fuzz4bounty/fuzz4bounty/fuzz4bounty.txt -mc 200,301,401 >> "$fuzzing_results_file"
-  tail -n +1 "$fuzzing_results_file"
-done < "$alive_subdomains_file"
-
-echo "Fuzzing results saved to $fuzzing_results_file"
-
-# Perform vulnerability scanning on alive subdomains
-echo "Performing vulnerability scanning on alive subdomains..."
-nuclei -tags cves,osint,tech -l "$alive_subdomains_file" | anew nuclei_results.txt
-
-echo "Vulnerability scanning results saved to nuclei_results.txt"
-
+# shellcheck source=/dev/null
+for _4t_mod in $_4T_MODS; do . "$_4T_LIB/$_4t_mod.sh"; done

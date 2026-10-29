@@ -1,0 +1,17 @@
+{
+  "name": "deep",
+  "description": "Maximum coverage: large caps, all specialists, broad DAST. Slow and loud - use with permission/scope headroom.",
+  "focus_areas": ["idor", "sqli", "xss", "ssrf", "lfi", "redirect", "ssti", "rce", "crlf"],
+  "specialists": ["nuclei-dast", "dalfox", "kxss", "arjun", "sqlmap"],
+  "nuclei_dast_tags": "",
+  "caps": {
+    "max_juicy_urls": 250,
+    "max_dalfox": 150,
+    "max_kxss": 1000,
+    "max_sqlmap": 8,
+    "max_arjun_hosts": 60,
+    "crawl_max_urls": 20000,
+    "crawl_max_time": 2400,
+    "dast_max_urls": 4000
+  }
+}

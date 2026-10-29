@@ -1,0 +1,22 @@
+{
+  "name": "cloud_devops",
+  "description": "Infra / DevOps / cloud-native (Kubernetes, Docker, Jenkins, GitLab, Grafana, Kibana, Prometheus, Consul, Vault, Spring Boot, S3/CloudFront): config, metadata and secret exposure, default logins, SSRF-to-metadata, takeovers. Skips client-side XSS passes to spend budget on exposure.",
+  "focus_areas": ["exposure", "misconfiguration", "default-login", "takeover", "ssrf", "secrets"],
+  "specialists": ["nuclei-dast", "arjun"],
+  "nuclei_dast_tags": "ssrf,redirect",
+  "fuzzing_strategy": "light",
+  "stages": { "jsmine": 1 },
+  "nuclei": {
+    "extra_tags": "kubernetes,docker,jenkins,gitlab,grafana,kibana,prometheus,consul,vault,springboot,s3,aws,token"
+  },
+  "caps": {
+    "max_juicy_urls": 100,
+    "max_dalfox": 0,
+    "max_kxss": 0,
+    "max_sqlmap": 0,
+    "max_arjun_hosts": 20,
+    "crawl_max_urls": 8000,
+    "crawl_max_time": 1200,
+    "dast_max_urls": 1200
+  }
+}

@@ -1,0 +1,18 @@
+{
+  "name": "wordpress",
+  "description": "WordPress / CMS target: plugin CVEs, user enumeration, XSS; fuzzing tuned to CMS surface.",
+  "focus_areas": ["cve", "xss", "sqli", "lfi", "exposure"],
+  "specialists": ["nuclei-dast", "dalfox", "kxss", "sqlmap", "arjun"],
+  "nuclei_dast_tags": "xss,sqli,lfi",
+  "nuclei": { "extra_tags": "wordpress,wp-plugin,wp-theme" },
+  "caps": {
+    "max_juicy_urls": 80,
+    "max_dalfox": 60,
+    "max_kxss": 400,
+    "max_sqlmap": 2,
+    "max_arjun_hosts": 15,
+    "crawl_max_urls": 6000,
+    "crawl_max_time": 900,
+    "dast_max_urls": 1000
+  }
+}

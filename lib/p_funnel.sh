@@ -1,0 +1,552 @@
+# Step 4.7: ACTIVE FUNNEL (-C): crawl (broad/passive) -> cluster -> AI picks juicy URLs
+# -> dispatch paired specialists (parallel, capped) -> merge. The "bug-hunter brain".
+has_spec() { case ",$ACT_SPECIALISTS," in *",$1,"*) return 0;; *) return 1;; esac; }
+# Deterministic URL clustering: collapse ids/uuids/hashes/values so 5000 URLs -> ~N patterns.
+cluster_urls() {  # stdin: urls -> stdout: pattern<TAB>example-url
+  local u p base q
+  while IFS= read -r u; do
+    [ -z "$u" ] && continue
+    base="${u%%\?*}"; q=""; case "$u" in *\?*) q="${u#*\?}" ;; esac
+    # collapse ID-ish path segments so N product/user pages become one pattern (not N).
+    base="$(printf '%s' "$base" \
+      | sed -E 's#/[0-9a-fA-F]{8}-[0-9a-fA-F-]{20,}#/{uuid}#g' \
+      | sed -E 's#/[0-9]+(/|$)#/{id}\1#g' \
+      | sed -E 's#/[0-9a-fA-F]{24}(/|$)#/{objectid}\1#g' \
+      | sed -E 's#/[0-9a-fA-F]{12,}(/|$)#/{hash}\1#g' \
+      | sed -E 's#/[A-Za-z0-9_-]{16,}(/|$)#/{token}\1#g' \
+      | sed -E 's#/[A-Za-z0-9]+-[A-Za-z0-9-]{6,}(/|$)#/{slug}\1#g')"
+    # normalize the query: sort params by name and blank values, so ?a=1&b=2 and ?b=9&a=5
+    # (and value variants) cluster to one pattern keyed on the param SET.
+    if [ -n "$q" ]; then
+      q="$(printf '%s' "$q" | tr '&' '\n' | sed -E 's#=.*#={v}#' | sort -u | paste -sd'&' -)"
+      p="$base?$q"
+    else
+      p="$base"
+    fi
+    printf '%s\t%s\n' "$p" "$u"
+  done
+}
+
+if [ "$CRAWL" != 1 ]; then
+  set_stage $S_CRAWL skip "off (-C to enable)"
+elif done_marker crawl && [ -f "$targets_active_file" ]; then
+  set_stage $S_CRAWL done "$(nlines "$urls_file") urls, $(nlines "$targets_active_file") active, $(nlines "$dast_file") dast (resumed)"
+else
+  set_stage $S_CRAWL running "collecting URLs"
+  : > "$urls_file"
+  # (A) Broad / passive URL collection - WAF-safe. Run ALL available sources and UNION them
+  # (waymore adds commoncrawl+alienvault+urlscan, but gau/waybackurls often surface URLs it
+  # misses) - more coverage, deduped later anyway.
+  [ "$NO_ARCHIVE" != 1 ] && have gau         && { printf '%s\n' "$domain" | tmo "$GAU_MAX_TIME" gau --subs 2>>"$llm_log" >> "$urls_file" || true; }
+  [ "$NO_ARCHIVE" != 1 ] && have waybackurls && { printf '%s\n' "$domain" | tmo "$GAU_MAX_TIME" waybackurls 2>>"$llm_log" >> "$urls_file" || true; }
+  if [ "$NO_ARCHIVE" != 1 ] && [ "$USE_WAYMORE" = 1 ] && have waymore; then
+    set_stage $S_CRAWL running "waymore: aggregating more sources"
+    tmo "$((GAU_MAX_TIME*2))" waymore -i "$domain" -mode U -oU "$OUTDIR/.waymore.txt" >/dev/null 2>>"$llm_log" || true
+    [ -f "$OUTDIR/.waymore.txt" ] && cat "$OUTDIR/.waymore.txt" >> "$urls_file"; rm -f "$OUTDIR/.waymore.txt"
+  fi
+  if have katana; then
+    set_stage $S_CRAWL running "katana crawling…"
+    # Seed katana with the live hosts PLUS ffuf's 200 hits, so it crawls INSIDE unlinked
+    # directories discovery found (/ftp, /api-docs, ...) instead of only the root pages.
+    katana_seed="$OUTDIR/.katana_seed.txt"
+    { cat "$alive_file" 2>/dev/null
+      [ -s "${fuzz_findings_file:-/dev/null}" ] && awk -F'\t' '$1==200 {print $3}' "$fuzz_findings_file" 2>/dev/null
+    } | awk 'NF && !seen[$0]++' | head -n 500 > "$katana_seed"
+    [ -s "$katana_seed" ] || cp "$alive_file" "$katana_seed" 2>/dev/null
+    kcmd=(katana -silent -list "$katana_seed" -d 2 -jc -kf all -c 15 -ef png,jpg,jpeg,gif,svg,ico,webp,woff,woff2,ttf,eot,otf,css,mp4,mp3,pdf,zip -o "$OUTDIR/.katana.txt")
+    [ "${#KATANA_NET[@]}" -gt 0 ] && kcmd+=("${KATANA_NET[@]}")
+    # authenticated crawl: never follow logout/session-kill links (would drop the session)
+    [ "$AVOID_LOGOUT" = 1 ] && [ "${#AUTH_H[@]}" -gt 0 ] && kcmd+=(-cos "$LOGOUT_RE")
+    # A single SPA host converges in <60s; the 20-min default just lets katana spin on big media /
+    # JS parsing. Trim the default to 5 min for -s (any explicit CRAWL_MAX_TIME= is still honored).
+    _crawl_cap="$CRAWL_MAX_TIME"; [ "${SINGLE:-0}" = 1 ] && [ "$CRAWL_MAX_TIME" = 1200 ] && _crawl_cap=300
+    [ "$_crawl_cap" -gt 0 ] 2>/dev/null && have timeout && kcmd=(timeout "${_crawl_cap}s" "${kcmd[@]}")
+    "${kcmd[@]}" >/dev/null 2>>"$llm_log" & kpid=$!
+    kstart=$SECONDS
+    while kill -0 "$kpid" 2>/dev/null; do
+      ST_DETAIL[$S_CRAWL]="katana crawling… $(nlines "$OUTDIR/.katana.txt") urls · $((SECONDS-kstart))s"; render; sleep 1
+    done
+    wait "$kpid" 2>/dev/null || true
+    [ -f "$OUTDIR/.katana.txt" ] && cat "$OUTDIR/.katana.txt" >> "$urls_file" && rm -f "$OUTDIR/.katana.txt"
+    rm -f "$katana_seed"
+  fi
+  # fold in content-discovery hits so crawling/API-spec detection/param-mining also see paths
+  # only ffuf/feroxbuster found (/v2/api-docs, /admin, /api/users, ...).
+  [ -s "${fuzz_findings_file:-/dev/null}" ] && awk -F'\t' '$1 ~ /^(200|204|301|302|307|401|403)$/ {print $3}' "$fuzz_findings_file" 2>/dev/null >> "$urls_file"
+  # Deep-JS: katana + archives surface .js bundles the pre-funnel JS stage (root-scrape only)
+  # missed. Mine a bounded set of NEW ones for secrets + endpoints before drop_static discards them.
+  if [ "$JSMINE" = 1 ] && [ -f "${js_urls_file:-/dev/null}" ]; then
+    deep_js="$(grep -aoiE "https?://([a-z0-9._-]+\.)?${esc_domain}[^ \"'\`]*\.js([?][^ \"'\`]*)?" "$urls_file" 2>/dev/null | sort -u | grep -vxF -f "$js_urls_file" 2>/dev/null | head -n "${DEEP_JS_MAX:-60}")"
+    while IFS= read -r dj; do
+      [ -n "$dj" ] || continue
+      jb="$(curl -s -L --max-time 12 ${CURL_NET[@]+"${CURL_NET[@]}"} "$dj" 2>/dev/null)"; [ -n "$jb" ] || continue
+      printf '%s' "$jb" | grep -aoE "$SECRET_RE" 2>/dev/null | sort -u | sed "s#^#${dj}\t#" >> "$js_secrets_file"
+      jorg="$(printf '%s' "$dj" | sed -E 's#(https?://[^/]+).*#\1#')"
+      { grep -aoiE "https?://([a-z0-9._-]+\.)?${esc_domain}[a-z0-9._/?=&%:-]*" <<<"$jb"
+        grep -aoE "[\"'\`]/[a-zA-Z0-9_./?=&%-]{2,}[\"'\`]" <<<"$jb" | tr -d "\"'\`" | sed "s#^#${jorg}#"
+        grep -aoE "[\"'\`](rest|api|graphql|v[0-9]+)/[a-zA-Z0-9_./?=&%-]{2,}[\"'\`]" <<<"$jb" | tr -d "\"'\`" | sed "s#^#${jorg}/#"
+      } 2>/dev/null >> "$js_endpoints_file"
+      # source map for this newly found bundle (Juice Shop & most SPAs ship .js.map): the
+      # readable original source leaks endpoints + the secrets minification hid. Mine its
+      # sourcesContent directly (no file reconstruction needed here).
+      if [ "$SOURCEMAPS" = 1 ] && have jq; then
+        mb="$(curl -s -L --max-time 12 ${CURL_NET[@]+"${CURL_NET[@]}"} "${dj%%\?*}.map" 2>/dev/null | head -c 8000000)"
+        if printf '%s' "$mb" | jq -e '.sourcesContent | length > 0' >/dev/null 2>&1; then
+          printf '%s\n' "${dj%%\?*}.map" >> "${sourcemap_file:-/dev/null}"
+          msrc="$(printf '%s' "$mb" | jq -r '.sourcesContent[]? // empty' 2>/dev/null)"
+          printf '%s' "$msrc" | grep -aoE "$SECRET_RE" 2>/dev/null | sort -u | sed "s#^#sourcemap:${dj}\t#" >> "$js_secrets_file"
+          printf '%s' "$msrc" | grep -aoiE "https?://([a-z0-9._-]+\.)?${esc_domain}[a-z0-9._/?=&%:-]*" 2>/dev/null >> "${smap_endpoints_file:-/dev/null}"
+        fi
+      fi
+      printf '%s\n' "$dj" >> "$js_urls_file"
+    done <<< "$deep_js"
+    sort -u -o "$js_secrets_file" "$js_secrets_file"
+    [ -s "${sourcemap_file:-/dev/null}" ] && sort -u -o "$sourcemap_file" "$sourcemap_file"
+    [ -s "${smap_endpoints_file:-/dev/null}" ] && sort -u -o "$smap_endpoints_file" "$smap_endpoints_file"
+    [ -s "$js_endpoints_file" ] && grep -ivE '\.(png|jpe?g|gif|svg|woff2?|ttf|eot|css|ico|map)([?#]|$)' "$js_endpoints_file" | grep -vE '^https?://[^/]+(/[0-9]+)+/?(\?|$)' | sed -E '/\?/ s/=(&|$)/=1\1/g' | sort -u > "$js_endpoints_file.t" && mv "$js_endpoints_file.t" "$js_endpoints_file"
+    # keep the JS dashboard row in sync with what the deep re-mine added (was frozen at the
+    # pre-funnel count, so the TUI showed "0 secret hits" while the tally said js-secrets:N).
+    set_stage $S_JS done "$(nlines "$js_urls_file") JS, $(nlines "$js_secrets_file") secret hits, $(nlines "${sourcemap_file:-/dev/null}") maps"
+  fi
+  # fold in endpoints mined from source maps + JS bundles (SPA API surface); scoped+deduped below
+  [ -s "${smap_endpoints_file:-/dev/null}" ] && cat "$smap_endpoints_file" >> "$urls_file"
+  [ -s "${js_endpoints_file:-/dev/null}" ] && cat "$js_endpoints_file" >> "$urls_file"
+  grep -iE "^https?://([a-z0-9._-]+\.)?${esc_domain}([:/]|$)" "$urls_file" 2>/dev/null \
+    | sort -u | head -n "$CRAWL_MAX_URLS" > "$urls_file.tmp" && mv "$urls_file.tmp" "$urls_file"
+  # authenticated: strip logout/session-kill URLs so no downstream stage fetches them
+  if [ "$AVOID_LOGOUT" = 1 ] && [ "${#AUTH_H[@]}" -gt 0 ]; then
+    grep -viE "$LOGOUT_RE" "$urls_file" > "$urls_file.tmp" 2>/dev/null && mv "$urls_file.tmp" "$urls_file"
+  fi
+  # Only URLs with a real ?k=v, and NOT static assets - so clustering, AI selection and
+  # every downstream specialist work on genuine injectable endpoints.
+  grep -E '\?[^=]+=' "$urls_file" 2>/dev/null | drop_static | sort -u > "$urls_params_file" || : > "$urls_params_file"
+  url_total="$(nlines "$urls_file")"; param_total="$(nlines "$urls_params_file")"
+
+  # (B) Cluster parametered URLs into endpoint patterns (one exemplar per pattern).
+  set_stage $S_CRAWL running "clustering $param_total param-urls"
+  cluster_urls < "$urls_params_file" | awk -F'\t' '!seen[$1]++' > "$OUTDIR/.patterns.tsv"
+  cut -f1 "$OUTDIR/.patterns.tsv" > "$url_patterns_file"
+  pattern_total="$(nlines "$url_patterns_file")"
+
+  # (C) AI "juicy" funnel: cheap model picks the most promising patterns; expand to real
+  # URLs (capped ACT_MAX_JUICY). Falls back to all param exemplars when AI is off.
+  : > "$targets_active_file"
+  if [ "$AI_ENABLED" = 1 ] && budget_ok && [ "$pattern_total" -gt 0 ]; then
+    set_stage $S_CRAWL running "AI selecting juicy endpoints ($pattern_total patterns)"
+    nl -ba -w1 -s') ' "$url_patterns_file" | head -n 600 > "$OUTDIR/.patterns_numbered.txt"
+    # Surface the legacy ranking so the model prefers URLs on older/outdated hosts.
+    stale_hint=""
+    [ "$STALE_RANK" = 1 ] && [ -s "${stale_file:-/dev/null}" ] && \
+      stale_hint=" These hosts look the most legacy/outdated (older stack = higher bug likelihood, prioritize their URLs): $(awk -F'\t' '{printf "%s(%s) ",$2,$3}' "$stale_file" | head -c 500)."
+    jout="$(mktemp)"
+    ai_call "$LLM_MODEL_PLAN" 1500 \
+      "You are an expert bug-bounty hunter. From the numbered endpoint patterns, select the ones MOST likely to hold IDOR, SQLi, XSS, SSRF, LFI, open-redirect or logic flaws, given the focus areas: $ACT_FOCUS.${stale_hint} Use the TECH SURFACE below to prefer endpoints that fit the stack (e.g. .asp/.aspx on IIS, /wp-json on WordPress, /api + json on a REST/SPA backend). Ignore static assets (js/css/img/fonts), analytics, and generic CMS noise. Reply with ONLY a comma-separated list of the numbers you pick (max $ACT_MAX_JUICY), nothing else." \
+      "=== TECH SURFACE ===
+$(head -c 2000 "$tech_brief" 2>/dev/null)
+
+=== NUMBERED ENDPOINT PATTERNS ===
+$(cat "$OUTDIR/.patterns_numbered.txt")" >"$jout" 2>>"$llm_log" || true
+    # parse chosen line numbers -> exemplar URLs
+    sel="$(grep -oE '[0-9]+' "$jout" | sort -un | head -n "$ACT_MAX_JUICY")"; rm -f "$jout"
+    if [ -n "$sel" ]; then
+      while read -r n; do sed -n "${n}p" "$OUTDIR/.patterns.tsv" | cut -f2; done <<< "$sel" >> "$targets_active_file"
+    fi
+  fi
+  # fallback / augment: if AI gave nothing, use all param exemplars (capped)
+  [ -s "$targets_active_file" ] || cut -f2 "$OUTDIR/.patterns.tsv" | head -n "$ACT_MAX_JUICY" > "$targets_active_file"
+  # Path-only API/accessor endpoints have no ?k=v so the param clustering above dropped them -
+  # but REST/SPA bugs (BOLA, authz, injection in path segments) live there. Fold a bounded set
+  # of non-static api/rest/versioned/object-accessor paths straight into the active set so
+  # nuclei-dast, the agent and idor_check actually reach them.
+  grep -hiE 'https?://[^ "]+/(api|rest|graphql|v[0-9]+|users?|accounts?|orders?|invoices?|baskets?|carts?|products?|customers?|documents?|files?|messages?|tickets?|admin|internal|me|profile|billing|settings)([/?][^ "]*)?' "$urls_file" 2>/dev/null \
+    | grep -vE '\?[^=]+=' | drop_static | sort -u | head -n "$ACT_MAX_JUICY" >> "$targets_active_file"
+  # Endpoints mined from LIVE JS bundles + source maps are high-signal (the app's own API) -
+  # guarantee a bounded set is tested even if the AI selector didn't pick them from the flat
+  # pattern list (Wayback noise can crowd them out).
+  { [ -s "${js_endpoints_file:-/dev/null}" ] && cut -f2 <(cluster_urls < "$js_endpoints_file") 2>/dev/null | sort -u | head -n 40
+    [ -s "${smap_endpoints_file:-/dev/null}" ] && cut -f2 <(cluster_urls < "$smap_endpoints_file") 2>/dev/null | sort -u | head -n 40
+  } 2>/dev/null | drop_static >> "$targets_active_file"
+  sort -u -o "$targets_active_file" "$targets_active_file"
+  rm -f "$OUTDIR/.patterns_numbered.txt"
+  active_total="$(nlines "$targets_active_file")"
+
+  # (C2) API specs: find Swagger/OpenAPI/GraphQL, let the AI turn each spec into concrete
+  # test requests, and fold them into the active set. APIs are where IDOR/authz/logic bugs
+  # live and plain crawling misses them (undocumented params, methods, versioned paths).
+  : > "$api_specs_file"; : > "$api_tests_file"
+  if [ "$API_SPECS" = 1 ]; then
+    set_stage $S_CRAWL running "probing for API specs (swagger/openapi/graphql)"
+    # (a) specs already seen in collected URLs
+    grep -iE '(swagger|openapi|api-docs|v[0-9]+/api-docs|/graphql|/graphiql|apispec|/\.well-known/(openid-configuration|oauth-authorization-server|openapi|swagger))' \
+      "$urls_file" 2>/dev/null | grep -iE 'https?://' | sort -u >> "$api_specs_file" || true
+    # (b) probe common spec paths on each live host (capped, auth-aware)
+    api_probe_paths=(/swagger.json /swagger/v1/swagger.json /openapi.json /v2/api-docs /v3/api-docs \
+                     /api-docs /api/swagger.json /api/openapi.json /swagger-ui/index.html /graphql /api/graphql \
+                     /api-docs/swagger-ui-init.js /swagger-ui-init.js)   # Express/Node Swagger UI embeds the spec JSON here
+    while IFS= read -r h; do
+      [ -n "$h" ] || continue
+      base="${h%/}"
+      for p in "${api_probe_paths[@]}"; do
+        u="$base$p"
+        resp="$(curl -s -L --max-time 10 ${CURL_NET[@]+"${CURL_NET[@]}"} \
+                 -w $'\n4TSTAT %{http_code} %{content_type}' "$u" 2>/dev/null)"
+        code="$(printf '%s' "$resp" | tail -1 | awk '{print $2}')"
+        ctype="$(printf '%s' "$resp" | tail -1 | cut -d' ' -f3-)"
+        body="$(printf '%s' "$resp" | sed '$d' | head -c 400)"
+        case "$code" in
+          401|403) printf '%s\n' "$u" >> "$api_specs_file" ;;   # exists-but-protected is a real signal
+          200)
+            # Only a real spec: JSON/YAML/GraphQL by content-type OR body shape. Guards against
+            # SPA/catch-all hosts that serve index.html (200) for every unknown path.
+            if printf '%s' "$ctype" | grep -qiE 'json|yaml|graphql|javascript' \
+               || printf '%s' "$body" | grep -qiE '^\s*[{[]|"(openapi|swagger|paths|__schema)"|^\s*(openapi|swagger):'; then
+              printf '%s\n' "$u" >> "$api_specs_file"
+            fi ;;
+        esac
+      done
+    done < <(ranked_hosts 20)
+    # collapse accidental double slashes (ffuf emits http://host//api-docs) before dedup, so the
+    # HTML wrapper and its canonical URL don't both count as separate specs.
+    sed -E 's#([^:])//+#\1/#g' "$api_specs_file" 2>/dev/null | sort -u > "$api_specs_file.tmp" && mv "$api_specs_file.tmp" "$api_specs_file"
+
+    # (c) fetch each spec and let the AI generate targeted test URLs
+    spec_n=0
+    while IFS= read -r spec; do
+      [ -n "$spec" ] || continue
+      [ "$spec_n" -ge "$API_MAX_SPECS" ] && break
+      body="$(curl -s -L --max-time 15 ${CURL_NET[@]+"${CURL_NET[@]}"} "$spec" 2>/dev/null \
+               | head -c 60000)"
+      [ -n "$body" ] || continue
+      # swagger-ui-express serves an HTML wrapper at /api-docs that only <script src>s the real
+      # spec from swagger-ui-init.js (embedded swaggerDoc JSON). Follow it so the AI sees endpoints.
+      case "$body" in
+        *swagger-ui-init.js*|*swagger-initializer.js*)
+          initref="$(printf '%s' "$body" | grep -aoiE '[a-z0-9._/-]*swagger-(ui-init|initializer)\.js' | head -1)"
+          case "$initref" in
+            http*) : ;;
+            /*) initref="$(printf '%s' "$spec" | sed -E 's#(https?://[^/]+).*#\1#')$initref" ;;
+            ?*) initref="${spec%/*}/$initref" ;;
+          esac
+          if [ -n "$initref" ]; then
+            ib="$(curl -s -L --max-time 15 ${CURL_NET[@]+"${CURL_NET[@]}"} "$initref" 2>/dev/null | head -c 60000)"
+            [ -n "$ib" ] && body="$ib"
+          fi ;;
+      esac
+      # Skip the bare HTML wrapper: if the body is HTML with no spec markers (openapi/swagger/paths/
+      # __schema/swaggerDoc), it carries zero endpoints - don't waste an LLM call on it.
+      if printf '%s' "$body" | grep -qiE '<(!doctype|html|div)\b' \
+         && ! printf '%s' "$body" | grep -qiE '"(openapi|swagger|paths|__schema)"|swaggerDoc|^\s*(openapi|swagger):'; then
+        continue
+      fi
+      spec_n=$((spec_n+1))
+      # Extract POST/PUT/PATCH request-body field names from the OpenAPI spec into forms_file, so
+      # the agent/PoC know the real body schema of write endpoints (not just GET paths). Best-effort
+      # jq over OpenAPI 3 inline schemas; failures are silent.
+      if have jq; then
+        printf '%s' "$body" | jq -r '
+          (.paths // {}) | to_entries[] | .key as $p | (.value // {}) | to_entries[]
+          | select(.key|test("^(post|put|patch)$";"i")) | .key as $m
+          | ((.value.requestBody.content // {}) | to_entries[]?.value.schema.properties? // (.value.parameters // [] | map(select(.in=="body")) | .[0].schema.properties?) // {})
+          | if (type=="object") then (keys | join(",")) else empty end
+          | select(length>0) | "\($p)\t\($m|ascii_upcase)\tapi-spec\t\(.)"' 2>/dev/null \
+          >> "${forms_file:-/dev/null}" || true
+      fi
+      set_stage $S_CRAWL running "AI building API tests from spec $spec_n/$API_MAX_SPECS"
+      if [ "$AI_ENABLED" = 1 ] && budget_ok; then
+        aout="$(mktemp)"
+        ai_call "$LLM_MODEL_PLAN" 2000 \
+          "You are an API security tester. Below is an API spec (OpenAPI/Swagger JSON/YAML, or a GraphQL/GraphiQL page) fetched from $spec. Build concrete HTTP GET test URLs (absolute, same origin) ONLY for operations the spec defines as HTTP GET - exercise IDOR/broken-authz/SQLi/SSRF: substitute realistic probe values for path/query params (ids=1, user=1, q=test', url=http://169.254.169.254/, file=/etc/passwd as appropriate). CRITICAL: do NOT invent GET ?query= URLs for POST/PUT/PATCH/DELETE-only paths (their body fields are tested separately) - skip those paths entirely. Only GET-able URLs, one per line, no commentary, no markdown, max $API_MAX_TESTS lines." \
+          "$body" >"$aout" 2>>"$llm_log" || true
+        grep -oE 'https?://[^ "'"'"'`<>]+' "$aout" 2>/dev/null \
+          | grep -iE "^https?://([a-z0-9._-]+\.)?${esc_domain}([:/]|$)" \
+          >> "$api_tests_file" || true
+        rm -f "$aout"
+      fi
+    done < "$api_specs_file"
+
+    if [ -s "$api_tests_file" ]; then
+      sort -u "$api_tests_file" | head -n "$API_MAX_TESTS" > "$api_tests_file.tmp" && mv "$api_tests_file.tmp" "$api_tests_file"
+      cat "$api_tests_file" >> "$targets_active_file"
+      sort -u -o "$targets_active_file" "$targets_active_file"
+      active_total="$(nlines "$targets_active_file")"
+    fi
+    set_stage $S_CRAWL running "api specs: $(nlines "$api_specs_file") found, $(nlines "$api_tests_file") tests built"
+
+    # (C2.5) GraphQL introspection: if a /graphql endpoint answers an introspection query,
+    # the whole schema (types, fields, args) is readable - the single highest-signal GraphQL
+    # find, since it hands you the full attack surface for IDOR/authz/injection. Done with a
+    # GET introspection query (read-only, no mutation) to stay within the GET-only invariant;
+    # servers that only accept POST simply won't introspect, which is the safe tradeoff.
+    : > "$gql_schema_file"
+    gql_q='{__schema{queryType{name}mutationType{name}types{name kind fields{name args{name}}}}}'
+    gql_n=0
+    gql_endpoints="$(grep -iE 'https?://[^ ]*/(graphql|graphiql|api/graphql|v[0-9]+/graphql)([?/]|$)' \
+                      "$api_specs_file" 2>/dev/null | sort -u)"
+    while IFS= read -r gql; do
+      [ -n "$gql" ] || continue
+      [ "$gql_n" -ge "${GRAPHQL_MAX:-5}" ] && break
+      gql_n=$((gql_n+1))
+      set_stage $S_CRAWL running "graphql introspection $gql_n ($gql)"
+      # Try GET first (read-only), then fall back to a POST with a JSON body - most modern
+      # GraphQL servers (Apollo v4, Yoga, Hasura, HotChocolate) disable GET and only answer
+      # introspection on a standard POST. The POST body is a query (no mutation), still safe.
+      gresp="$(curl -s -G --max-time 12 ${CURL_NET[@]+"${CURL_NET[@]}"} \
+                 -H 'Content-Type: application/json' \
+                 --data-urlencode "query=$gql_q" "$gql" 2>/dev/null | head -c 400000)"
+      if ! printf '%s' "$gresp" | jq -e '.data.__schema.types | length > 0' >/dev/null 2>&1; then
+        gresp="$(curl -s -X POST --max-time 12 ${CURL_NET[@]+"${CURL_NET[@]}"} \
+                   -H 'Content-Type: application/json' \
+                   --data "$(jq -nc --arg q "$gql_q" '{query:$q}')" "$gql" 2>/dev/null | head -c 400000)"
+      fi
+      # introspection is OPEN only if the server actually returned a __schema with its types
+      printf '%s' "$gresp" | jq -e '.data.__schema.types | length > 0' >/dev/null 2>&1 || continue
+      {
+        echo "== GraphQL introspection OPEN: $gql =="
+        printf '%s' "$gresp" | jq -r '
+          .data.__schema as $s
+          | "queryType: \($s.queryType.name // "-")   mutationType: \($s.mutationType.name // "-")",
+            ( $s.types[]
+              | select(.name | test("^__") | not)
+              | select(.fields != null and (.fields | length > 0))
+              | "type \(.name) {" ,
+                ( .fields[] | "  \(.name)(\((.args // []) | map(.name) | join(", ")))" ),
+                "}" )' 2>/dev/null
+        echo
+      } >> "$gql_schema_file"
+      # Let the AI turn the live schema into concrete GET query-probes folded into the active set.
+      if [ "$AI_ENABLED" = 1 ] && budget_ok; then
+        gout="$(mktemp)"
+        ai_call "$LLM_MODEL_PLAN" 1500 \
+          "GraphQL introspection is OPEN at $gql. Below is the dumped schema. Build concrete HTTP GET probe URLs of the form ${gql}?query=<url-unencoded graphql query> that exercise the riskiest query fields for IDOR/broken-authz (fetch objects by id=1), injection (string args = test'), and SSRF (url/uri args = http://169.254.169.254/). Keep queries minimal and same-origin. One URL per line, no commentary, no markdown, max 20 lines." \
+          "$(head -c 20000 "$gql_schema_file")" >"$gout" 2>>"$llm_log" || true
+        grep -oE 'https?://[^ "'"'"'`<>]+' "$gout" 2>/dev/null \
+          | grep -iE "^https?://([a-z0-9._-]+\.)?${esc_domain}([:/]|$)" \
+          >> "$api_tests_file" || true
+        rm -f "$gout"
+      fi
+    done <<< "$gql_endpoints"
+    if [ -s "$api_tests_file" ]; then   # re-fold (AI may have added GraphQL query probes)
+      sort -u "$api_tests_file" | head -n "$API_MAX_TESTS" > "$api_tests_file.tmp" && mv "$api_tests_file.tmp" "$api_tests_file"
+      cat "$api_tests_file" >> "$targets_active_file"; sort -u -o "$targets_active_file" "$targets_active_file"
+      active_total="$(nlines "$targets_active_file")"
+    fi
+    [ -s "$gql_schema_file" ] && set_stage $S_CRAWL running "graphql: introspection OPEN on $(grep -c 'introspection OPEN' "$gql_schema_file") endpoint(s)"
+  fi
+
+  # (C3) kiterunner: API-route discovery with API-specific wordlists + route prediction -
+  # finds /api/v1/users/{id}/roles style endpoints ffuf can't guess. Routes feed the active set.
+  if [ "$USE_KITERUNNER" = 1 ] && have kr; then
+    set_stage $S_CRAWL running "kiterunner: API route discovery"
+    kapi="${SECLISTS_DIR:+$SECLISTS_DIR/Discovery/Web-Content/api/api-endpoints.txt}"
+    if [ -n "$kapi" ] && [ -f "$kapi" ]; then
+      ranked_hosts 20 \
+        | tmo 300 kr scan - -w "$kapi" -q 2>/dev/null \
+        | grep -oE 'https?://[^ ]+' | grep -iE "^https?://([a-z0-9._-]+\.)?${esc_domain}([:/]|$)" \
+        | sort -u | head -n 200 >> "$targets_active_file" || true
+      sort -u -o "$targets_active_file" "$targets_active_file"
+    fi
+  fi
+
+  # (D) Hidden-parameter discovery (x8 preferred, arjun fallback). Moved here from the -j JS stage:
+  #     it is slow and needs the JS-mined + fuzz-discovered surface, so it now probes the REAL
+  #     endpoints (/api/*, /rest/*, parameterless 200s) rather than the SPA's static "/" root.
+  : > "$params_file"
+  if { { [ "$PREFER_X8" = 1 ] && have x8; } || have arjun; } && [ "${ACT_MAX_ARJUN:-0}" -gt 0 ] 2>/dev/null; then
+    _pwl="${SECLISTS_DIR:+$SECLISTS_DIR/Discovery/Web-Content/burp-parameter-names.txt}"
+    PARAM_HOSTS="${PARAM_HOSTS:-20}"
+    _ptargets="$( {
+        [ -s "${js_endpoints_file:-/dev/null}" ] && grep -iE '/api/|/rest/|/graphql|\?' "$js_endpoints_file" 2>/dev/null
+        [ -s "${fuzz_findings_file:-/dev/null}" ] && awk -F'\t' '$1==200 && $2+0>0 {print $3}' "$fuzz_findings_file" 2>/dev/null
+        grep -av '?' "$targets_active_file" 2>/dev/null
+        ranked_hosts "$PARAM_HOSTS"
+      } | awk 'NF && !seen[$0]++' )"
+    _ptotal="$(printf '%s\n' "$_ptargets" | head -n "$PARAM_HOSTS" | grep -c .)"
+    _pi=0
+    while read -r _pu; do
+      [ -z "$_pu" ] && continue
+      _pi=$((_pi + 1)); [ "$_pi" -gt "$PARAM_HOSTS" ] && break
+      _pt="$(mktemp)"
+      if [ "$PREFER_X8" = 1 ] && have x8; then
+        ( tmo "$ARJUN_MAX_TIME" x8 -u "$_pu" ${_pwl:+-w "$_pwl"} -O "$_pt" 2>/dev/null ) & _pa=$!; _pp=x8
+      else
+        ( tmo "$ARJUN_MAX_TIME" arjun -u "$_pu" -q -oT "$_pt" 2>/dev/null ) & _pa=$!; _pp=arjun
+      fi
+      _ps=$SECONDS
+      while kill -0 "$_pa" 2>/dev/null; do ST_DETAIL[$S_CRAWL]="param discovery $_pi/$_ptotal ($_pp)  $((SECONDS-_ps))s"; [ "$TUI" = 1 ] && render; sleep 0.3; done
+      wait "$_pa" 2>/dev/null || true
+      # fast-whiff fallback only: don't double a full timeout on a slow/empty host
+      if [ ! -s "$_pt" ] && [ "$((SECONDS-_ps))" -lt "$((ARJUN_MAX_TIME/2))" ]; then
+        if [ "$_pp" = x8 ] && have arjun; then tmo "$ARJUN_MAX_TIME" arjun -u "$_pu" -q -oT "$_pt" 2>/dev/null || true
+        elif [ "$_pp" = arjun ] && have x8; then tmo "$ARJUN_MAX_TIME" x8 -u "$_pu" ${_pwl:+-w "$_pwl"} -O "$_pt" 2>/dev/null || true; fi
+      fi
+      [ -s "$_pt" ] && grep -oiE '[a-z0-9_.\[\]-]{1,40}' "$_pt" 2>/dev/null | awk 'length>=2 && !seen[$0]++' | sed "s#^#${_pu}\t#" >> "$params_file"
+      rm -f "$_pt"
+    done <<< "$(printf '%s\n' "$_ptargets" | head -n "$PARAM_HOSTS")"
+  fi
+  # fold discovered params into the active set as testable ?param=1 URLs
+  if [ -s "${params_file:-/dev/null}" ]; then
+    set_stage $S_CRAWL running "folding $(nlines "$params_file") discovered params into tests"
+    awk -F'\t' 'NF>=2{sep=($1 ~ /\?/)?"&":"?"; print $1 sep $2 "=1"}' "$params_file" >> "$targets_active_file"
+    sort -u -o "$targets_active_file" "$targets_active_file"
+  fi
+  # Final clean of the set that feeds every slow specialist: drop static assets, then dedupe.
+  drop_static < "$targets_active_file" 2>/dev/null | sort -u > "$targets_active_file.tmp" \
+    && mv "$targets_active_file.tmp" "$targets_active_file"
+  # Probe the mined endpoints NOW (before gf + specialists): folds their real statuses into
+  # fuzz_findings AND purges SPA catch-all URLs (/b2b/v2/orders, /v1/userinfo) from targets_active
+  # so the specialists and gf don't waste their caps on index.html shells.
+  set_stage $S_CRAWL running "probing mined API endpoints"; probe_mined_endpoints; render
+  active_total="$(nlines "$targets_active_file")"
+
+  # (E) gf bucketing on the active set (candidate classes for routing)
+  : > "$gf_file"
+  if have gf && [ -s "$targets_active_file" ]; then
+    # Expand focus aliases so blueprint focus names map onto gf pattern names.
+    # NB: this block is sourced at top level, not inside a function - no 'local' here.
+    _focus=",$ACT_FOCUS,"
+    case "$_focus" in *,injection,*) _focus="${_focus}sqli,lfi," ;; esac
+    for pat in sqli xss ssrf lfi redirect rce ssti idor; do
+      # Run this bucket if the pattern is in focus; always run rce + idor (cheap, high-value,
+      # and routing on them is wanted regardless of the stated focus).
+      case "$_focus" in
+        *",$pat,"*) ;;
+        *) { [ "$pat" != idor ] && [ "$pat" != rce ]; } && continue ;;
+      esac
+      gf "$pat" < "$targets_active_file" 2>/dev/null | sed "s/^/${pat}\t/" >> "$gf_file" || true
+    done
+  fi
+
+  # (F) Dispatch paired specialists in parallel, each strictly capped.
+  : > "$dast_file"; : > "$findings_dir/dalfox.txt"; : > "$findings_dir/kxss.txt"; : > "$findings_dir/sqlmap.txt"
+  set_stage $S_CRAWL running "dispatching specialists ($active_total urls)"
+  declare -a SPIDS=()
+  # XSS reflection FIRST (fast): kxss/Gxss flags params that reflect unfiltered chars.
+  # Run it synchronously so its output can actually feed dalfox (the real pairing).
+  if { has_spec kxss && { have kxss || have Gxss; }; } && [ -s "$targets_active_file" ]; then
+    set_stage $S_CRAWL running "kxss: probing reflection"; render
+    xtool="kxss"; have kxss || xtool="Gxss"
+    # kxss only tests query params - feed it ONLY ?k=v URLs so the cap isn't spent on the
+    # parameterless REST paths now folded into the active set.
+    grep -aE '\?[^=]+=' "$targets_active_file" 2>/dev/null | head -n "$ACT_MAX_KXSS" | "$xtool" 2>/dev/null > "$findings_dir/kxss.txt" || true
+  fi
+  # XSS confirm: dalfox on the URLs kxss just flagged as reflecting (chained!) plus the
+  # gf xss-bucket; only if neither yields anything do we fall back to the full active set.
+  if has_spec dalfox && have dalfox && [ -s "$targets_active_file" ]; then
+    xq="$findings_dir/.xssq.txt"; : > "$xq"
+    grep -oiE 'https?://[^ ]+' "$findings_dir/kxss.txt" 2>/dev/null >> "$xq"   # kxss reflecting URLs (highest signal)
+    grep -iE '^xss\t' "$gf_file" 2>/dev/null | cut -f2 >> "$xq"                 # gf xss-bucket
+    # collapse value-variants (/s?q=1 /s?q=2 -> one) so dalfox tests each endpoint once
+    if have qsreplace; then qsreplace FUZZ < "$xq" 2>/dev/null | sort -u | qsreplace 1 2>/dev/null | sort -u -o "$xq"; else sort -u -o "$xq" "$xq"; fi
+    [ -s "$xq" ] || grep -aE '\?[^=]+=' "$targets_active_file" 2>/dev/null > "$xq"   # fallback: query URLs only (dalfox needs params)
+    dfx=(dalfox pipe --silence --skip-bav -o "$findings_dir/dalfox.txt"); [ "${#DALFOX_NET[@]}" -gt 0 ] && dfx+=("${DALFOX_NET[@]}")
+    ( head -n "$ACT_MAX_DALFOX" "$xq" | tmo "$DALFOX_MAX_TIME" "${dfx[@]}" >/dev/null 2>>"$llm_log" ) & SPIDS+=($!)
+  fi
+  # Broad DAST: nuclei -dast across all classes (or ACT_DAST_TAGS)
+  if has_spec nuclei-dast && have nuclei && [ -s "$targets_active_file" ]; then
+    head -n "$DAST_MAX_URLS" "$targets_active_file" > "$OUTDIR/.dast_targets.txt"
+    dcmd=(nuclei -silent -dast -l "$OUTDIR/.dast_targets.txt" -rate-limit "$NUCLEI_RATELIMIT"
+          -timeout "$NUCLEI_TIMEOUT" -retries "$NUCLEI_RETRIES" -mhe "$NUCLEI_MHE" -o "$dast_file")
+    [ -n "$ACT_DAST_TAGS" ] && dcmd+=(-tags "$ACT_DAST_TAGS")
+    [ "${#NUCLEI_NET[@]}" -gt 0 ] && dcmd+=("${NUCLEI_NET[@]}")
+    # DAST fuzzing gets its OWN short cap (not the 1h whole-nuclei cap): time-based templates on an
+    # SPA catch-all can otherwise burn 30-50 min. Use the smaller of DAST_MAX_TIME / NUCLEI_MAX_TIME.
+    _dast_cap="${DAST_MAX_TIME:-300}"
+    [ "$NUCLEI_MAX_TIME" -gt 0 ] 2>/dev/null && [ "$NUCLEI_MAX_TIME" -lt "$_dast_cap" ] && _dast_cap="$NUCLEI_MAX_TIME"
+    [ "$_dast_cap" -gt 0 ] 2>/dev/null && have timeout && dcmd=(timeout "${_dast_cap}s" "${dcmd[@]}")
+    ( "${dcmd[@]}" >/dev/null 2>>"$llm_log" ) & SPIDS+=($!)
+  fi
+  # Blind SSRF / open-redirect confirmation via OAST: inject unique payloads into
+  # redirect/SSRF-style params (prefers the gf redirect/ssrf buckets, else the active set).
+  if [ "$OAST" = 1 ] && [ -n "$OAST_DOMAIN" ]; then
+    { grep -iE '^(redirect|ssrf)\t' "$gf_file" 2>/dev/null | cut -f2; cat "$targets_active_file"; } \
+      | sort -u | oast_inject & SPIDS+=($!)
+  fi
+  # SQLi confirmation: sqlmap on the gf-sqli URLs ONLY, tightly capped (not discovery)
+  if has_spec sqlmap && [ "$SQLMAP_CONFIRM" = 1 ] && have sqlmap && [ "${ACT_MAX_SQLMAP:-0}" -gt 0 ] 2>/dev/null; then
+    sq="$findings_dir/.sqliq.txt"
+    # gf's sqli list keys on id=/search=/query=/filter= but misses ?q= on REST/API search
+    # endpoints (e.g. Juice Shop /rest/products/search?q=1). Supplement with any active API/
+    # search URL that has a populated query param; dedup; cap at ACT_MAX_SQLMAP.
+    # Prioritise REAL parameterised API/search URLs (…/search?q=1) over gf's generic matches, and
+    # fold in any URL nuclei-dast already flagged sqli on, so the tight cap isn't spent on a
+    # synthetic ?cid=1 before the genuine injection point is tested.
+    { [ -s "${dast_file:-/dev/null}" ] && grep -iaE 'sqli' "$dast_file" 2>/dev/null | grep -oE 'https?://[^ ]+'
+      grep -aiE '[?&][a-z0-9_]+=[^&]' "$targets_active_file" 2>/dev/null | grep -iE '/rest/|/api/|search|query|filter|[?&]q='
+      grep -iE '^sqli\t' "$gf_file" 2>/dev/null | cut -f2
+    } | awk 'NF && !seen[$0]++' | head -n "$ACT_MAX_SQLMAP" > "$sq"
+    if [ -s "$sq" ]; then
+      # no --smart (we feed only high-suspicion URLs) and --level=2 so parenthesis closures ') ')' are tried
+      ( tmo "$SQLMAP_MAX_TIME" sqlmap -m "$sq" --batch --level=2 --risk=2 --technique=BEU \
+          --output-dir="$findings_dir/sqlmap" >/dev/null 2>>"$llm_log"
+        # attach the tested URL to each finding line (sqlmap keeps it in the per-target target.txt);
+        # without it the finding lands in findings.json with an empty "url".
+        : > "$findings_dir/sqlmap.txt"
+        _sqfallback="$(head -1 "$sq" 2>/dev/null | grep -oE 'https?://[^ ]+')"
+        for _sd in "$findings_dir/sqlmap"/*/; do
+          [ -d "$_sd" ] || continue
+          _turl="$(grep -hoE 'https?://[^ )]+' "$_sd/target.txt" 2>/dev/null | head -1)"; : "${_turl:=$_sqfallback}"
+          grep -rhiE 'parameter .* is vulnerable|is injectable|Type: ' "$_sd" 2>/dev/null \
+            | sort -u | sed "s#^#${_turl}  #" >> "$findings_dir/sqlmap.txt"
+        done
+        [ -s "$findings_dir/sqlmap.txt" ] || grep -rhiE 'parameter .* is vulnerable|is injectable|Type: ' "$findings_dir/sqlmap" 2>/dev/null \
+          | sort -u | sed "s#^#${_sqfallback:+$_sqfallback  }#" > "$findings_dir/sqlmap.txt" ) & SPIDS+=($!)
+    fi
+  fi
+  # live progress while specialists run
+  while :; do
+    alive=0; for sp in "${SPIDS[@]:-}"; do [ -n "$sp" ] && kill -0 "$sp" 2>/dev/null && alive=$((alive+1)); done
+    [ "$alive" -eq 0 ] && break
+    ST_DETAIL[$S_CRAWL]="specialists running:$alive  dast:$(nlines "$dast_file") dalfox:$(nlines "$findings_dir/dalfox.txt") kxss:$(nlines "$findings_dir/kxss.txt")"
+    render; sleep 2
+  done
+  for sp in "${SPIDS[@]:-}"; do [ -n "$sp" ] && wait "$sp" 2>/dev/null || true; done
+  rm -f "$OUTDIR/.dast_targets.txt" "$findings_dir/.xssq.txt" "$findings_dir/.sqliq.txt"
+
+  # (G) Correlation / exploitation passes that connect findings into verdicts.
+  : > "$bypass_file"; : > "$prop_file"; : > "$idor_file"; : > "$corsy_file"
+  # (mined endpoints were already status-probed + catch-all-purged before the specialists above,
+  # so fuzz_findings holds the real REST surface here for the 403-bypass/stack-trace/open-dir passes)
+  set_stage $S_CRAWL running "403 bypass · path propagation · authz diff · CORS"
+  awk -F'\t' '$1==401||$1==403' "$fuzz_findings_file" 2>/dev/null \
+    | grep -viE 'google\.com|%2e%2e|\\\.\\\.|etc.{0,3}passwd' \
+    | awk -F'\t' '!seen[$1"\t"$2]++' | try_403_bypass; render
+  propagate_paths; render
+  idor_check; render
+  # CORS misconfiguration (Corsy) on the live hosts + juicy URLs (bug class we don't cover elsewhere).
+  if [ "$CORS_SCAN" = 1 ] && have corsy; then
+    { ranked_hosts; head -n 30 "$targets_active_file" 2>/dev/null; } | awk '!seen[$0]++' | head -n "$CORS_MAX" > "$OUTDIR/.cors_in.txt"
+    # Corsy prints multi-line blocks: the URL on a header line, the misconfig on an indented
+    # "- Class: ..." line below it. Keep each class ATTACHED to its parent URL (awk carries the
+    # last URL seen), drop plain "wildcard value" (ACAO:* without credentials is standard on
+    # public APIs/SPAs and not a finding), and dedupe by (origin, class) so one host doesn't
+    # emit the same class dozens of times.
+    [ -s "$OUTDIR/.cors_in.txt" ] && tmo 180 corsy -i "$OUTDIR/.cors_in.txt" 2>/dev/null \
+      | sed -E 's/\x1b\[[0-9;]*m//g' \
+      | awk -v def="${SEED_URL:-$domain}" '
+          match($0,/https?:\/\/[^][:space:]"'"'"'<>]+/){ u=substr($0,RSTART,RLENGTH); gsub(/[],")>]+$/,"",u) }
+          /[Cc]lass[[:space:]]*:/ { c=$0; sub(/.*[Cc]lass[[:space:]]*:[[:space:]]*/,"",c); sub(/[[:space:]]+$/,"",c);
+            if (c!="") print (u!=""?u:def) "\t" c }
+        ' \
+      | grep -iE 'reflect|null origin|arbitrary|post-domain|pre-domain|trusted|credential' \
+      | awk -F'\t' '{ o=$1; sub(/(https?:\/\/[^\/]+).*/,"\\1",o); k=o"|"$2; if(!s[k]++) printf "%s — %s\n",$1,$2 }' \
+      > "$corsy_file" || true
+    rm -f "$OUTDIR/.cors_in.txt"
+  fi; render
+
+  # OWASP/API Top-10 lightweight detectors (open dirs, 500 stack traces, unauth API exposure,
+  # open-redirect confirmation, JWT weaknesses) - GET-only, capped, non-destructive.
+  set_stage $S_CRAWL running "OWASP detectors (dirs · errors · unauth-api · redirect · jwt)"
+  run_owasp_detectors; render
+  # Final dedupe of fuzz_findings by URL: probing (/metrics twice, once by ffuf, once by the mined
+  # prober - Prometheus byte-length drifts each scrape) and the [POST]/mined appends can introduce
+  # same-URL duplicates. Keep the first occurrence per URL.
+  # Also drop 200/0B rows (empty bodies / connection resets like /ak47.php - never a real hit).
+  [ -s "$fuzz_findings_file" ] && awk -F'\t' '!($1==200 && ($2==0 || $2=="0B")) && !seen[$3]++' "$fuzz_findings_file" > "$fuzz_findings_file.dd" 2>/dev/null && mv "$fuzz_findings_file.dd" "$fuzz_findings_file"
+  # p_funnel appended mined-endpoint + detector hits after p_fuzz set fuzz_hits, so the old snapshot
+  # could read smaller than the live distinct count ("47 distinct (39 raw)"). Recompute it here.
+  fuzz_hits="$(nlines "$fuzz_findings_file")"
+
+  touch "$OUTDIR/.done_crawl"
+  set_stage $S_CRAWL done "$url_total urls -> $active_total active | dast:$(nlines "$dast_file") dalfox:$(nlines "$findings_dir/dalfox.txt") kxss:$(nlines "$findings_dir/kxss.txt") sqlmap:$(nlines "$findings_dir/sqlmap.txt") bypass:$(nlines "$bypass_file") prop:$(nlines "$prop_file") idor:$(nlines "$idor_file")"
+fi
+
