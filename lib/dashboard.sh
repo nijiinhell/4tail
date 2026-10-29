@@ -56,7 +56,9 @@ loot_sev_color() {
   esac
 }
 loot_add() {  # sev  src  text   -> push one finding, bounded history
-  LOOT_LINES+=("$1"$'\t'"$2"$'\t'"$3")
+  # strip CR/newlines so a tool's raw \r (sqlmap timestamps) can't jump the cursor and corrupt the box
+  local _lt; _lt="$(printf '%s' "$3" | tr -d '\r' | tr '\n' ' ')"
+  LOOT_LINES+=("$1"$'\t'"$2"$'\t'"$_lt")
   local n=${#LOOT_LINES[@]}
   [ "$n" -gt "$LOOT_MAX" ] && LOOT_LINES=("${LOOT_LINES[@]: -$LOOT_MAX}")
 }

@@ -244,8 +244,8 @@ build_alive_ranked
 # Resolve the strategy blueprint (AI-chosen from the tech surface when BLUEPRINT=auto).
 # Run it ALWAYS, not only under -C: a blueprint also tunes stages that run without the active
 # funnel - fuzzing_strategy (light/off) for the fuzz stage, and rate/caps for nuclei.
-# (don't flip S_PLAN here - it runs after JS now, and doing so would skew its stage timer)
-[ "$TUI" = 1 ] && { ST_DETAIL[$S_LIVE]="selecting blueprint"; render; }
+# (blueprint resolution is quick and silent here; don't flip/relabel a stage - S_PLAN runs after JS
+#  now so flipping it would skew its timer, and relabeling S_LIVE clobbers its "N live (Xs)" status)
 resolve_blueprint
 [ "$ASSUME_YES" = 1 ] || log "Blueprint: ${BLUEPRINT_NAME:-defaults}  (focus: $ACT_FOCUS | specialists: $ACT_SPECIALISTS)"
 

@@ -108,7 +108,9 @@ agent_tool_run() {   # name  target  extra
       res="$(printf '%s' "$raw" | head -3 | tr '\n' ';')" ;;
     *) echo "unknown/unavailable tool: $name"; return 0 ;;
   esac
-  res="$(printf '%s' "$res" | sed -E 's/((pass(word|wd)?|secret|api[-_]?key|token|connection[-_ ]?string)[^[:cntrl:]]{0,8}[:=])[^[:cntrl:]"'"'"']{1,}/\1<redacted>/Ig' | head -c 320)"
+  # strip CR first: sqlmap/dalfox emit a bare \r before timestamps, which (unfiltered) jumps the TUI
+  # cursor to column 0 and eats the loot box border, and lands as a literal \r in findings.json.
+  res="$(printf '%s' "$res" | tr -d '\r' | sed -E 's/((pass(word|wd)?|secret|api[-_]?key|token|connection[-_ ]?string)[^[:cntrl:]]{0,8}[:=])[^[:cntrl:]"'"'"']{1,}/\1<redacted>/Ig' | head -c 320)"
   if [ -n "$hit" ]; then
     printf '[%s] %s | via %s | %s\n' "${hit%% *}" "$tgt" "$name" "$res" >> "$agent_file"
     printf 'TOOL %s %s => %s | %s' "$name" "$tgt" "$hit" "$res"

@@ -229,7 +229,10 @@ else
           | jq -r '[("sourcemap:"+(.SourceMetadata.Data.Filesystem.file // "src")), (.DetectorName // "secret"), (.Raw // "")] | @tsv' 2>/dev/null \
           | sed -E 's#'"$smap_dir"'/##' >> "$js_secrets_file" || true
       else
-        grep -rhaoE "$SECRET_RE" "$smap_dir" 2>/dev/null | sort -u | sed 's#^#sourcemap-src\t#' >> "$js_secrets_file" || true
+        grep -rhaoE "$SECRET_RE" "$smap_dir" 2>/dev/null \
+          | grep -aviE '^0x([0-9a-f]*0{12,}|[0-9a-f]*f{12,})' \
+          | grep -aviE '(password|passwd|pwd|secret|private[_-]?key|api[_-]?key|token)["]?[[:space:]]*[:=][[:space:]]*["`]?(password|passwd|secret|key|token|null|undefined|true|false|example|changeme|x{3,}|your[_-]?.*here)([^a-z0-9]|$)' \
+          | sort -u | sed 's#^#sourcemap-src\t#' >> "$js_secrets_file" || true
       fi
       sort -u -o "$smap_endpoints_file" "$smap_endpoints_file"
     fi

