@@ -157,10 +157,10 @@ run_doctor() {
     if [ "$bp_invalid" -eq 0 ] && [ "$bp_cnt" -gt 0 ]; then
       dr_pass "Loaded $bp_cnt strategy blueprints from $BLUEPRINTS_DIR"
     elif [ "$bp_cnt" -eq 0 ]; then
-      dr_warn "No blueprint JSON files found in $BLUEPRINTS_DIR (embedded defaults will be used)"
+      dr_warn "No blueprint JSON files found in $BLUEPRINTS_DIR (active defaults will be used)"
     fi
   else
-    dr_pass "Using embedded built-in blueprint fallbacks (standalone mode)"
+    dr_pass "Using built-in active defaults"
   fi
 
   dr_head "Summary"

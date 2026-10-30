@@ -18,38 +18,7 @@ load_blueprint() { # $1 = name or path; applies focus/specialists/caps
     */*|*.json) [ -f "$bp" ] && f="$bp" ;;
     *) [ -n "$BLUEPRINTS_DIR" ] && [ -f "$BLUEPRINTS_DIR/$bp.json" ] && f="$BLUEPRINTS_DIR/$bp.json" ;;
   esac
-  if [ -z "$f" ]; then
-    # Fallback to embedded default blueprint configurations if blueprints/ directory is not present
-    case "$bp" in
-      spa)
-        BLUEPRINT_NAME="spa"; bp_set ACT_FOCUS "xss,idor,ssrf,redirect,auth-bypass,secrets"
-        bp_set ACT_SPECIALISTS "nuclei-dast,dalfox,kxss,arjun"; bp_set ACT_DAST_TAGS "xss,redirect,ssrf"
-        bp_set FUZZING_STRATEGY "light"; bp_set ACT_MAX_JUICY 120; bp_set ACT_MAX_DALFOX 60
-        bp_set ACT_MAX_KXSS 500; bp_set ACT_MAX_SQLMAP 1; bp_set ACT_MAX_ARJUN 30; return 0 ;;
-      stealth)
-        BLUEPRINT_NAME="stealth"; bp_set ACT_FOCUS "xss,redirect,ssrf"; bp_set ACT_SPECIALISTS "kxss,dalfox"
-        bp_set ACT_DAST_TAGS "xss,redirect,ssrf"; bp_set FUZZING_STRATEGY "light"; bp_set ACT_MAX_JUICY 40
-        bp_set ACT_MAX_DALFOX 15; bp_set ACT_MAX_KXSS 150; bp_set ACT_MAX_SQLMAP 0; bp_set ACT_MAX_ARJUN 0
-        bp_set FFUF_THREADS 5; bp_set FFUF_RATE 10; bp_set NUCLEI_RATELIMIT 25; return 0 ;;
-      wordpress)
-        BLUEPRINT_NAME="wordpress"; bp_set ACT_FOCUS "cve,xss,sqli,lfi,exposure"; bp_set ACT_SPECIALISTS "nuclei-dast,dalfox,kxss"
-        bp_set ACT_DAST_TAGS "xss,sqli,lfi"; bp_set ACT_MAX_JUICY 80; bp_set ACT_MAX_DALFOX 60
-        bp_set ACT_MAX_KXSS 400; bp_set ACT_MAX_SQLMAP 2; bp_set ACT_MAX_ARJUN 15; return 0 ;;
-      graphql)
-        BLUEPRINT_NAME="graphql"; bp_set ACT_FOCUS "idor,auth-bypass,sqli,ssrf,injection"; bp_set ACT_SPECIALISTS "nuclei-dast,arjun,sqlmap"
-        bp_set ACT_DAST_TAGS "sqli,ssrf,ssti"; bp_set FUZZING_STRATEGY "light"; bp_set ACT_MAX_JUICY 120
-        bp_set ACT_MAX_DALFOX 10; bp_set ACT_MAX_KXSS 80; bp_set ACT_MAX_SQLMAP 4; bp_set ACT_MAX_ARJUN 30; return 0 ;;
-      api_bounty)
-        BLUEPRINT_NAME="api_bounty"; bp_set ACT_FOCUS "idor,ssrf,sqli,auth-bypass,ssti"; bp_set ACT_SPECIALISTS "nuclei-dast,arjun,sqlmap"
-        bp_set ACT_DAST_TAGS "sqli,ssrf,ssti,redirect,lfi"; bp_set ACT_MAX_JUICY 120; bp_set ACT_MAX_DALFOX 10
-        bp_set ACT_MAX_KXSS 100; bp_set ACT_MAX_SQLMAP 4; bp_set ACT_MAX_ARJUN 40; return 0 ;;
-      webapp_bounty|*)
-        BLUEPRINT_NAME="webapp_bounty"; bp_set ACT_FOCUS "idor,sqli,xss,ssrf,lfi,redirect,ssti"
-        bp_set ACT_SPECIALISTS "nuclei-dast,dalfox,kxss,arjun,sqlmap"; bp_set ACT_DAST_TAGS "xss,sqli,lfi,ssrf,redirect,ssti"
-        bp_set ACT_MAX_JUICY 100; bp_set ACT_MAX_DALFOX 50; bp_set ACT_MAX_KXSS 400; bp_set ACT_MAX_SQLMAP 3
-        bp_set ACT_MAX_ARJUN 25; return 0 ;;
-    esac
-  fi
+  [ -z "$f" ] && { warn "blueprint '$bp' not found - using built-in active defaults"; return 1; }
   have jq || { warn "jq required for blueprints - using defaults"; return 1; }
   BLUEPRINT_NAME="$(jq -r '.name // "custom"' "$f" 2>/dev/null)"
   bp_set ACT_FOCUS       "$(jq -r '(.focus_areas // []) | join(",")' "$f" 2>/dev/null)"
