@@ -1,0 +1,17 @@
+{
+  "name": "webapp_bounty",
+  "description": "General web-app bounty: balanced active testing across the common bug classes.",
+  "focus_areas": ["idor", "sqli", "xss", "ssrf", "lfi", "redirect", "ssti"],
+  "specialists": ["nuclei-dast", "dalfox", "kxss", "arjun", "sqlmap"],
+  "nuclei_dast_tags": "xss,sqli,lfi,ssrf,redirect,ssti",
+  "caps": {
+    "max_juicy_urls": 100,
+    "max_dalfox": 50,
+    "max_kxss": 400,
+    "max_sqlmap": 3,
+    "max_arjun_hosts": 25,
+    "crawl_max_urls": 8000,
+    "crawl_max_time": 1200,
+    "dast_max_urls": 1500
+  }
+}

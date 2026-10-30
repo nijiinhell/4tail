@@ -1,0 +1,17 @@
+{
+  "name": "graphql",
+  "description": "GraphQL API: introspection, field-level authz/IDOR, injection through resolvers; the agent should probe /graphql with introspection + batching.",
+  "focus_areas": ["idor", "auth-bypass", "sqli", "ssrf", "injection"],
+  "specialists": ["nuclei-dast", "arjun", "sqlmap"],
+  "nuclei_dast_tags": "sqli,ssrf,ssti",
+  "caps": {
+    "max_juicy_urls": 120,
+    "max_dalfox": 10,
+    "max_kxss": 80,
+    "max_sqlmap": 4,
+    "max_arjun_hosts": 30,
+    "crawl_max_urls": 8000,
+    "crawl_max_time": 1200,
+    "dast_max_urls": 2000
+  }
+}

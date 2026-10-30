@@ -1,0 +1,18 @@
+{
+  "name": "spa",
+  "description": "JS-heavy SPA (React/Vue/Angular/Next): mine JS for endpoints/secrets, hunt DOM-XSS and the API the front-end talks to; light on classic path fuzzing.",
+  "focus_areas": ["xss", "idor", "ssrf", "redirect", "auth-bypass", "secrets"],
+  "specialists": ["nuclei-dast", "dalfox", "kxss", "arjun"],
+  "nuclei_dast_tags": "xss,redirect,ssrf",
+  "fuzzing_strategy": "light",
+  "caps": {
+    "max_juicy_urls": 120,
+    "max_dalfox": 60,
+    "max_kxss": 500,
+    "max_sqlmap": 1,
+    "max_arjun_hosts": 30,
+    "crawl_max_urls": 12000,
+    "crawl_max_time": 1500,
+    "dast_max_urls": 1500
+  }
+}

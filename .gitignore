@@ -1,0 +1,6 @@
+
+# scan output dirs
+4tail_*/
+
+# build artifacts
+dist/
