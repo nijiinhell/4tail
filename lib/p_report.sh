@@ -221,13 +221,13 @@ oast_stop
 # Structured output: findings.json (and optional SARIF) for automation / ticketing.
 findings_json="$OUTDIR/findings.json"
 if have jq; then
-  emit_f() { jq -nc --arg type "$1" --arg sev "$2" --arg src "$3" --arg url "$4" --arg detail "$5" \
-      '{type:$type,severity:$sev,source:$src,url:$url,detail:$detail}'; }
+  emit_f() { jq -nc --arg type "$1" --arg sev "$2" --arg src "$3" --arg url "$4" --arg detail "$5" --arg poc "${6:-}" \
+      '{type:$type,severity:$sev,source:$src,url:$url,detail:$detail,poc:$poc}'; }
   nsev() { printf '%s' "$1" | grep -oiE '\[(critical|high|medium|low|info|unknown)\]' | head -1 | tr -d '[]' | tr 'A-Z' 'a-z'; }
   nurl() { printf '%s' "$1" | grep -oE 'https?://[^ ]+' | head -1; }
   {
     if [ -s "${findings_jsonl:-}" ]; then
-      jq -c '. | {type:.type, severity:(.severity // "info"), source:(.stage // "hit"), url:(.target // ""), detail:.evidence}' "$findings_jsonl" 2>/dev/null
+      jq -c '. | {type:.type, severity:(.severity // "info"), source:(.stage // "hit"), url:(.target // ""), detail:.evidence, poc:(.poc // "")}' "$findings_jsonl" 2>/dev/null
     fi
     [ -f "$nuclei_file" ] && while IFS= read -r l; do [ -n "$l" ] && emit_f nuclei "$(nsev "$l")" nuclei "$(nurl "$l")" "$l"; done < "$nuclei_file"
     [ -f "$dast_file" ]   && while IFS= read -r l; do [ -n "$l" ] && emit_f dast "$(nsev "$l")" nuclei-dast "$(nurl "$l")" "$l"; done < "$dast_file"
@@ -299,7 +299,15 @@ if have jq; then
   # Standalone interactive HTML report (offline, zero-dependency, filterable)
   report_html="$OUTDIR/report.html"
   if [ -s "$findings_json" ] && have jq; then
-    rows="$(jq -r '.findings[]? | "<tr><td class=\"sev sev-\(.severity // "info")\">\(.severity // "info")</td><td>\(.type // "-")</td><td>\(.source // "-")</td><td><a href=\"\(.url // "#")\" target=\"_blank\">\(.url // "-")</a></td><td><code>\(.detail // "" | @html)</code></td></tr>"' "$findings_json" 2>/dev/null || true)"
+    rows="$(jq -r '.findings[]? | 
+      "<tr data-sev=\"" + (.severity // "info") + "\" data-src=\"" + (.source // "-") + "\">" +
+      "<td class=\"sev sev-" + (.severity // "info") + "\">" + (.severity // "info") + "</td>" +
+      "<td>" + (.type // "-") + "</td>" +
+      "<td class=\"src-col\">" + (.source // "-") + "</td>" +
+      "<td><a href=\"" + (.url // "#") + "\" target=\"_blank\">" + (.url // "-") + "</a></td>" +
+      "<td><code>" + (.detail // "" | @html) + "</code></td>" +
+      "<td>" + (if (.poc // "") != "" then "<button class=\"btn-sm\" data-poc=\"" + (.poc | @html) + "\" onclick=\"copyPoc(this)\">Copy cURL</button>" elif ((.url // "") | test("^https?://")) then "<button class=\"btn-sm\" data-poc=\"curl -i &#39;" + (.url | @html) + "&#39;\" onclick=\"copyPoc(this)\">Copy cURL</button>" else "<span class=\"dash\">-</span>" end) + "</td>" +
+      "</tr>"' "$findings_json" 2>/dev/null || true)"
     total_f="$(jq -r '.count // 0' "$findings_json" 2>/dev/null || echo 0)"
     crit_f="$(jq -r '[.findings[]? | select(.severity=="critical")] | length' "$findings_json" 2>/dev/null || echo 0)"
     high_f="$(jq -r '[.findings[]? | select(.severity=="high")] | length' "$findings_json" 2>/dev/null || echo 0)"
@@ -310,40 +318,51 @@ if have jq; then
 <html lang="en">
 <head>
 <meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
 <title>4tail Recon Report - __DOMAIN__</title>
 <style>
-:root { --bg:#0f172a; --card:#1e293b; --text:#f8fafc; --muted:#94a3b8; --border:#334155; --crit:#ef4444; --high:#f97316; --med:#eab308; --low:#3b82f6; --info:#64748b; }
+:root { --bg:#0b0f19; --card:#151c2e; --text:#f1f5f9; --muted:#94a3b8; --border:#243049; --crit:#ef4444; --high:#f97316; --med:#eab308; --low:#3b82f6; --info:#64748b; }
 body { font-family:-apple-system,BlinkMacSystemFont,"Segoe UI",Roboto,sans-serif; background:var(--bg); color:var(--text); margin:0; padding:24px; line-height:1.5; }
-.header { margin-bottom:24px; border-bottom:1px solid var(--border); padding-bottom:16px; }
-h1 { margin:0 0 8px 0; font-size:24px; font-weight:700; }
-.meta { color:var(--muted); font-size:14px; }
-.cards { display:flex; gap:16px; margin-bottom:24px; flex-wrap:wrap; }
-.card { background:var(--card); border:1px solid var(--border); border-radius:8px; padding:16px; min-width:140px; }
+.header { margin-bottom:20px; border-bottom:1px solid var(--border); padding-bottom:16px; }
+h1 { margin:0 0 6px 0; font-size:24px; font-weight:700; color:#fff; }
+.meta { color:var(--muted); font-size:13px; }
+.cards { display:flex; gap:14px; margin-bottom:20px; flex-wrap:wrap; }
+.card { background:var(--card); border:1px solid var(--border); border-radius:8px; padding:14px 20px; min-width:130px; }
 .card .val { font-size:28px; font-weight:700; }
-.card .lbl { font-size:12px; text-transform:uppercase; color:var(--muted); }
-.controls { display:flex; gap:12px; margin-bottom:16px; align-items:center; }
-input[type="text"] { background:var(--card); border:1px solid var(--border); color:var(--text); padding:8px 14px; border-radius:6px; width:300px; font-size:14px; }
-.btn { background:var(--card); border:1px solid var(--border); color:var(--muted); padding:6px 12px; border-radius:6px; cursor:pointer; font-size:13px; font-weight:600; }
+.card .lbl { font-size:11px; text-transform:uppercase; color:var(--muted); letter-spacing:0.5px; }
+.controls { display:flex; gap:12px; margin-bottom:16px; align-items:center; flex-wrap:wrap; background:var(--card); border:1px solid var(--border); padding:12px 16px; border-radius:8px; }
+input[type="text"] { background:#0b0f19; border:1px solid var(--border); color:var(--text); padding:7px 12px; border-radius:6px; width:240px; font-size:13px; outline:none; }
+input[type="text"]:focus { border-color:#3b82f6; }
+.group-label { font-size:11px; color:var(--muted); font-weight:700; text-transform:uppercase; margin-right:2px; }
+.btn-group { display:inline-flex; gap:4px; align-items:center; }
+.btn { background:#1e293b; border:1px solid var(--border); color:var(--muted); padding:5px 10px; border-radius:6px; cursor:pointer; font-size:12px; font-weight:600; transition:all 0.15s; }
+.btn:hover { background:#283548; color:#fff; }
 .btn.active { background:#3b82f6; color:#fff; border-color:#3b82f6; }
+.export-btn { margin-left:auto; background:#059669; color:#fff; border-color:#059669; }
+.export-btn:hover { background:#047857; }
+.btn-sm { background:#2563eb; color:#fff; border:none; border-radius:4px; padding:3px 8px; font-size:11px; cursor:pointer; font-weight:600; white-space:nowrap; transition:all 0.15s; }
+.btn-sm:hover { background:#1d4ed8; }
+.btn-sm.copied { background:#16a34a !important; color:#fff; }
 table { width:100%; border-collapse:collapse; background:var(--card); border:1px solid var(--border); border-radius:8px; overflow:hidden; font-size:13px; }
-th, td { padding:10px 14px; text-align:left; border-bottom:1px solid var(--border); vertical-align:top; }
-th { background:#1e293b; color:var(--muted); font-weight:600; text-transform:uppercase; font-size:11px; letter-spacing:0.5px; }
+th, td { padding:10px 14px; text-align:left; border-bottom:1px solid var(--border); vertical-align:middle; }
+th { background:#151c2e; color:var(--muted); font-weight:600; text-transform:uppercase; font-size:11px; letter-spacing:0.5px; border-bottom:2px solid var(--border); }
 tr:hover { background:rgba(255,255,255,0.02); }
 a { color:#38bdf8; text-decoration:none; word-break:break-all; }
 a:hover { text-decoration:underline; }
-code { background:#0f172a; padding:2px 6px; border-radius:4px; font-family:monospace; font-size:12px; word-break:break-all; color:#cbd5e1; }
-.sev { font-weight:700; text-transform:uppercase; font-size:11px; border-radius:4px; padding:2px 6px; display:inline-block; }
+code { background:#0b0f19; padding:2px 6px; border-radius:4px; font-family:ui-monospace,SFMono-Regular,Menlo,Monaco,Consolas,monospace; font-size:12px; word-break:break-all; color:#cbd5e1; border:1px solid rgba(255,255,255,0.05); }
+.sev { font-weight:700; text-transform:uppercase; font-size:10px; border-radius:4px; padding:3px 7px; display:inline-block; }
 .sev-critical { background:rgba(239,68,68,0.2); color:#fca5a5; border:1px solid rgba(239,68,68,0.4); }
 .sev-high { background:rgba(249,115,22,0.2); color:#fdba74; border:1px solid rgba(249,115,22,0.4); }
 .sev-medium { background:rgba(234,179,8,0.2); color:#fde047; border:1px solid rgba(234,179,8,0.4); }
 .sev-low { background:rgba(59,130,246,0.2); color:#93c5fd; border:1px solid rgba(59,130,246,0.4); }
 .sev-info { background:rgba(100,116,139,0.2); color:#cbd5e1; border:1px solid rgba(100,116,139,0.4); }
+.dash { color:var(--border); }
 </style>
 </head>
 <body>
 <div class="header">
   <h1>4tail Recon Report: __DOMAIN__</h1>
-  <div class="meta">Generated: __DATE__ | Target: __DOMAIN__ | Blueprint: __BLUEPRINT__</div>
+  <div class="meta">Target: <b>__DOMAIN__</b> | Blueprint: <b>__BLUEPRINT__</b> | Generated: __DATE__</div>
 </div>
 <div class="cards">
   <div class="card"><div class="val">__TOTAL__</div><div class="lbl">Total Findings</div></div>
@@ -353,17 +372,30 @@ code { background:#0f172a; padding:2px 6px; border-radius:4px; font-family:monos
   <div class="card"><div class="val" style="color:var(--low)">__LOW__</div><div class="lbl">Low</div></div>
 </div>
 <div class="controls">
-  <input type="text" id="search" placeholder="Search findings, paths, or tools..." onkeyup="filterTable()">
-  <button class="btn active" onclick="setSev('all', this)">All</button>
-  <button class="btn" onclick="setSev('critical', this)">Critical</button>
-  <button class="btn" onclick="setSev('high', this)">High</button>
-  <button class="btn" onclick="setSev('medium', this)">Medium</button>
-  <button class="btn" onclick="setSev('low', this)">Low</button>
-  <button class="btn" onclick="setSev('info', this)">Info</button>
+  <input type="text" id="search" placeholder="Search findings, URLs, tools..." onkeyup="filterTable()">
+  <div class="btn-group">
+    <span class="group-label">Severity:</span>
+    <button class="btn sev-btn active" onclick="setSev('all', this)">All</button>
+    <button class="btn sev-btn" onclick="setSev('critical', this)">Critical</button>
+    <button class="btn sev-btn" onclick="setSev('high', this)">High</button>
+    <button class="btn sev-btn" onclick="setSev('medium', this)">Med</button>
+    <button class="btn sev-btn" onclick="setSev('low', this)">Low</button>
+    <button class="btn sev-btn" onclick="setSev('info', this)">Info</button>
+  </div>
+  <div class="btn-group">
+    <span class="group-label">Source:</span>
+    <button class="btn src-btn active" onclick="setSrc('all', this)">All</button>
+    <button class="btn src-btn" onclick="setSrc('nuclei', this)">Nuclei</button>
+    <button class="btn src-btn" onclick="setSrc('ffuf', this)">Ffuf</button>
+    <button class="btn src-btn" onclick="setSrc('js', this)">Secrets</button>
+    <button class="btn src-btn" onclick="setSrc('dns', this)">Takeover</button>
+    <button class="btn src-btn" onclick="setSrc('agent', this)">Agent</button>
+  </div>
+  <button class="btn export-btn" onclick="exportCSV()">Export CSV</button>
 </div>
 <table id="ftable">
 <thead>
-  <tr><th>Severity</th><th>Type</th><th>Source</th><th>URL / Target</th><th>Details / Evidence</th></tr>
+  <tr><th style="width:90px">Severity</th><th style="width:130px">Type</th><th style="width:110px">Source</th><th>URL / Target</th><th>Details / Evidence</th><th style="width:100px">Action</th></tr>
 </thead>
 <tbody>
 __ROWS__
@@ -371,9 +403,16 @@ __ROWS__
 </table>
 <script>
 let curSev = 'all';
+let curSrc = 'all';
 function setSev(s, el) {
   curSev = s;
-  document.querySelectorAll('.btn').forEach(b => b.classList.remove('active'));
+  document.querySelectorAll('.sev-btn').forEach(b => b.classList.remove('active'));
+  el.classList.add('active');
+  filterTable();
+}
+function setSrc(s, el) {
+  curSrc = s;
+  document.querySelectorAll('.src-btn').forEach(b => b.classList.remove('active'));
   el.classList.add('active');
   filterTable();
 }
@@ -382,11 +421,55 @@ function filterTable() {
   const rows = document.querySelectorAll('#ftable tbody tr');
   rows.forEach(r => {
     const txt = r.innerText.toLowerCase();
-    const sev = r.querySelector('.sev')?.innerText.toLowerCase() || '';
-    const matchQ = txt.includes(q);
-    const matchSev = curSev === 'all' || sev === curSev;
-    r.style.display = (matchQ && matchSev) ? '' : 'none';
+    const sev = (r.getAttribute('data-sev') || '').toLowerCase();
+    const src = (r.getAttribute('data-src') || '').toLowerCase();
+    const matchQ = !q || txt.includes(q);
+    const matchSev = (curSev === 'all') || (sev === curSev);
+    const matchSrc = (curSrc === 'all') || src.includes(curSrc);
+    r.style.display = (matchQ && matchSev && matchSrc) ? '' : 'none';
   });
+}
+function copyPoc(btn) {
+  const poc = btn.getAttribute('data-poc');
+  if (!poc) return;
+  navigator.clipboard.writeText(poc).then(() => {
+    const orig = btn.innerText;
+    btn.innerText = 'Copied!';
+    btn.classList.add('copied');
+    setTimeout(() => {
+      btn.innerText = orig;
+      btn.classList.remove('copied');
+    }, 1500);
+  });
+}
+function exportCSV() {
+  const rows = document.querySelectorAll('#ftable tr');
+  let csv = [];
+  rows.forEach(r => {
+    if (r.style.display === 'none') return;
+    const cols = r.querySelectorAll('th, td');
+    const row = [];
+    cols.forEach(col => {
+      let val = '';
+      const pocBtn = col.querySelector('[data-poc]');
+      if (pocBtn) {
+        val = pocBtn.getAttribute('data-poc');
+      } else {
+        val = col.innerText.trim();
+      }
+      row.push('"' + val.replace(/"/g, '""') + '"');
+    });
+    csv.push(row.join(','));
+  });
+  const blob = new Blob([csv.join('\n')], { type: 'text/csv;charset=utf-8;' });
+  const url = URL.createObjectURL(blob);
+  const a = document.createElement('a');
+  a.href = url;
+  a.download = 'findings_' + (document.title.replace(/[^a-zA-Z0-9_-]/g, '_')) + '.csv';
+  document.body.appendChild(a);
+  a.click();
+  document.body.removeChild(a);
+  URL.revokeObjectURL(url);
 }
 </script>
 </body>

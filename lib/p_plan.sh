@@ -153,13 +153,31 @@ SecLists root: ${SECLISTS_DIR:-<not installed>}
 $(head -c 10000 "$tech_brief")
 ${js_brief:+$'\n'$js_brief}" "$plan_out"
 
-  # Reasoning models (GLM/DeepSeek) often wrap JSON in ``` fences or prepend
-  # "thinking". Prefer a {...} span that actually contains nuclei_tags, else any
-  # {...}, else the whole reply (sanitize_tags salvages allowlisted words from prose).
-  flat="$(tr -d '\r' < "$plan_out" | tr '\n' ' ')"
-  plan_json="$(printf '%s' "$flat" | grep -oE '\{[^{}]*nuclei_tags.*\}' | head -1)"
-  [ -z "$plan_json" ] && plan_json="$(printf '%s' "$flat" | grep -oE '\{.*\}' | head -1)"
-  [ -z "$plan_json" ] && plan_json="$(cat "$plan_out")"
+  # Strip multi-line thinking tags (<think>...</think>) from reasoning models (DeepSeek-R1, Qwen, Claude 3.7)
+  clean_reply="$(awk '
+    /<think>/ { in_think=1; next }
+    /<\/think>/ { in_think=0; next }
+    !in_think { print }
+  ' "$plan_out" 2>/dev/null | sed -E 's/```(json)?//g; s/```//g')"
+
+  # Extract valid JSON containing nuclei_tags or wordlists using jq/awk
+  plan_json=""
+  if have jq; then
+    if printf '%s\n' "$clean_reply" | jq -e . >/dev/null 2>&1; then
+      plan_json="$clean_reply"
+    else
+      cand="$(printf '%s\n' "$clean_reply" | awk '/^[[:space:]]*\{/{p=1} p{print} /^[[:space:]]*\}/{if(p){print; exit}}' 2>/dev/null)"
+      if [ -n "$cand" ] && printf '%s\n' "$cand" | jq -e . >/dev/null 2>&1; then
+        plan_json="$cand"
+      fi
+    fi
+  fi
+
+  if [ -z "$plan_json" ]; then
+    flat="$(printf '%s' "$clean_reply" | tr '\r\n' '  ')"
+    plan_json="$(printf '%s' "$flat" | grep -oE '\{.*\}' | head -1)"
+    [ -z "$plan_json" ] && plan_json="$(cat "$plan_out")"
+  fi
 
   # --- parse nuclei tags ---
   # Explicit JSON tags are trusted against the WIDE allowlist (so the AI can pick real

@@ -125,10 +125,16 @@ if [ "${#missing[@]}" -gt 0 ] && [ "$DOCTOR" != 1 ]; then
 fi
 [ "$DOCTOR" = 1 ] || have ffuf || warn "ffuf not found - content-discovery step will be skipped."
 
-# Self-heal preflight: refresh nuclei templates on request (UPDATE_TEMPLATES=1 / -U behaviour).
-if [ "$DOCTOR" != 1 ] && [ "$UPDATE_TEMPLATES" = 1 ] && have nuclei; then
-  log "Self-heal: updating nuclei templates (this can take a bit)…"
-  nuclei -update-templates -silent >/dev/null 2>&1 || warn "nuclei template update failed (continuing)"
+# Self-heal preflight: refresh nuclei templates on request (UPDATE_TEMPLATES=1 / -U)
+# or auto-bootstrap if nuclei is installed but templates are completely absent.
+if [ "$DOCTOR" != 1 ] && have nuclei; then
+  if [ "$UPDATE_TEMPLATES" = 1 ]; then
+    log "Self-heal: updating nuclei templates (this can take a bit)…"
+    nuclei -update-templates -silent >/dev/null 2>&1 || warn "nuclei template update failed (continuing)"
+  elif [ -z "$(locate_nuclei_templates)" ]; then
+    log "Self-heal: nuclei templates not found - auto-downloading (nuclei -update-templates)…"
+    nuclei -update-templates -silent >/dev/null 2>&1 || warn "nuclei template download failed (continuing)"
+  fi
 fi
 
 AI_ENABLED=1

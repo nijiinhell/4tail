@@ -164,10 +164,26 @@ else
     [ "$smaps" -gt 0 ] && set_stage $S_JS running "source maps: $smaps recovered, $(nlines "$smap_endpoints_file") endpoints"
   fi
   if [ -s "$js_secrets_file" ]; then
-    # Drop false positives: syntax highlighter keyword lists, long space-separated words, and common code constants
+    # High-precision noise suppression:
+    # 1. Drop syntax highlighter keyword lists, long space-separated words, and common code constants
+    # 2. Drop asset paths, media/font extensions, placeholder/dummy values, and JS framework keywords
     grep -vE '([a-zA-Z]+[[:space:]]+){3,}' "$js_secrets_file" 2>/dev/null \
-      | grep -ivE '(true|false|null|undefined|application/json|text/html|void 0|this\.)' \
-      | sort -u > "$js_secrets_file.tmp" && mv "$js_secrets_file.tmp" "$js_secrets_file"
+      | grep -ivE '(true|false|null|undefined|application/json|text/html|void 0|this\.|window\.|process\.env|document\.|console\.log|export (default|const)|import \{|class [a-zA-Z])' \
+      | grep -ivE '/(api|v[0-9]+|assets|static|images|chunks|packs)/|\.(png|jpe?g|gif|svg|css|woff2?|ttf|eot|ico|map)' \
+      | grep -ivE '(placeholder|dummy|example|sample|changeme|default_value|your[-_]?key|xxxx+|123456)' \
+      | awk -F'\t' '{ k=($NF); if(!seen[k]++) print }' > "$js_secrets_file.tmp" && mv "$js_secrets_file.tmp" "$js_secrets_file"
+
+    # Emit canonical findings into findings.jsonl
+    while IFS=$'\t' read -r j_src j_det j_ver j_val; do
+      [ -n "$j_src" ] || continue
+      if [ -n "$j_val" ]; then
+        s_sev="medium"
+        [ "$j_ver" = "VERIFIED" ] && s_sev="critical"
+        emit_finding js "secret-$j_det" "$s_sev" "$j_src" "TruffleHog ($j_ver): $j_det found"
+      elif [ -n "$j_det" ]; then
+        emit_finding js "secret-candidate" "medium" "$j_src" "Pattern matched: $(printf '%.60s' "$j_det")"
+      fi
+    done < "$js_secrets_file"
   fi
   # 3) param discovery (arjun if available) - arjun is slow, so background each host
   #    and keep the dashboard ticking instead of freezing.

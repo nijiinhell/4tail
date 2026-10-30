@@ -145,6 +145,14 @@ UPDATE_TEMPLATES="${UPDATE_TEMPLATES:-0}" # 1 = nuclei -update-templates before 
 EMIT_SARIF="${EMIT_SARIF:-0}"            # 1 = also write findings.sarif
 NUCLEI_TAG_INDEX="${NUCLEI_TAG_INDEX:-1}" # 1 = index REAL category tags from the installed templates so the AI plan isn't limited to the hardcoded allowlist
 NUCLEI_TEMPLATES_DIR="${NUCLEI_TEMPLATES_DIR:-}" # override template store path; auto-located if empty
+locate_nuclei_templates() {
+  [ -n "$NUCLEI_TEMPLATES_DIR" ] && { [ -d "$NUCLEI_TEMPLATES_DIR" ] && printf '%s\n' "$NUCLEI_TEMPLATES_DIR"; return; }
+  local d; d="$(jq -r '."nuclei-templates-directory" // empty' "$HOME/.config/nuclei/.templates-config.json" 2>/dev/null)"
+  [ -n "$d" ] && [ -d "$d" ] && { printf '%s\n' "$d"; return; }
+  for d in "$HOME/nuclei-templates" "$HOME/.local/nuclei-templates" /root/nuclei-templates /root/.local/nuclei-templates; do
+    [ -d "$d" ] && { printf '%s\n' "$d"; return; }
+  done
+}
 
 # --- Staleness ranking + OAST (blind-bug confirmation) ----------------------
 STALE_RANK="${STALE_RANK:-1}"            # 1 = compute a per-host "legacy" score; AI funnels budget to older stacks first

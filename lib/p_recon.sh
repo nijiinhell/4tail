@@ -102,7 +102,7 @@ fi
 : > "$dns_hygiene_file"
 # Subdomain takeover candidates: CNAME pointing to dangling cloud services with 404/0 status
 if [ -s "$httpx_json" ]; then
-  takeover_candidates="$(jq -r 'select(.cname != null) | select(.cname | test("(s3.*amazonaws\\.com|herokuapp\\.com|herokudns\\.com|github\\.io|azurewebsites\\.net|cloudapp\\.net|trafficmanager\\.net|elasticbeanstalk\\.com|zendesk\\.com|readme\\.io|myshopify\\.com|surge\\.sh)")) | select(.status_code == 404 or .status_code == 0) | "\(.url)\t\(.cname)\tstatus=\(.status_code)"' "$httpx_json" 2>/dev/null || true)"
+  takeover_candidates="$(jq -r 'select(.cname != null) | select(.cname | test("(s3.*amazonaws\\.com|herokuapp\\.com|herokudns\\.com|github\\.io|azurewebsites\\.net|cloudapp\\.net|trafficmanager\\.net|elasticbeanstalk\\.com|zendesk\\.com|readme\\.io|myshopify\\.com|surge\\.sh|vercel-dns\\.com|netlify\\.app|fly\\.dev|fastly\\.net|fastlylb\\.net|ghost\\.io|webflow\\.io|pantheonsite\\.io|bitbucket\\.io|cloudfront\\.net)")) | select(.status_code == 404 or .status_code == 0) | "\(.url)\t\(.cname)\tstatus=\(.status_code)"' "$httpx_json" 2>/dev/null || true)"
   if [ -n "$takeover_candidates" ]; then
     while IFS=$'\t' read -r t_url t_cname t_stat; do
       [ -n "$t_url" ] || continue
@@ -241,9 +241,7 @@ if [ "$STALE_RANK" = 1 ] && have jq && [ -s "$httpx_json" ]; then
 fi
 
 # Resolve the strategy blueprint (AI-chosen from the tech surface when BLUEPRINT=auto).
-# Only needed for the active funnel (-C), where it sets focus/specialists/caps.
-if [ "$CRAWL" = 1 ]; then
-  resolve_blueprint
-  log "Blueprint: ${BLUEPRINT_NAME:-defaults}  (focus: $ACT_FOCUS | specialists: $ACT_SPECIALISTS)"
-fi
+# Applies focus/specialists/caps and FUZZING_STRATEGY (e.g. light for SPA targets).
+resolve_blueprint
+log "Blueprint: ${BLUEPRINT_NAME:-defaults}  (focus: $ACT_FOCUS | specialists: $ACT_SPECIALISTS | fuzz: ${FUZZING_STRATEGY:-normal})"
 

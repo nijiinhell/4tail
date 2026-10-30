@@ -113,7 +113,7 @@ agent_tool_run() {   # name  target  extra
       host="$(printf '%s' "$tgt" | sed -E 's#^[a-z]+://##; s#[:/].*##')"
       if have dig; then cn="$(dig +short CNAME "$host" 2>/dev/null | tail -1)"; else cn="$(host -t CNAME "$host" 2>/dev/null | awk '{print $NF}')"; fi
       res="CNAME: ${cn:-none}"
-      printf '%s' "$cn" | grep -qiE '(s3.*amazonaws|herokudns|github\.io|azurewebsites|elasticbeanstalk|trafficmanager|zendesk|readme\.io|myshopify|surge\.sh)' && hit="DANGLING-CNAME" ;;
+      printf '%s' "$cn" | grep -qiE '(s3.*amazonaws|herokudns|github\.io|azurewebsites|elasticbeanstalk|trafficmanager|zendesk|readme\.io|myshopify|surge\.sh|vercel-dns|netlify|fly\.dev|fastly|ghost\.io|webflow|pantheonsite|bitbucket|cloudfront)' && hit="DANGLING-CNAME" ;;
     cors)
       raw="$(_cap curl -s -i --max-time 10 -H "Origin: https://evil-$domain" ${CURL_NET[@]+"${CURL_NET[@]}"} "$tgt" 2>/dev/null | head -c 2000)"
       acao="$(printf '%s' "$raw" | grep -i 'access-control-allow-origin' | tr -d '\r')"
