@@ -32,6 +32,11 @@ else
           *)     echo "${u%/}/$jrel" ;;
         esac; done
   done >> "$js_urls_file"
+  # Fold in historical JS bundles discovered by passive archives (gau/wayback/waymore)
+  if [ -s "${urls_archive_file:-}" ]; then
+    grep -iE '\.js([?#]|$)' "$urls_archive_file" 2>/dev/null \
+      | grep -ivE '\.(json|jsp|map|css)([?#]|$)' >> "$js_urls_file" || true
+  fi
   sort -u -o "$js_urls_file" "$js_urls_file"
   # SPA fallback: if scraping + subjs/getJS came up nearly empty (some SPAs inject their
   # scripts dynamically, so there's nothing to scrape), probe common entry-bundle names on

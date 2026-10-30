@@ -21,7 +21,7 @@ _4T_LIB="$_4T_DIR/lib"
 # explicit tuning vars BEFORE config applies defaults; the rest define helpers and
 # then run the pipeline top-to-bottom (same order as the monolith).
 _4T_MODS="00-prelude config cli dashboard helpers agent_tools blueprints ai doctor \
-          p_recon p_js p_plan p_fuzz p_funnel p_nuclei p_agent p_report"
+          p_recon p_archive p_js p_plan p_fuzz p_funnel p_nuclei p_agent p_report"
 
 # Fail clearly if a section is missing (e.g. only 4tail.sh was copied without lib/).
 for _4t_mod in $_4T_MODS; do

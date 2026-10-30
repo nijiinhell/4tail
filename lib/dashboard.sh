@@ -4,10 +4,10 @@
 if [ -t 1 ] && [ "$NO_TUI" != "1" ]; then TUI=1; else TUI=0; fi
 
 # Stages (named indices so the order is easy to change).
-S_SUBS=0 S_LIVE=1 S_JS=2 S_PLAN=3 S_FUZZ=4 S_CRAWL=5 S_NUCLEI=6 S_AGENT=7 S_TRIAGE=8
-ST_LABEL=("Subdomains" "Live hosts" "JS & params" "AI scan plan" "Fuzzing" "Active funnel" "Nuclei scan" "AI agent" "AI triage")
-ST_STATE=(pending pending pending pending pending pending pending pending pending)
-ST_DETAIL=("" "" "" "" "" "" "" "" "")
+S_SUBS=0 S_LIVE=1 S_ARCH=2 S_JS=3 S_PLAN=4 S_FUZZ=5 S_CRAWL=6 S_NUCLEI=7 S_AGENT=8 S_TRIAGE=9
+ST_LABEL=("Subdomains" "Live hosts" "Archive URLs" "JS & secrets" "AI scan plan" "Fuzzing" "Active funnel" "Nuclei scan" "AI agent" "AI triage")
+ST_STATE=(pending pending pending pending pending pending pending pending pending pending)
+ST_DETAIL=("" "" "" "" "" "" "" "" "" "")
 SUP_NOTE=""                              # latest AI-supervisor status line
 # Loot feed state: a bounded in-memory history of findings ("sev\tsrc\ttext"),
 # plus a per-file cursor so each source file is only read for its new lines.
@@ -92,11 +92,32 @@ loot_scan() {  # file  src  mode
   done < <(sed -n "$((cur+1)),${total}p" "$file")
   LOOT_SEEN[$file]="$total"
 }
-# Pull fresh findings from every known source (throttled to ~1/s).
+# Read from canonical structured JSONL findings store
+loot_scan_jsonl() {
+  local file="$1"
+  [ -n "$file" ] && [ -f "$file" ] || return 0
+  local total cur l sev src tgt ev
+  total="$(wc -l < "$file" 2>/dev/null | tr -d ' ')"
+  [ -n "$total" ] 2>/dev/null || total=0
+  cur="${LOOT_SEEN[$file]:-0}"
+  [ "$total" -le "$cur" ] && return 0
+  while IFS= read -r l; do
+    [ -n "$l" ] || continue
+    sev="$(printf '%s' "$l" | jq -r '.severity // "info"' 2>/dev/null)"
+    src="$(printf '%s' "$l" | jq -r '.stage // "hit"' 2>/dev/null)"
+    tgt="$(printf '%s' "$l" | jq -r '.target // ""' 2>/dev/null)"
+    ev="$(printf '%s' "$l" | jq -r '.evidence // ""' 2>/dev/null)"
+    loot_add "${sev:-info}" "${src:-hit}" "${tgt:+$tgt }${ev}"
+  done < <(sed -n "$((cur+1)),${total}p" "$file")
+  LOOT_SEEN[$file]="$total"
+}
+
+# Pull fresh findings from canonical JSONL store and legacy specialists (throttled to ~1/s).
 loot_refresh() {
   [ "$LOOT_FEED" = 1 ] || return 0
   [ $((SECONDS - LOOT_LAST)) -lt 1 ] && return 0
   LOOT_LAST=$SECONDS
+  [ -n "${findings_jsonl:-}" ] && loot_scan_jsonl "$findings_jsonl"
   loot_scan "${fuzz_findings_file:-}"      ffuf    ffuf
   loot_scan "${dast_file:-}"               dast    nuclei
   loot_scan "${nuclei_file:-}"             nuclei  nuclei

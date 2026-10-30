@@ -37,6 +37,24 @@ agent_sev() {
 # file-ish query value (?file=app.js) is kept. Used to clean input to the slow scanners.
 drop_static() { awk -v re="$STATIC_URL_RE" '{ p=tolower($0); sub(/[?#].*/,"",p); if (p !~ re) print }'; }
 
+# Unified findings emitter (writes structured JSONL to $findings_jsonl)
+emit_finding() {  # stage type severity target evidence [poc]
+  local stage="$1" type="$2" sev="$3" tgt="$4" ev="$5" poc="${6:-}"
+  [ -n "${findings_jsonl:-}" ] || findings_jsonl="$OUTDIR/findings/findings.jsonl"
+  mkdir -p "$(dirname "$findings_jsonl")" 2>/dev/null
+  local ts; ts="$(date -u +"%Y-%m-%dT%H:%M:%SZ" 2>/dev/null || date +"%Y-%m-%dT%H:%M:%SZ")"
+  jq -c -n \
+    --arg ts "$ts" \
+    --arg stage "$stage" \
+    --arg type "$type" \
+    --arg sev "$(printf '%s' "$sev" | tr 'A-Z' 'a-z')" \
+    --arg tgt "$tgt" \
+    --arg ev "$ev" \
+    --arg poc "$poc" \
+    '{timestamp: $ts, stage: $stage, type: $type, severity: $sev, target: $tgt, evidence: $ev, poc: $poc}' \
+    >> "$findings_jsonl" 2>/dev/null || true
+}
+
 # ---- Correlation / exploitation helpers (all GET/HEAD, scope-locked, capped) ----
 # Two response "sizes" are the same resource if within 10% (Autorize-style diff).
 _near() { awk -v a="${1:-0}" -v b="${2:-0}" 'BEGIN{d=a-b;if(d<0)d=-d;m=(a>b?a:b);exit !(a==b || (m>0 && d<=0.10*m))}'; }
@@ -56,11 +74,19 @@ try_403_bypass() {
     origin="$scheme://$host"
     for t in "$path/" "$path/." "/.$path" "$path%2e" "$path%20" "$path%09" "$path..;/" "$path?" ; do
       code="$(curl -s -o /dev/null -w '%{http_code}' -L --max-time 8 ${CURL_NET[@]+"${CURL_NET[@]}"} "$origin$t" 2>/dev/null || echo 000)"
-      case "$code" in 200|201|202|203|206|301|302|307) printf '%s -> %s via path trick %s\n' "$url" "$code" "$origin$t" >> "$bypass_file"; n=$n ; break ;; esac
+      case "$code" in 200|201|202|203|206|301|302|307)
+        printf '%s -> %s via path trick %s\n' "$url" "$code" "$origin$t" >> "$bypass_file"
+        emit_finding bypass auth-bypass medium "$origin$t" "403 bypass from $url to $code via path trick $t" "curl -i '$origin$t'"
+        break ;;
+      esac
     done
     for h in "X-Forwarded-For: 127.0.0.1" "X-Original-URL: $path" "X-Rewrite-URL: $path" "X-Custom-IP-Authorization: 127.0.0.1" "X-Forwarded-Host: localhost" "X-Host: localhost" "X-Real-IP: 127.0.0.1" ; do
       code="$(curl -s -o /dev/null -w '%{http_code}' --max-time 8 ${CURL_NET[@]+"${CURL_NET[@]}"} -H "$h" "$url" 2>/dev/null || echo 000)"
-      case "$code" in 200|201|202|203|206) printf '%s -> %s via header %s\n' "$url" "$code" "$h" >> "$bypass_file"; break ;; esac
+      case "$code" in 200|201|202|203|206)
+        printf '%s -> %s via header %s\n' "$url" "$code" "$h" >> "$bypass_file"
+        emit_finding bypass auth-bypass medium "$url" "403 bypass to $code via header $h" "curl -i -H '$h' '$url'"
+        break ;;
+      esac
     done
   done
 }
@@ -88,7 +114,10 @@ propagate_paths() {
       grep -qF "$origin$p" "$fuzz_findings_file" 2>/dev/null && continue  # already known on this host
       code="$(curl -s -o /dev/null -w '%{http_code}' --max-time 8 ${CURL_NET[@]+"${CURL_NET[@]}"} "$origin$p" 2>/dev/null || echo 000)"
       # Only record genuine 200 OK hits (never 401/403 WAF blocks or generic redirects)
-      [ "$code" = 200 ] && printf '%s\t%s\n' "$code" "$origin$p" >> "$prop_file"
+      if [ "$code" = 200 ]; then
+        printf '%s\t%s\n' "$code" "$origin$p" >> "$prop_file"
+        emit_finding propagation shared-path low "$origin$p" "Discovered path active on sibling host (200 OK)" "curl -i '$origin$p'"
+      fi
     done <<< "$paths"
   done <<< "$hosts"
 }
@@ -109,11 +138,17 @@ idor_check() {
     [ "$ca" = 200 ] && [ "${sa:-0}" -gt 0 ] 2>/dev/null || continue   # only resources A can actually read
     rx="$(curl -s -o /dev/null -w '%{http_code} %{size_download}' --max-time 10 ${CURL_NET[@]+"${CURL_NET[@]}"} "$u" 2>/dev/null || echo '000 0')"
     cx="${rx%% *}"; sx="${rx##* }"
-    [ "$cx" = 200 ] && _near "$sa" "$sx" && printf '[ANON-ACCESS] %s | authorized content served with NO session (A=200/%s anon=200/%s)\n' "$u" "$sa" "$sx" >> "$idor_file"
+    if [ "$cx" = 200 ] && _near "$sa" "$sx"; then
+      printf '[ANON-ACCESS] %s | authorized content served with NO session (A=200/%s anon=200/%s)\n' "$u" "$sa" "$sx" >> "$idor_file"
+      emit_finding idor anon-access high "$u" "Authorized content served with NO session (A=200/$sa anon=200/$sx)" "curl -i '$u'"
+    fi
     if [ -n "$AUTH_B" ]; then
       rb="$(curl -s -o /dev/null -w '%{http_code} %{size_download}' --max-time 10 ${CURL_NET[@]+"${CURL_NET[@]}"} -H "$AUTH_B" "$u" 2>/dev/null || echo '000 0')"
       cb="${rb%% *}"; sb="${rb##* }"
-      [ "$cb" = 200 ] && _near "$sa" "$sb" && printf '[IDOR?] %s | user B gets the same resource as user A (A=200/%s B=200/%s) - verify object ownership\n' "$u" "$sa" "$sb" >> "$idor_file"
+      if [ "$cb" = 200 ] && _near "$sa" "$sb"; then
+        printf '[IDOR?] %s | user B gets the same resource as user A (A=200/%s B=200/%s) - verify object ownership\n' "$u" "$sa" "$sb" >> "$idor_file"
+        emit_finding idor idor high "$u" "User B receives same resource as user A (A=200/$sa B=200/$sb)" "curl -i -H '$AUTH_B' '$u'"
+      fi
     fi
   done <<< "$cand"
 
@@ -142,6 +177,7 @@ idor_check() {
     # skip if the endpoint 200s even for a bogus id with a similar body (not id-scoped)
     if [ "$ccc" = 200 ] && _near "$salt" "$scc"; then continue; fi
     printf '[PATH-IDOR?] %s -> %s | identity A reads neighbour object id %s (200/%sB; bogus id -> %s/%sB) - verify ownership\n' "$purl" "$alturl" "$alt" "$salt" "$ccc" "$scc" >> "$idor_file"
+    emit_finding idor path-bola high "$alturl" "Identity A reads neighbour object id $alt ($purl -> $alturl)" "curl -i -H '$AUTH_A' '$alturl'"
   done <<< "$pcand"
 }
 

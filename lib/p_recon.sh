@@ -108,6 +108,7 @@ if [ -s "$httpx_json" ]; then
       [ -n "$t_url" ] || continue
       echo "[takeover-candidate] $t_url -> dangling CNAME $t_cname ($t_stat) - verify unclaimed cloud tenant" >> "$dns_hygiene_file"
       [ -n "${takeover_file:-}" ] && printf '%s\t%s\t%s\n' "$t_url" "$t_cname" "$t_stat" >> "$takeover_file"
+      emit_finding recon takeover high "$t_url" "Dangling CNAME $t_cname ($t_stat) - potential subdomain takeover"
     done <<< "$takeover_candidates"
   fi
 fi
@@ -120,18 +121,36 @@ if [ "$DNS_HYGIENE" = 1 ] && [ "$NO_ARCHIVE" != 1 ] && { have dig || have dnsx |
            elif have dnsx; then printf '%s\n' "$1" | dnsx -silent -ns -resp-only 2>/dev/null
            elif have host; then host -t NS "$1" 2>/dev/null | awk '/name server/{print $NF}'; fi; }
   spf="$(_txt "$domain" | grep -i 'v=spf1' | head -1)"
-  if [ -z "$spf" ]; then echo "[email-spoofing] no SPF record on $domain - sender spoofing possible" >> "$dns_hygiene_file"
-  else case "$spf" in *'+all'*|*'?all'*) echo "[email-spoofing] weak SPF ('$(printf '%s' "$spf" | grep -oiE '[+?]all')') on $domain" >> "$dns_hygiene_file" ;; esac; fi
+  if [ -z "$spf" ]; then
+    echo "[email-spoofing] no SPF record on $domain - sender spoofing possible" >> "$dns_hygiene_file"
+    emit_finding recon email-spoofing low "$domain" "No SPF record configured - sender spoofing possible"
+  else
+    case "$spf" in *'+all'*|*'?all'*)
+      echo "[email-spoofing] weak SPF ('$(printf '%s' "$spf" | grep -oiE '[+?]all')') on $domain" >> "$dns_hygiene_file"
+      emit_finding recon email-spoofing low "$domain" "Weak SPF record: $(printf '%s' "$spf" | grep -oiE '[+?]all')"
+      ;;
+    esac
+  fi
   dmarc="$(_txt "_dmarc.$domain" | grep -i 'v=DMARC1' | head -1)"
-  if [ -z "$dmarc" ]; then echo "[email-spoofing] no DMARC record on $domain - spoofed mail not rejected" >> "$dns_hygiene_file"
-  else case "$dmarc" in *'p=none'*) echo "[email-spoofing] DMARC p=none on $domain (monitor-only, does not block spoofing)" >> "$dns_hygiene_file" ;; esac; fi
+  if [ -z "$dmarc" ]; then
+    echo "[email-spoofing] no DMARC record on $domain - spoofed mail not rejected" >> "$dns_hygiene_file"
+    emit_finding recon email-spoofing low "$domain" "No DMARC record configured - spoofed mail not rejected"
+  else
+    case "$dmarc" in *'p=none'*)
+      echo "[email-spoofing] DMARC p=none on $domain (monitor-only, does not block spoofing)" >> "$dns_hygiene_file"
+      emit_finding recon email-spoofing low "$domain" "DMARC p=none policy (monitor-only)"
+      ;;
+    esac
+  fi
   if have dig || have host; then
     _ns "$domain" | sed 's/\.$//' | sort -u | head -4 | while IFS= read -r ns; do
       [ -n "$ns" ] || continue
       if have dig; then axfr="$(tmo 12 dig +short axfr "$domain" "@$ns" 2>/dev/null | head -c 2000)"
       else axfr="$(tmo 12 host -l "$domain" "$ns" 2>/dev/null | grep -iv 'Transfer failed\|not found\|no servers' | head -c 2000)"; fi
-      [ -n "$axfr" ] && printf '%s\n' "$axfr" | grep -qiE '(IN[[:space:]]+(A|CNAME|MX|NS)|has address|name server)' \
-        && echo "[zone-transfer] AXFR allowed from $ns for $domain - full DNS zone disclosed (HIGH)" >> "$dns_hygiene_file"
+      if [ -n "$axfr" ] && printf '%s\n' "$axfr" | grep -qiE '(IN[[:space:]]+(A|CNAME|MX|NS)|has address|name server)'; then
+        echo "[zone-transfer] AXFR allowed from $ns for $domain - full DNS zone disclosed (HIGH)" >> "$dns_hygiene_file"
+        emit_finding recon zone-transfer high "$domain" "AXFR allowed from $ns - DNS zone disclosed"
+      fi
     done
   fi
 fi

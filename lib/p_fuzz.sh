@@ -234,6 +234,10 @@ if ls "$fuzz_dir"/*.json >/dev/null 2>&1; then
   { for s in 200 302 301 307 401 403 405 500 204; do awk -F'\t' -v s="$s" '$1==s' "$OUTDIR/.fuzz_raw"; done
     awk -F'\t' '$1!~/^(200|301|302|307|401|403|405|500|204)$/' "$OUTDIR/.fuzz_raw"; } > "$fuzz_findings_file"
   rm -f "$OUTDIR/.fuzz_raw"
+  awk -F'\t' '$1==200 && $3~/\.(env|git|bak|old|sql|conf|config|yml|yaml|zip|tar|gz|properties|ini|log)($|[?#])/' "$fuzz_findings_file" 2>/dev/null \
+    | while IFS=$'\t' read -r _st _len _url; do
+        emit_finding fuzz exposure high "$_url" "Exposed sensitive file: HTTP $_st ($_len bytes)" "curl -i '$_url'"
+      done
 fi
 fuzz_hits="$(nlines "$fuzz_findings_file")"
 

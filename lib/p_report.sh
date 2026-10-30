@@ -226,6 +226,9 @@ if have jq; then
   nsev() { printf '%s' "$1" | grep -oiE '\[(critical|high|medium|low|info|unknown)\]' | head -1 | tr -d '[]' | tr 'A-Z' 'a-z'; }
   nurl() { printf '%s' "$1" | grep -oE 'https?://[^ ]+' | head -1; }
   {
+    if [ -s "${findings_jsonl:-}" ]; then
+      jq -c '. | {type:.type, severity:(.severity // "info"), source:(.stage // "hit"), url:(.target // ""), detail:.evidence}' "$findings_jsonl" 2>/dev/null
+    fi
     [ -f "$nuclei_file" ] && while IFS= read -r l; do [ -n "$l" ] && emit_f nuclei "$(nsev "$l")" nuclei "$(nurl "$l")" "$l"; done < "$nuclei_file"
     [ -f "$dast_file" ]   && while IFS= read -r l; do [ -n "$l" ] && emit_f dast "$(nsev "$l")" nuclei-dast "$(nurl "$l")" "$l"; done < "$dast_file"
     # Group ffuf hits by response fingerprint (status,length) - never by URL string -

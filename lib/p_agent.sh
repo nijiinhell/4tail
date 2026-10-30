@@ -24,6 +24,7 @@ else
     local f="$agent_loot_dir/$(printf '%s' "$1" | tr -c 'A-Za-z0-9._-' '_' | tail -c 120).txt"
     { echo "# $1"; printf '%s\n' "$2"; } > "$f"
     printf '[SECRET-LOOT] %s | raw response with credentials saved -> %s\n' "$1" "$f" >> "$agent_file"
+    emit_finding agent secret-loot critical "$1" "Raw response with credentials captured -> $f" "curl -i '$1'"
   }
   agent_is_vuln_confirmed() { # $1=url $2=why $3=resp
     local url="$1" why="$2" resp="$3"
@@ -164,6 +165,7 @@ $results" > "$aout" 2>>"$llm_log" || true
         if [ "$phit" = HIT ]; then
           if agent_is_vuln_confirmed "$purl" "$pwhy" "$presp"; then
             printf '[CONFIRMED] POST %s (body: %s) | %s\n' "$purl" "$pbody" "$pwhy" >> "$agent_file"
+            emit_finding agent post-confirmed high "$purl" "$pwhy" "curl -i -X POST -H 'Content-Type: $pct' --data '$pbody' '$purl'"
           else
             printf '[REFUTED-OR-CATCHALL] POST %s | %s\n' "$purl" "$pwhy" >> "$agent_log"
           fi
@@ -193,6 +195,7 @@ $results" > "$aout" 2>>"$llm_log" || true
       if [ "$hit" = HIT ]; then
         if agent_is_vuln_confirmed "$url" "$why" "$resp"; then
           printf '[CONFIRMED] %s | %s\n' "$url" "$why" >> "$agent_file"
+          emit_finding agent get-confirmed high "$url" "$why" "curl -i '$url'"
         else
           printf '[REFUTED-OR-CATCHALL] %s | %s\n' "$url" "$why" >> "$agent_log"
         fi

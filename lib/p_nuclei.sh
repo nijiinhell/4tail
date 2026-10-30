@@ -71,6 +71,7 @@ else
               -rate-limit "$NUCLEI_RATELIMIT" -timeout "$NUCLEI_TIMEOUT"
               -retries "$NUCLEI_RETRIES" -mhe "$NUCLEI_MHE"
               -c "$NUCLEI_CONC" -bulk-size "$NUCLEI_BULK"
+              -resume "$OUTDIR/.nuclei_resume.cfg"
               -l "$nuclei_targets_file" -o "$nuclei_file")
   [ "${#NUCLEI_NET[@]}" -gt 0 ] && nuclei_cmd+=("${NUCLEI_NET[@]}")
   if [ "$NUCLEI_MAX_TIME" -gt 0 ] 2>/dev/null && have timeout; then
@@ -129,6 +130,15 @@ error sample: $(grep -iv '^{' "$nuclei_stats_file" | grep -iE 'error|timeout|ref
   fi
   render
   touch "$OUTDIR/.done_nuclei"
+fi
+if [ -s "$nuclei_file" ]; then
+  while IFS= read -r nline; do
+    [ -n "$nline" ] || continue
+    _t_id="$(printf '%s' "$nline" | grep -oE '^\[[^]]+\]' | tr -d '[]')"
+    _sev="$(printf '%s' "$nline" | grep -oiE '\[(critical|high|medium|low|info)\]' | head -1 | tr -d '[]' | tr 'A-Z' 'a-z')"
+    _url="$(printf '%s' "$nline" | grep -oE 'https?://[^ ]+' | head -1)"
+    emit_finding nuclei "${_t_id:-cve}" "${_sev:-medium}" "${_url:-$domain}" "$nline"
+  done < "$nuclei_file"
 fi
 find_count=$(wc -l < "$nuclei_file" 2>/dev/null || echo 0)
 set_stage $S_NUCLEI done "$find_count findings$(done_marker nuclei && echo ' (resumed)')"

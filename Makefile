@@ -4,7 +4,7 @@
 
 LIBS = lib/00-prelude.sh lib/config.sh lib/cli.sh lib/dashboard.sh lib/helpers.sh \
        lib/agent_tools.sh lib/blueprints.sh lib/ai.sh lib/doctor.sh \
-       lib/p_recon.sh lib/p_js.sh lib/p_plan.sh lib/p_fuzz.sh lib/p_funnel.sh \
+       lib/p_recon.sh lib/p_archive.sh lib/p_js.sh lib/p_plan.sh lib/p_fuzz.sh lib/p_funnel.sh \
        lib/p_nuclei.sh lib/p_agent.sh lib/p_report.sh
 
 .PHONY: build check clean

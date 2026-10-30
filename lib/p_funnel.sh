@@ -21,15 +21,18 @@ else
   set_stage $S_CRAWL running "collecting URLs"
   esc_domain="$(printf '%s' "$domain" | sed 's/\./\\./g')"
   : > "$urls_file"
-  # (A) Broad / passive URL collection - WAF-safe. Run ALL available sources and UNION them
-  # (waymore adds commoncrawl+alienvault+urlscan, but gau/waybackurls often surface URLs it
-  # misses) - more coverage, deduped later anyway.
-  [ "$NO_ARCHIVE" != 1 ] && have gau         && { printf '%s\n' "$domain" | tmo "$GAU_MAX_TIME" gau --subs --blacklist png,jpg,jpeg,gif,svg,woff,woff2,ttf,eot,ico,css 2>>"$llm_log" | grep -ivE '\.(png|jpe?g|gif|svg|woff2?|ttf|eot|ico|css)([?#]|$)' | head -n 50000 >> "$urls_file" || true; }
-  [ "$NO_ARCHIVE" != 1 ] && have waybackurls && { printf '%s\n' "$domain" | tmo "$GAU_MAX_TIME" waybackurls 2>>"$llm_log" | grep -ivE '\.(png|jpe?g|gif|svg|woff2?|ttf|eot|ico|css)([?#]|$)' | head -n 50000 >> "$urls_file" || true; }
-  if [ "$NO_ARCHIVE" != 1 ] && [ "$USE_WAYMORE" = 1 ] && have waymore; then
-    set_stage $S_CRAWL running "waymore: aggregating more sources"
-    tmo "$((GAU_MAX_TIME*2))" waymore -i "$domain" -mode U -oU "$OUTDIR/.waymore.txt" >/dev/null 2>>"$llm_log" || true
-    [ -f "$OUTDIR/.waymore.txt" ] && cat "$OUTDIR/.waymore.txt" >> "$urls_file"; rm -f "$OUTDIR/.waymore.txt"
+  # (A) Fold in passive archive URLs (collected early in p_archive)
+  if [ -s "${urls_archive_file:-}" ]; then
+    cat "$urls_archive_file" >> "$urls_file"
+  else
+    # Fallback if p_archive was skipped
+    [ "$NO_ARCHIVE" != 1 ] && have gau         && { printf '%s\n' "$domain" | tmo "$GAU_MAX_TIME" gau --subs --blacklist png,jpg,jpeg,gif,svg,woff,woff2,ttf,eot,ico,css 2>>"$llm_log" | grep -ivE '\.(png|jpe?g|gif|svg|woff2?|ttf|eot|ico|css)([?#]|$)' | head -n 50000 >> "$urls_file" || true; }
+    [ "$NO_ARCHIVE" != 1 ] && have waybackurls && { printf '%s\n' "$domain" | tmo "$GAU_MAX_TIME" waybackurls 2>>"$llm_log" | grep -ivE '\.(png|jpe?g|gif|svg|woff2?|ttf|eot|ico|css)([?#]|$)' | head -n 50000 >> "$urls_file" || true; }
+    if [ "$NO_ARCHIVE" != 1 ] && [ "$USE_WAYMORE" = 1 ] && have waymore; then
+      set_stage $S_CRAWL running "waymore: aggregating more sources"
+      tmo "$((GAU_MAX_TIME*2))" waymore -i "$domain" -mode U -oU "$OUTDIR/.waymore.txt" >/dev/null 2>>"$llm_log" || true
+      [ -f "$OUTDIR/.waymore.txt" ] && cat "$OUTDIR/.waymore.txt" >> "$urls_file"; rm -f "$OUTDIR/.waymore.txt"
+    fi
   fi
   if have katana; then
     set_stage $S_CRAWL running "katana crawling…"
@@ -113,6 +116,7 @@ else
         # Must contain legitimate API spec/schema indicators (never plain 401/403 or SPA catch-all HTML)
         if printf '%s' "$resp" | grep -qiE '("openapi"|"swagger"|"paths"[[:space:]]*:|swagger-ui|SwaggerUIBundle|GraphiQL|"__schema")'; then
           printf '%s\n' "$u" >> "$api_specs_file"
+          emit_finding api api-spec info "$u" "Discovered valid API specification endpoint" "curl -i '$u'"
         fi
       done
     done < <(sort -u "$alive_file" 2>/dev/null | head -n 25)
@@ -168,6 +172,7 @@ else
                  --data-urlencode "query=$gql_q" "$gql" 2>/dev/null | head -c 400000)"
       # introspection is OPEN only if the server actually returned a __schema with its types
       printf '%s' "$gresp" | jq -e '.data.__schema.types | length > 0' >/dev/null 2>&1 || continue
+      emit_finding api graphql-introspection high "$gql" "GraphQL introspection OPEN - full schema disclosed" "curl -i -G '$gql' --data-urlencode 'query=$gql_q'"
       {
         echo "== GraphQL introspection OPEN: $gql =="
         printf '%s' "$gresp" | jq -r '
@@ -304,7 +309,12 @@ else
           --threads=2 --timeout=10 --retries=1 --random-agent --flush-session \
           --output-dir="$findings_dir/sqlmap" >/dev/null 2>>"$llm_log"
         grep -rhiE 'parameter .* is vulnerable|is injectable|Type: ' "$findings_dir/sqlmap" 2>/dev/null \
-          | sort -u > "$findings_dir/sqlmap.txt" ) & SPIDS+=($!)
+          | sort -u > "$findings_dir/sqlmap.txt"
+        if [ -s "$findings_dir/sqlmap.txt" ]; then
+          while IFS= read -r _sq_line; do
+            emit_finding dast sqli critical "$sq" "SQL injection confirmed: $_sq_line"
+          done < "$findings_dir/sqlmap.txt"
+        fi ) & SPIDS+=($!)
     fi
   fi
   # live progress while specialists run
@@ -337,6 +347,11 @@ else
       | sed -E 's/\x1b\[[0-9;]*m//g' \
       | grep -viE 'no misconfig|not vulnerable|unreachable|could not|timed out|invalid|connection (refused|error)|^[[:space:]]*-?[[:space:]]*$' \
       | grep -iE 'reflect|wildcard|null origin|arbitrary origin|post-domain|pre-domain|trusted|credentials|origin reflected' > "$corsy_file" || true
+    if [ -s "$corsy_file" ]; then
+      while IFS= read -r _cors_l; do
+        emit_finding cors cors-misconfig medium "$domain" "$_cors_l"
+      done < "$corsy_file"
+    fi
     rm -f "$OUTDIR/.cors_in.txt"
   fi; render
 
