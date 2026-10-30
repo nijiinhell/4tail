@@ -4,6 +4,7 @@
   "focus_areas": ["idor", "auth-bypass", "sqli", "ssrf", "injection"],
   "specialists": ["nuclei-dast", "arjun", "sqlmap"],
   "nuclei_dast_tags": "sqli,ssrf,ssti",
+  "fuzzing_strategy": "light",
   "caps": {
     "max_juicy_urls": 120,
     "max_dalfox": 10,

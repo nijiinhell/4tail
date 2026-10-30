@@ -18,7 +18,38 @@ load_blueprint() { # $1 = name or path; applies focus/specialists/caps
     */*|*.json) [ -f "$bp" ] && f="$bp" ;;
     *) [ -n "$BLUEPRINTS_DIR" ] && [ -f "$BLUEPRINTS_DIR/$bp.json" ] && f="$BLUEPRINTS_DIR/$bp.json" ;;
   esac
-  [ -z "$f" ] && { warn "blueprint '$bp' not found - using built-in active defaults"; return 1; }
+  if [ -z "$f" ]; then
+    # Fallback to embedded default blueprint configurations if blueprints/ directory is not present
+    case "$bp" in
+      spa)
+        BLUEPRINT_NAME="spa"; bp_set ACT_FOCUS "xss,idor,ssrf,redirect,auth-bypass,secrets"
+        bp_set ACT_SPECIALISTS "nuclei-dast,dalfox,kxss,arjun"; bp_set ACT_DAST_TAGS "xss,redirect,ssrf"
+        bp_set FUZZING_STRATEGY "light"; bp_set ACT_MAX_JUICY 120; bp_set ACT_MAX_DALFOX 60
+        bp_set ACT_MAX_KXSS 500; bp_set ACT_MAX_SQLMAP 1; bp_set ACT_MAX_ARJUN 30; return 0 ;;
+      stealth)
+        BLUEPRINT_NAME="stealth"; bp_set ACT_FOCUS "xss,redirect,ssrf"; bp_set ACT_SPECIALISTS "kxss,dalfox"
+        bp_set ACT_DAST_TAGS "xss,redirect,ssrf"; bp_set FUZZING_STRATEGY "light"; bp_set ACT_MAX_JUICY 40
+        bp_set ACT_MAX_DALFOX 15; bp_set ACT_MAX_KXSS 150; bp_set ACT_MAX_SQLMAP 0; bp_set ACT_MAX_ARJUN 0
+        bp_set FFUF_THREADS 5; bp_set FFUF_RATE 10; bp_set NUCLEI_RATELIMIT 25; return 0 ;;
+      wordpress)
+        BLUEPRINT_NAME="wordpress"; bp_set ACT_FOCUS "cve,xss,sqli,lfi,exposure"; bp_set ACT_SPECIALISTS "nuclei-dast,dalfox,kxss"
+        bp_set ACT_DAST_TAGS "xss,sqli,lfi"; bp_set ACT_MAX_JUICY 80; bp_set ACT_MAX_DALFOX 60
+        bp_set ACT_MAX_KXSS 400; bp_set ACT_MAX_SQLMAP 2; bp_set ACT_MAX_ARJUN 15; return 0 ;;
+      graphql)
+        BLUEPRINT_NAME="graphql"; bp_set ACT_FOCUS "idor,auth-bypass,sqli,ssrf,injection"; bp_set ACT_SPECIALISTS "nuclei-dast,arjun,sqlmap"
+        bp_set ACT_DAST_TAGS "sqli,ssrf,ssti"; bp_set FUZZING_STRATEGY "light"; bp_set ACT_MAX_JUICY 120
+        bp_set ACT_MAX_DALFOX 10; bp_set ACT_MAX_KXSS 80; bp_set ACT_MAX_SQLMAP 4; bp_set ACT_MAX_ARJUN 30; return 0 ;;
+      api_bounty)
+        BLUEPRINT_NAME="api_bounty"; bp_set ACT_FOCUS "idor,ssrf,sqli,auth-bypass,ssti"; bp_set ACT_SPECIALISTS "nuclei-dast,arjun,sqlmap"
+        bp_set ACT_DAST_TAGS "sqli,ssrf,ssti,redirect,lfi"; bp_set ACT_MAX_JUICY 120; bp_set ACT_MAX_DALFOX 10
+        bp_set ACT_MAX_KXSS 100; bp_set ACT_MAX_SQLMAP 4; bp_set ACT_MAX_ARJUN 40; return 0 ;;
+      webapp_bounty|*)
+        BLUEPRINT_NAME="webapp_bounty"; bp_set ACT_FOCUS "idor,sqli,xss,ssrf,lfi,redirect,ssti"
+        bp_set ACT_SPECIALISTS "nuclei-dast,dalfox,kxss,arjun,sqlmap"; bp_set ACT_DAST_TAGS "xss,sqli,lfi,ssrf,redirect,ssti"
+        bp_set ACT_MAX_JUICY 100; bp_set ACT_MAX_DALFOX 50; bp_set ACT_MAX_KXSS 400; bp_set ACT_MAX_SQLMAP 3
+        bp_set ACT_MAX_ARJUN 25; return 0 ;;
+    esac
+  fi
   have jq || { warn "jq required for blueprints - using defaults"; return 1; }
   BLUEPRINT_NAME="$(jq -r '.name // "custom"' "$f" 2>/dev/null)"
   bp_set ACT_FOCUS       "$(jq -r '(.focus_areas // []) | join(",")' "$f" 2>/dev/null)"
@@ -33,20 +64,34 @@ load_blueprint() { # $1 = name or path; applies focus/specialists/caps
   bp_set CRAWL_MAX_URLS  "$(jq -r '.caps.crawl_max_urls // empty' "$f" 2>/dev/null)"
   bp_set CRAWL_MAX_TIME  "$(jq -r '.caps.crawl_max_time // empty' "$f" 2>/dev/null)"
   bp_set DAST_MAX_URLS   "$(jq -r '.caps.dast_max_urls // empty' "$f" 2>/dev/null)"
+  bp_set FFUF_THREADS    "$(jq -r '.caps.ffuf_threads // empty' "$f" 2>/dev/null)"
+  bp_set FFUF_RATE       "$(jq -r '.caps.ffuf_rate // empty' "$f" 2>/dev/null)"
+  bp_set NUCLEI_RATELIMIT "$(jq -r '.caps.nuclei_rate_limit // empty' "$f" 2>/dev/null)"
   return 0
 }
 # Resolve the blueprint: explicit name, or AI-chosen from the catalog using the tech brief.
 resolve_blueprint() {
   if [ "$BLUEPRINT" != "auto" ]; then load_blueprint "$BLUEPRINT"; return; fi
   local chosen="webapp_bounty" n pick out
-  # Deterministic: a JS SPA framework in the tech surface -> the spa blueprint (JS-mining +
-  # DOM-XSS + the API behind the front-end). The generic AI pick tends to default to
-  # webapp_bounty and miss that the real surface is the mined /rest + /api, not path fuzzing.
-  if [ -s "$tech_brief" ] && [ -n "$BLUEPRINTS_DIR" ] && [ -f "$BLUEPRINTS_DIR/spa.json" ] \
-     && grep -qiE 'angular|react|vue\.?js|next\.?js|nuxt|svelte|ember|backbone|single[ -]?page' "$tech_brief" 2>/dev/null; then
-    load_blueprint spa
-    [ "$ASSUME_YES" = 1 ] || log "Blueprint: spa (SPA framework detected in tech surface)"
-    return
+  # Deterministic tech surface matchers: pick specialized blueprints for well-identified stacks
+  if [ -s "$tech_brief" ]; then
+    if grep -qiE 'angular|react|vue\.?js|next\.?js|nuxt|svelte|ember|backbone|single[ -]?page' "$tech_brief" 2>/dev/null; then
+      load_blueprint spa
+      [ "$ASSUME_YES" = 1 ] || log "Blueprint: spa (SPA framework detected in tech surface)"
+      return
+    elif grep -qiE 'wordpress|wp-json|wp-content|wp-includes' "$tech_brief" 2>/dev/null; then
+      load_blueprint wordpress
+      [ "$ASSUME_YES" = 1 ] || log "Blueprint: wordpress (WordPress detected in tech surface)"
+      return
+    elif grep -qiE 'graphql|apollo|hasura|graphiql' "$tech_brief" 2>/dev/null; then
+      load_blueprint graphql
+      [ "$ASSUME_YES" = 1 ] || log "Blueprint: graphql (GraphQL endpoint detected in tech surface)"
+      return
+    elif grep -qiE 'swagger|openapi|fastapi|spring[ -]?boot.*rest|api-gateway' "$tech_brief" 2>/dev/null; then
+      load_blueprint api_bounty
+      [ "$ASSUME_YES" = 1 ] || log "Blueprint: api_bounty (API specification/stack detected in tech surface)"
+      return
+    fi
   fi
   if [ "$AI_ENABLED" = 1 ] && [ -n "$BLUEPRINTS_DIR" ] && budget_ok && [ -s "$tech_brief" ]; then
     out="$(mktemp)"
@@ -73,10 +118,12 @@ cleanup() {   # restore terminal, and if we died mid-run with the dashboard up, 
   if [ "${STAGES_BEGAN:-0}" = 1 ] && [ "${_FINISHED:-0}" != 1 ] && [ "$rc" -ne 0 ] && [ "$rc" -ne 130 ]; then
     # Write to fd 3 (the real terminal) since fd 2 may be redirected to the log in TUI mode.
     printf '\n\033[1;31m[!]\033[0m 4tail stopped early (exit %s) before finishing.\n' "$rc" >&3 2>/dev/null
-    if [ -s "${OUTDIR:-}/run_stderr.log" ]; then
+    local err_log="${logs_dir:-${OUTDIR:-}}/run_stderr.log"
+    [ -s "$err_log" ] || err_log="${OUTDIR:-}/run_stderr.log"
+    if [ -s "$err_log" ]; then
       printf '    last error output:\n' >&3 2>/dev/null
-      grep -viE 'nuclei\.txt: No such file' "${OUTDIR}/run_stderr.log" 2>/dev/null | tail -8 | sed 's/^/      /' >&3 2>/dev/null
-      printf '    (full log: %s/run_stderr.log)\n' "$OUTDIR" >&3 2>/dev/null
+      grep -viE 'nuclei\.txt: No such file' "$err_log" 2>/dev/null | tail -8 | sed 's/^/      /' >&3 2>/dev/null
+      printf '    (full log: %s)\n' "$err_log" >&3 2>/dev/null
     else
       printf '    Re-run with -P (plain output, no dashboard) to see the error inline.\n' >&3 2>/dev/null
     fi

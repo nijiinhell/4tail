@@ -170,60 +170,91 @@ if [ "$DOCTOR" != 1 ]; then
     ts="$(date +%Y%m%d_%H%M%S)"; OUTDIR="4tail_${domain}_${ts}"
     [ "$RESUME" = 1 ] && warn "No previous run found for $domain - starting fresh."
   fi
+  # Tiered directory layout
   mkdir -p "$OUTDIR"
-  subdomains_file="$OUTDIR/subdomains.txt"
-  httpx_json="$OUTDIR/httpx.jsonl"
-  alive_file="$OUTDIR/alive.txt"
-  tech_brief="$OUTDIR/tech_brief.txt"
-  fuzz_dir="$OUTDIR/fuzz"; mkdir -p "$fuzz_dir"
-  nuclei_file="$OUTDIR/nuclei.txt"
+  recon_dir="$OUTDIR/recon"; mkdir -p "$recon_dir"
+  surface_dir="$OUTDIR/surface"; mkdir -p "$surface_dir"
+  findings_dir="$OUTDIR/findings"; mkdir -p "$findings_dir"
+  loot_dir="$OUTDIR/loot"; mkdir -p "$loot_dir"
+  logs_dir="$OUTDIR/logs"; mkdir -p "$logs_dir"
+
+  # Tier 1: Primary Deliverables (clean root OUTDIR)
   report_file="$OUTDIR/report.md"
-  llm_log="$OUTDIR/llm.log"
-  tech_map_file="$OUTDIR/tech_wordlists.tsv"   # tech <TAB> seclists-relative-path
-  seclists_index="$OUTDIR/.seclists_index.tsv" # basename <TAB> abs-path of real SecLists Web-Content lists
-  nuclei_tag_index="$OUTDIR/.nuclei_tags.txt"  # real category tags present in the installed nuclei templates
-  fuzz_plan_file="$OUTDIR/fuzz_plan.txt"        # host <TAB> wordlists used
-  nuclei_stats_file="$OUTDIR/nuclei_stats.jsonl"
-  supervisor_log="$OUTDIR/supervisor.log"
-  fuzz_findings_file="$OUTDIR/fuzz_findings.txt"   # aggregated ffuf hits: status<TAB>length<TAB>url
-  urls_archive_file="$OUTDIR/urls_archive.txt"     # passive archive URLs (gau/wayback/waymore)
-  urls_file="$OUTDIR/urls.txt"                     # crawled + historical URLs (in-scope)
-  urls_params_file="$OUTDIR/urls_params.txt"       # URLs with query params (for gf/DAST)
-  findings_jsonl="$OUTDIR/findings/findings.jsonl" # canonical structured JSONL findings store
-  gf_file="$OUTDIR/gf_hits.txt"                    # gf pattern -> url
-  dast_file="$OUTDIR/dast_findings.txt"            # nuclei -dast findings
-  url_patterns_file="$OUTDIR/url_patterns.txt"     # clustered endpoint patterns
-  targets_active_file="$OUTDIR/targets_active.txt" # AI-selected juicy URLs for specialists
-  api_specs_file="$OUTDIR/api_specs.txt"           # discovered Swagger/OpenAPI/GraphQL spec URLs
-  api_tests_file="$OUTDIR/api_tests.txt"           # AI-generated API test URLs (folded into active set)
-  gql_schema_file="$OUTDIR/graphql_schema.txt"     # dumped GraphQL schema when introspection is open
-  sourcemap_file="$OUTDIR/sourcemaps.txt"          # recovered .js.map URLs (source leak)
-  smap_endpoints_file="$OUTDIR/sourcemap_endpoints.txt"  # endpoints reconstructed from source maps (folded into urls)
-  js_endpoints_file="$OUTDIR/js_endpoints.txt"     # API endpoints/paths mined from JS bundles (SPA surface -> folded into urls)
-  stale_file="$OUTDIR/stale.tsv"                   # per-host legacy score: score<TAB>url<TAB>evidence
-  oast_dir="$OUTDIR/oast"; mkdir -p "$oast_dir"    # interactsh output + injection map
-  oast_log="$oast_dir/interactions.jsonl"          # raw interactsh interactions
-  oast_map="$oast_dir/injected.tsv"                # marker<TAB>url we injected an OOB payload into
-  oast_hits_file="$oast_dir/confirmed.txt"         # correlated: confirmed blind SSRF/redirect
-  agent_file="$OUTDIR/agent_confirmed.txt"         # agent loop: confirmed/escalated issues
-  agent_log="$OUTDIR/agent_log.txt"                # agent loop: full probe transcript
-  bypass_file="$OUTDIR/findings/bypass.txt"        # 403/401 access-control bypasses
-  prop_file="$OUTDIR/findings/propagated.txt"      # paths found on one host, live on another
-  idor_file="$OUTDIR/findings/idor.txt"            # dual-identity IDOR / broken-authz candidates
-  corsy_file="$OUTDIR/findings/cors.txt"           # Corsy CORS-misconfig findings
-  cdn_file="$OUTDIR/.cdn_hosts.txt"                # hosts classified CDN/WAF by cdncheck (skip-fuzz)
-  verified_file="$OUTDIR/verified.txt"             # findings that survived the verification re-test
-  diff_file="$OUTDIR/changes.txt"                  # what changed since the last run of this target
-  findings_dir="$OUTDIR/findings"; mkdir -p "$findings_dir"  # per-specialist output
-  forms_file="$OUTDIR/forms.txt"                   # harvested POST/GET form fields (for PoC accuracy)
-  poc_file="$OUTDIR/poc_requests.sh"               # AI-written MANUAL curl PoCs (4tail never runs these)
-  dns_hygiene_file="$OUTDIR/dns_hygiene.txt"       # SPF/DMARC/zone-transfer findings
-  takeover_file="$OUTDIR/findings/takeover.txt"     # subdomain takeover candidates (dangling CNAMEs)
-  report_html="$OUTDIR/report.html"                # standalone interactive HTML report
-  sec_headers_file="$OUTDIR/security_headers.txt"  # clickjacking / HSTS / CSP / cookie-flag findings
-  versions_file="$OUTDIR/versioned_components.txt" # product:version pairs for CVE matching
-  cost_ledger="${LLM_COST_LEDGER:-$OUTDIR/.llm_cost_usd}"
+  report_html="$OUTDIR/report.html"
+  findings_json="$OUTDIR/findings.json"
+  poc_file="$OUTDIR/poc_requests.sh"
+
+  # Tier 2: Reconnaissance & Infrastructure Intelligence
+  subdomains_file="$recon_dir/subdomains.txt"
+  httpx_json="$recon_dir/httpx.jsonl"
+  alive_file="$recon_dir/alive.txt"
+  tech_brief="$recon_dir/tech_brief.txt"
+  stale_file="$recon_dir/stale.tsv"
+  cdn_file="$recon_dir/cdn_hosts.txt"
+  dns_hygiene_file="$recon_dir/dns_hygiene.txt"
+  sec_headers_file="$recon_dir/security_headers.txt"
+  versions_file="$recon_dir/versioned_components.txt"
+  resolved_file="$recon_dir/resolved.txt"
+
+  # Tier 3: Attack Surface & Crawl Data
+  urls_archive_file="$surface_dir/urls_archive.txt"
+  urls_file="$surface_dir/urls.txt"
+  urls_params_file="$surface_dir/urls_params.txt"
+  params_file="$surface_dir/params.txt"
+  url_patterns_file="$surface_dir/url_patterns.txt"
+  targets_active_file="$surface_dir/targets_active.txt"
+  api_specs_file="$surface_dir/api_specs.txt"
+  api_tests_file="$surface_dir/api_tests.txt"
+  gql_schema_file="$surface_dir/graphql_schema.txt"
+  sourcemap_file="$surface_dir/sourcemaps.txt"
+  smap_endpoints_file="$surface_dir/sourcemap_endpoints.txt"
+  js_endpoints_file="$surface_dir/js_endpoints.txt"
+  js_urls_file="$surface_dir/js_urls.txt"
+  forms_file="$surface_dir/forms.txt"
+  nuclei_targets_file="$surface_dir/nuclei_targets.txt"
+
+  # Tier 4: Security Findings & Vulnerability Evidence
+  findings_jsonl="$findings_dir/findings.jsonl"
+  nuclei_file="$findings_dir/nuclei.txt"
+  dast_file="$findings_dir/dast_findings.txt"
+  fuzz_findings_file="$findings_dir/fuzz_findings.txt"
+  gf_file="$findings_dir/gf_hits.txt"
+  bypass_file="$findings_dir/bypass.txt"
+  prop_file="$findings_dir/propagated.txt"
+  idor_file="$findings_dir/idor.txt"
+  corsy_file="$findings_dir/cors.txt"
+  takeover_file="$findings_dir/takeover.txt"
+  agent_file="$findings_dir/agent_confirmed.txt"
+  verified_file="$findings_dir/verified.txt"
+  diff_file="$findings_dir/changes.txt"
+
+  # Tier 5: Extracted Loot & Source Reconstructions
+  js_secrets_file="$loot_dir/js_secrets.txt"
+  agent_loot_dir="$loot_dir/agent_loot"
+  js_dir="$loot_dir/jsfiles"
+  smap_dir="$loot_dir/sourcemaps_src"
+
+  # Tier 6: Diagnostics, Metrics & Tool Logs
+  supervisor_log="$logs_dir/supervisor.log"
+  llm_log="$logs_dir/llm.log"
+  agent_log="$logs_dir/agent_log.txt"
+  nuclei_stats_file="$logs_dir/nuclei_stats.jsonl"
+  fuzz_plan_file="$logs_dir/fuzz_plan.txt"
+  tech_map_file="$logs_dir/tech_wordlists.tsv"
+  seclists_index="$logs_dir/.seclists_index.tsv"
+  nuclei_tag_index="$logs_dir/.nuclei_tags.txt"
+  fuzz_dir="$logs_dir/fuzz"; mkdir -p "$fuzz_dir"
+  oast_dir="$logs_dir/oast"; mkdir -p "$oast_dir"
+  oast_log="$oast_dir/interactions.jsonl"
+  oast_map="$oast_dir/injected.tsv"
+  oast_hits_file="$oast_dir/confirmed.txt"
+  cost_ledger="${LLM_COST_LEDGER:-$logs_dir/llm_cost_usd}"
   [ -f "$cost_ledger" ] || printf '0\n' > "$cost_ledger"
+
+  # Backwards compatibility symlinks in OUTDIR root
+  ln -sf "recon/alive.txt" "$OUTDIR/alive.txt" 2>/dev/null || true
+  ln -sf "recon/subdomains.txt" "$OUTDIR/subdomains.txt" 2>/dev/null || true
+  ln -sf "surface/urls.txt" "$OUTDIR/urls.txt" 2>/dev/null || true
 fi
 
 # Auto-detect a SecLists installation so fuzzing can pick tech-specific lists.

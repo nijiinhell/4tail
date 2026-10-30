@@ -214,7 +214,7 @@ diff_state() {
   [ "$DIFF_STATE" = 1 ] || return 0
   mkdir -p "$STATE_DIR" 2>/dev/null || return 0
   local snap="$STATE_DIR/$(printf '%s' "$domain" | tr -c 'A-Za-z0-9._-' '_').snapshot"
-  local cur="$OUTDIR/.surface.txt"
+  local cur="${logs_dir:-$OUTDIR}/.surface.txt"
   { [ -f "$alive_file" ] && sed 's#^#host #' "$alive_file"
     [ -f "$fuzz_findings_file" ] && awk -F'\t' 'NF>=3{print "path "$3}' "$fuzz_findings_file"
     [ -f "$targets_active_file" ] && sed 's#^#url #' "$targets_active_file"

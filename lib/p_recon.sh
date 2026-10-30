@@ -60,7 +60,7 @@ else
     # custom port like :3000 and the chosen scheme are honored; no DNS resolution needed.
     printf '%s\n' "$SEED_URL" > "$OUTDIR/.seed_url.txt"; probe_input="$OUTDIR/.seed_url.txt"
   elif [ "$USE_DNSX" = 1 ] && have dnsx; then
-    resolved_file="$OUTDIR/resolved.txt"
+    resolved_file="${resolved_file:-${recon_dir:-$OUTDIR}/resolved.txt}"
     set_stage $S_LIVE running "resolving (dnsx, wildcard filter)"
     dnsx -silent -l "$subdomains_file" -wd "$domain" -o "$resolved_file" 2>>"$llm_log" || true
     [ -s "$resolved_file" ] && probe_input="$resolved_file"

@@ -12,8 +12,9 @@ elif ! budget_ok; then
   set_stage $S_AGENT skip "budget reached ($(cost_fmt))"
 else
   set_stage $S_AGENT running "building situation"
-  agent_seen="$OUTDIR/.agent_seen"; : > "$agent_seen"
-  agent_loot_dir="$OUTDIR/agent_loot"; agent_post_n=0
+  agent_seen="${logs_dir:-$OUTDIR}/.agent_seen"; : > "$agent_seen"
+  agent_loot_dir="${agent_loot_dir:-${loot_dir:-$OUTDIR}/agent_loot}"; agent_post_n=0
+  mkdir -p "$agent_loot_dir"
   # Secret value patterns: when a response matches, the RAW body is saved locally for the
   # human (never sent to the LLM) so a cred read via LFI is actually captured, not just noted.
   AGENT_SECRET_RE='connection[-_ ]?string|<add[^>]*connectionString|Data Source=|Server=.*;.*(Password|Pwd)=|Initial Catalog=|Provider=|machineKey|validationKey=|decryptionKey=|BEGIN [A-Z ]*PRIVATE KEY|AKIA[0-9A-Z]{16}|password["'"'"' ]*[:=]|SA_PASSWORD|DB_PASSWORD'

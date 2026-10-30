@@ -143,6 +143,26 @@ run_doctor() {
     done
   fi
 
+  dr_head "Blueprints (strategy profiles)"
+  if [ -n "$BLUEPRINTS_DIR" ] && [ -d "$BLUEPRINTS_DIR" ]; then
+    bp_cnt=0; bp_invalid=0
+    for bf in "$BLUEPRINTS_DIR"/*.json; do
+      [ -f "$bf" ] || continue
+      bp_cnt=$((bp_cnt+1))
+      if have jq && ! jq -e . "$bf" >/dev/null 2>&1; then
+        dr_fail "invalid JSON in blueprint: $(basename "$bf")"
+        bp_invalid=$((bp_invalid+1))
+      fi
+    done
+    if [ "$bp_invalid" -eq 0 ] && [ "$bp_cnt" -gt 0 ]; then
+      dr_pass "Loaded $bp_cnt strategy blueprints from $BLUEPRINTS_DIR"
+    elif [ "$bp_cnt" -eq 0 ]; then
+      dr_warn "No blueprint JSON files found in $BLUEPRINTS_DIR (embedded defaults will be used)"
+    fi
+  else
+    dr_pass "Using embedded built-in blueprint fallbacks (standalone mode)"
+  fi
+
   dr_head "Summary"
   if [ "$DR_FAIL" -gt 0 ]; then
     printf '  %s%d failed%s, %d warnings - fix the failures before running.\n' "$c_red" "$DR_FAIL" "$c_reset" "$DR_WARN"
@@ -166,7 +186,7 @@ if [ "$TUI" = 1 ]; then
   render
   # In TUI mode stderr would corrupt the dashboard, so send it to a log. This also means an
   # abnormal exit (a crash hidden by the alt screen) can be surfaced by cleanup() below.
-  [ -n "${OUTDIR:-}" ] && exec 2>>"$OUTDIR/run_stderr.log"
+  [ -n "${OUTDIR:-}" ] && exec 2>>"${logs_dir:-$OUTDIR}/run_stderr.log"
 fi
 STAGES_BEGAN=1
 

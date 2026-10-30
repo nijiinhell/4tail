@@ -1,7 +1,7 @@
 # Step 4.5: JS & secret mining + param discovery (opt-in with -j)
-js_urls_file="$OUTDIR/js_urls.txt"
-js_secrets_file="$OUTDIR/js_secrets.txt"
-params_file="$OUTDIR/params.txt"
+js_urls_file="${js_urls_file:-$surface_dir/js_urls.txt}"
+js_secrets_file="${js_secrets_file:-$loot_dir/js_secrets.txt}"
+params_file="${params_file:-$surface_dir/params.txt}"
 # Regex for common leaked secrets (no single-quote chars, so it stays shell-safe).
 SECRET_RE='AKIA[0-9A-Z]{16}|AIza[0-9A-Za-z_-]{35}|xox[baprs]-[0-9A-Za-z-]{10,}|ghp_[0-9A-Za-z]{36}|eyJ[A-Za-z0-9_-]{10,}\.[A-Za-z0-9_-]{10,}\.[A-Za-z0-9_-]{10,}|-----BEGIN [A-Z ]*PRIVATE KEY-----|[a-z0-9.-]+\.s3\.amazonaws\.com|(api[_-]?key|secret|access[_-]?token|client[_-]?secret|aws_secret|password)["[:space:]:=]{1,4}[0-9A-Za-z._+/-]{12,}'
 
@@ -104,7 +104,7 @@ else
   #      JS find on SPAs/webpack builds, and purely a GET fetch of a file the build shipped.
   : > "$sourcemap_file"; : > "$smap_endpoints_file"
   if [ "$SOURCEMAPS" = 1 ] && have jq && [ -s "$js_urls_file" ]; then
-    smap_dir="$OUTDIR/sourcemaps_src"; rm -rf "$smap_dir"; mkdir -p "$smap_dir"
+    smap_dir="${smap_dir:-${loot_dir:-$OUTDIR}/sourcemaps_src}"; rm -rf "$smap_dir"; mkdir -p "$smap_dir"
     smi=0; smaps=0
     while read -r j; do
       [ -z "$j" ] && continue

@@ -119,8 +119,10 @@ else : > "$tech_map_file"; fi
 build_nuclei_tag_index
 
 nuclei_tags="$DEFAULT_NUCLEI_TAGS"
-if [ "$RESUME" = 1 ] && [ -s "$OUTDIR/ai_scan_plan.txt" ]; then
-  nuclei_tags="$(cat "$OUTDIR/ai_scan_plan.txt")"
+scan_plan_file="${logs_dir:-$OUTDIR}/ai_scan_plan.txt"
+if [ "$RESUME" = 1 ] && { [ -s "$scan_plan_file" ] || [ -s "$OUTDIR/ai_scan_plan.txt" ]; }; then
+  [ -s "$scan_plan_file" ] || scan_plan_file="$OUTDIR/ai_scan_plan.txt"
+  nuclei_tags="$(cat "$scan_plan_file")"
   set_stage $S_PLAN done "$nuclei_tags (resumed)"
 elif [ "$AI_ENABLED" = "1" ] && ! budget_ok; then
   set_stage $S_PLAN skip "budget reached ($(cost_fmt)), using defaults"
@@ -201,7 +203,7 @@ ${js_brief:+$'\n'$js_brief}" "$plan_out"
   rm -f "$plan_out"
 
   nuclei_tags="${clean_plan:-$DEFAULT_NUCLEI_TAGS}"
-  printf '%s\n' "$nuclei_tags" > "$OUTDIR/ai_scan_plan.txt"
+  printf '%s\n' "$nuclei_tags" > "${scan_plan_file:-$OUTDIR/ai_scan_plan.txt}"
   if [ -n "$ai_extra" ]; then set_stage $S_PLAN done "$nuclei_tags"
   else set_stage $S_PLAN done "$nuclei_tags (defaults; AI added none)"; fi
 else

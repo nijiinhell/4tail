@@ -95,7 +95,7 @@ agent_tool_run() {   # name  target  extra
       { have git-dumper || have gitdumper; } || { echo "git-dumper: not installed (pipx install git-dumper)"; return 0; }
       local gd="git-dumper"; have git-dumper || gd="gitdumper"
       local safe_tgt="$(printf '%s' "$tgt" | sed -E 's#^[a-z]+://##; s#[:/].*##' | tr -c 'A-Za-z0-9._-' '_')"
-      local dump_dir="$findings_dir/gitdump_${safe_tgt}"
+      local dump_dir="${loot_dir:-$findings_dir}/gitdump_${safe_tgt}"
       mkdir -p "$dump_dir"
       raw="$(_cap "$gd" "${tgt%/}/.git/" "$dump_dir" 2>&1 | tail -c 1500)"
       [ -n "$(ls -A "$dump_dir" 2>/dev/null)" ] && hit="CONFIRMED source-disclosure"
@@ -103,8 +103,8 @@ agent_tool_run() {   # name  target  extra
     trufflehog)
       have trufflehog || { echo "trufflehog: not installed"; return 0; }
       local safe_tgt="$(printf '%s' "$tgt" | sed -E 's#^[a-z]+://##; s#[:/].*##' | tr -c 'A-Za-z0-9._-' '_')"
-      local dump_target="$findings_dir/gitdump_${safe_tgt}"
-      [ -d "$dump_target" ] || dump_target="$findings_dir/gitdump"
+      local dump_target="${loot_dir:-$findings_dir}/gitdump_${safe_tgt}"
+      [ -d "$dump_target" ] || dump_target="${loot_dir:-$findings_dir}/gitdump"
       raw="$(_cap trufflehog --no-update filesystem "$dump_target" 2>/dev/null | head -c 2000)"
       printf '%s' "$raw" | grep -qiE 'Found|verified' && hit="CONFIRMED secret"
       res="$(printf '%s' "$raw" | head -3 | tr '\n' ';')" ;;

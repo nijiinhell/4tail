@@ -71,7 +71,7 @@ else
               -rate-limit "$NUCLEI_RATELIMIT" -timeout "$NUCLEI_TIMEOUT"
               -retries "$NUCLEI_RETRIES" -mhe "$NUCLEI_MHE"
               -c "$NUCLEI_CONC" -bulk-size "$NUCLEI_BULK"
-              -resume "$OUTDIR/.nuclei_resume.cfg"
+              -resume "${logs_dir:-$OUTDIR}/.nuclei_resume.cfg"
               -l "$nuclei_targets_file" -o "$nuclei_file")
   [ "${#NUCLEI_NET[@]}" -gt 0 ] && nuclei_cmd+=("${NUCLEI_NET[@]}")
   if [ "$NUCLEI_MAX_TIME" -gt 0 ] 2>/dev/null && have timeout; then
