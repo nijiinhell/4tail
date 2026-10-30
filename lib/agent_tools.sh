@@ -41,12 +41,12 @@ agent_tool_run() {   # name  target  extra
           *) ;;  # ignore everything else: escalation (--level/--risk), shells, file R/W, tamper, technique (stays BEU)
         esac
       done
-      raw="$(_cap sqlmap -u "$tgt" --batch --smart --level=1 --risk=1 --technique=BEU --disable-coloring ${sqx[@]+"${sqx[@]}"} 2>/dev/null | tail -c 4000)"
+      raw="$(_cap sqlmap -u "$tgt" --batch --smart --level=1 --risk=1 --technique=BEU --threads=2 --timeout=10 --random-agent --disable-coloring ${sqx[@]+"${sqx[@]}"} 2>/dev/null | tail -c 4000)"
       printf '%s' "$raw" | grep -qiE 'is vulnerable|is injectable|Parameter:.*|Type: ' && hit="CONFIRMED sqli"
       res="$(printf '%s' "$raw" | grep -iE 'vulnerable|injectable|Type:|back-end DBMS' | head -3 | tr '\n' ';')" ;;
     dalfox)
       have dalfox || { echo "dalfox: not installed"; return 0; }
-      raw="$(_cap dalfox url "$tgt" --silence --skip-bav 2>/dev/null | head -c 4000)"
+      raw="$(_cap dalfox url "$tgt" --silence --skip-bav --waf-evasion --mining-dom 2>/dev/null | head -c 4000)"
       printf '%s' "$raw" | grep -qiE '\[POC\]|triggered|\[VULN\]' && hit="CONFIRMED xss"
       res="$(printf '%s' "$raw" | grep -iE 'POC|VULN|reflect' | head -3 | tr '\n' ';')" ;;
     nuclei)
@@ -93,13 +93,19 @@ agent_tool_run() {   # name  target  extra
       res="x8: $(printf '%s' "$raw" | tr '\n' ' ' | head -c 300)" ;;
     git-dumper|gitdumper)
       { have git-dumper || have gitdumper; } || { echo "git-dumper: not installed (pipx install git-dumper)"; return 0; }
-      local gd="git-dumper"; have git-dumper || gd="gitdumper"; mkdir -p "$findings_dir/gitdump"
-      raw="$(_cap "$gd" "${tgt%/}/.git/" "$findings_dir/gitdump" 2>&1 | tail -c 1500)"
-      [ -n "$(ls -A "$findings_dir/gitdump" 2>/dev/null)" ] && hit="CONFIRMED source-disclosure"
+      local gd="git-dumper"; have git-dumper || gd="gitdumper"
+      local safe_tgt="$(printf '%s' "$tgt" | sed -E 's#^[a-z]+://##; s#[:/].*##' | tr -c 'A-Za-z0-9._-' '_')"
+      local dump_dir="$findings_dir/gitdump_${safe_tgt}"
+      mkdir -p "$dump_dir"
+      raw="$(_cap "$gd" "${tgt%/}/.git/" "$dump_dir" 2>&1 | tail -c 1500)"
+      [ -n "$(ls -A "$dump_dir" 2>/dev/null)" ] && hit="CONFIRMED source-disclosure"
       res="$(printf '%s' "$raw" | tail -3 | tr '\n' ';')" ;;
     trufflehog)
       have trufflehog || { echo "trufflehog: not installed"; return 0; }
-      raw="$(_cap trufflehog --no-update filesystem "$findings_dir/gitdump" 2>/dev/null | head -c 2000)"
+      local safe_tgt="$(printf '%s' "$tgt" | sed -E 's#^[a-z]+://##; s#[:/].*##' | tr -c 'A-Za-z0-9._-' '_')"
+      local dump_target="$findings_dir/gitdump_${safe_tgt}"
+      [ -d "$dump_target" ] || dump_target="$findings_dir/gitdump"
+      raw="$(_cap trufflehog --no-update filesystem "$dump_target" 2>/dev/null | head -c 2000)"
       printf '%s' "$raw" | grep -qiE 'Found|verified' && hit="CONFIRMED secret"
       res="$(printf '%s' "$raw" | head -3 | tr '\n' ';')" ;;
     cname)

@@ -40,6 +40,14 @@ run_doctor() {
   for t in subfinder httpx nuclei; do
     if have "$t"; then dr_pass "$t found ($(command -v "$t"))"; else dr_fail "$t MISSING (install from projectdiscovery.io)"; fi
   done
+  if have subfinder; then
+    local pcfg="$HOME/.config/subfinder/provider-config.yaml"
+    if [ -f "$pcfg" ] && grep -qE ':[[:space:]]*[A-Za-z0-9_-]{8,}' "$pcfg" 2>/dev/null; then
+      dr_pass "subfinder providers: active API keys in $pcfg"
+    else
+      dr_warn "subfinder API keys not configured ($pcfg) - passive discovery limited to unauthenticated sources"
+    fi
+  fi
   if have nuclei; then
     local tpl; tpl="$(locate_nuclei_templates)"
     if [ -n "$tpl" ]; then

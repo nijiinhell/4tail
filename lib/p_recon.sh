@@ -14,15 +14,16 @@ if [ "$SINGLE" = 1 ]; then
 elif done_marker subs && [ -s "$subdomains_file" ]; then
   set_stage $S_SUBS done "$(wc -l <"$subdomains_file") subs (resumed)"
 else
-  run_stage $S_SUBS "$subdomains_file" " subs" subfinder -silent -d "$domain" -o "$subdomains_file"
+  run_stage $S_SUBS "$subdomains_file" " subs" subfinder -silent -d "$domain" \
+            -max-time "${SUBFINDER_MAX_TIME:-10}" -timeout "${SUBFINDER_TIMEOUT:-15}" -o "$subdomains_file"
   # subfinder enumerates subdomains OF the target but not the target host itself; always
   # include it (and www.) so a specific host like testasp.vulnweb.com is actually probed.
   { printf '%s\n' "$domain" "www.$domain"; cat "$subdomains_file" 2>/dev/null; } | sort -u > "$subdomains_file.tmp" \
     && mv "$subdomains_file.tmp" "$subdomains_file"
-  # TLS cert SANs: pull in-scope hostnames from the certificates (passive, fast).
+  # TLS cert SANs & CN: pull in-scope hostnames from the certificates (passive, fast).
   if [ "$USE_TLSX" = 1 ] && have tlsx; then
     set_stage $S_SUBS running "tlsx: harvesting cert SANs"
-    tmo 120 tlsx -silent -san -resp-only -l "$subdomains_file" 2>/dev/null \
+    tmo 120 tlsx -silent -san -cn -resp-only -l "$subdomains_file" 2>/dev/null \
       | grep -iE "(^|\.)${esc_domain}\$" | tr 'A-Z' 'a-z' >> "$subdomains_file" || true
     sort -u -o "$subdomains_file" "$subdomains_file"
   fi
@@ -65,7 +66,8 @@ else
     [ -s "$resolved_file" ] && probe_input="$resolved_file"
   fi
   run_stage $S_LIVE "$httpx_json" " live" \
-    httpx -silent -json -tech-detect -status-code -title -web-server -ip -cname \
+    httpx -silent -json -tech-detect -status-code -title -web-server -ip -cname -cdn -asn -location \
+          -timeout 10 -retries 2 \
           ${HTTPX_NET[@]+"${HTTPX_NET[@]}"} \
           -threads "$HTTPX_THREADS" -l "$probe_input" -o "$httpx_json"
   touch "$OUTDIR/.done_httpx"
@@ -75,16 +77,21 @@ alive_count=$(wc -l < "$alive_file" 2>/dev/null || echo 0)
 if [ "$alive_count" -eq 0 ]; then
   set_stage $S_LIVE warn "none live"; [ "$TUI" = 1 ] || warn "No live hosts; stopping."; exit 0
 fi
-# cdncheck: accurately classify CDN/WAF/cloud so we skip fuzzing edges and flag cloud
+# cdncheck / httpx-cdn: accurately classify CDN/WAF/cloud so we skip fuzzing edges and flag cloud
 # hosts (SSRF-to-metadata context) - more reliable than a static banner regex.
 # Runs BEFORE the stage is marked done, so the Live-hosts spinner can't get stuck.
 : > "$cdn_file"; cloud_hosts=""
+if [ -s "$httpx_json" ]; then
+  jq -r 'select(.cdn == true or .cdn_name != null) | (.host // .input // .url)' "$httpx_json" 2>/dev/null \
+    | sed -E 's#^[a-z]+://##; s#[:/].*$##' | sort -u >> "$cdn_file" || true
+fi
 if [ "$USE_CDNCHECK" = 1 ] && have cdncheck && [ "${alive_count:-0}" -ge "$CDNCHECK_MIN_HOSTS" ] 2>/dev/null; then
   set_stage $S_LIVE running "$alive_count live · cdncheck classifying…"
   # classify the live hosts by IP range; hard 20s cap (first run refreshes CDN ranges).
   sed -E 's#^[a-z]+://##; s#[:/].*$##' "$alive_file" | sort -u | head -n 200 \
     | tmo 20 cdncheck -silent -resp -cdn -waf -cloud 2>/dev/null > "$OUTDIR/.cdncheck.txt" || true
-  grep -iE '\[(cdn|waf)\]' "$OUTDIR/.cdncheck.txt" 2>/dev/null | awk '{print $1}' | sort -u > "$cdn_file" || true
+  grep -iE '\[(cdn|waf)\]' "$OUTDIR/.cdncheck.txt" 2>/dev/null | awk '{print $1}' | sort -u >> "$cdn_file" || true
+  sort -u -o "$cdn_file" "$cdn_file"
   cloud_hosts="$(grep -iE '\[cloud\]' "$OUTDIR/.cdncheck.txt" 2>/dev/null | awk '{print $1}' | sort -u | head -20)"
   rm -f "$OUTDIR/.cdncheck.txt"
 fi

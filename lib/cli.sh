@@ -95,13 +95,20 @@ AUTH_H=()
 if [ -n "$AUTH_HEADER" ]; then
   while IFS= read -r _l; do [ -n "$_l" ] && AUTH_H+=("$_l"); done <<< "$AUTH_HEADER"
 fi
+DEFAULT_UA="${CUSTOM_UA:-Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36}"
+has_ua=0
+for _h in ${AUTH_H[@]+"${AUTH_H[@]}"}; do
+  case "$_h" in [Uu][Ss][Ee][Rr]-[Aa][Gg][Ee][Nn][Tt]:*) has_ua=1 ;; esac
+done
+[ "$has_ua" = 0 ] && AUTH_H+=("User-Agent: $DEFAULT_UA")
+
 _hdr=(); for _h in ${AUTH_H[@]+"${AUTH_H[@]}"}; do _hdr+=(-H "$_h"); done
 HTTPX_NET=("${_hdr[@]}");  [ -n "$PROXY" ] && HTTPX_NET+=(-proxy "$PROXY")
 NUCLEI_NET=("${_hdr[@]}"); [ -n "$PROXY" ] && NUCLEI_NET+=(-proxy "$PROXY")
 FFUF_NET=("${_hdr[@]}");   [ -n "$PROXY" ] && FFUF_NET+=(-x "$PROXY")
 KATANA_NET=("${_hdr[@]}"); [ -n "$PROXY" ] && KATANA_NET+=(-proxy "$PROXY")
-DALFOX_NET=("${_hdr[@]}"); [ -n "$PROXY" ] && DALFOX_NET+=(--proxy "$PROXY")
-CURL_NET=("${_hdr[@]}");   [ -n "$PROXY" ] && CURL_NET+=(-x "$PROXY")
+DALFOX_NET=("${_hdr[@]}"); [ -n "$PROXY" ] && DALFOX_NET+=(--proxy "$PROXY"); DALFOX_NET+=(--user-agent "$DEFAULT_UA")
+CURL_NET=(--compressed "${_hdr[@]}");   [ -n "$PROXY" ] && CURL_NET+=(-x "$PROXY")
 [ "${#AUTH_H[@]}" -gt 0 ] && [ "$ASSUME_YES" != 1 ] && log "Auth: ${#AUTH_H[@]} header(s) will be sent to active tools"
 [ -n "$PROXY" ] && log "Proxy: routing active tools through $PROXY"
 

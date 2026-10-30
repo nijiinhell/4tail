@@ -101,6 +101,8 @@ oast_start() {
   local tries=0
   while [ "$tries" -lt 20 ]; do
     OAST_DOMAIN="$(grep -i 'payload' "$oast_dir/client.out" 2>/dev/null | head -1 | grep -oE '[A-Za-z0-9.-]+\.[A-Za-z]{2,}' | tail -1)"
+    [ -n "$OAST_DOMAIN" ] || OAST_DOMAIN="$(jq -r '.domain // .address // empty' "$oast_dir/client.out" 2>/dev/null | head -1)"
+    [ -n "$OAST_DOMAIN" ] || OAST_DOMAIN="$(grep -oiE '[a-z0-9.-]+\.oast\.(me|fun|live|pro|site|online)' "$oast_dir/client.out" 2>/dev/null | head -1)"
     [ -n "$OAST_DOMAIN" ] && break
     kill -0 "$OAST_PID" 2>/dev/null || break
     sleep 0.5; tries=$((tries+1))

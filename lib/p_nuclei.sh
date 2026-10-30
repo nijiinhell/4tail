@@ -66,8 +66,8 @@ else
   # Bounded run with live stats (-stats-json): per-request timeout, 1 retry, skip
   # error-prone hosts, hard overall time cap. Stats JSON -> nuclei_stats_file (stderr).
   : > "$nuclei_stats_file"
-  nuclei_cmd=(nuclei -silent -stats -stats-json -stats-interval "${NUCLEI_STATS_INTERVAL:-5}"
-              -tags "$effective_tags" -severity "$NUCLEI_SEVERITY"
+  nuclei_cmd=(nuclei -silent -duc -stats -stats-json -stats-interval "${NUCLEI_STATS_INTERVAL:-5}"
+              -tags "$effective_tags" -etags dos,fuzz -severity "$NUCLEI_SEVERITY"
               -rate-limit "$NUCLEI_RATELIMIT" -timeout "$NUCLEI_TIMEOUT"
               -retries "$NUCLEI_RETRIES" -mhe "$NUCLEI_MHE"
               -c "$NUCLEI_CONC" -bulk-size "$NUCLEI_BULK"

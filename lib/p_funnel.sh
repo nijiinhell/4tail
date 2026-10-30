@@ -24,7 +24,7 @@ else
   # (A) Broad / passive URL collection - WAF-safe. Run ALL available sources and UNION them
   # (waymore adds commoncrawl+alienvault+urlscan, but gau/waybackurls often surface URLs it
   # misses) - more coverage, deduped later anyway.
-  [ "$NO_ARCHIVE" != 1 ] && have gau         && { printf '%s\n' "$domain" | tmo "$GAU_MAX_TIME" gau --subs 2>>"$llm_log" | grep -ivE '\.(png|jpe?g|gif|svg|woff2?|ttf|eot|ico|css)([?#]|$)' | head -n 50000 >> "$urls_file" || true; }
+  [ "$NO_ARCHIVE" != 1 ] && have gau         && { printf '%s\n' "$domain" | tmo "$GAU_MAX_TIME" gau --subs --blacklist png,jpg,jpeg,gif,svg,woff,woff2,ttf,eot,ico,css 2>>"$llm_log" | grep -ivE '\.(png|jpe?g|gif|svg|woff2?|ttf|eot|ico|css)([?#]|$)' | head -n 50000 >> "$urls_file" || true; }
   [ "$NO_ARCHIVE" != 1 ] && have waybackurls && { printf '%s\n' "$domain" | tmo "$GAU_MAX_TIME" waybackurls 2>>"$llm_log" | grep -ivE '\.(png|jpe?g|gif|svg|woff2?|ttf|eot|ico|css)([?#]|$)' | head -n 50000 >> "$urls_file" || true; }
   if [ "$NO_ARCHIVE" != 1 ] && [ "$USE_WAYMORE" = 1 ] && have waymore; then
     set_stage $S_CRAWL running "waymore: aggregating more sources"
@@ -33,7 +33,9 @@ else
   fi
   if have katana; then
     set_stage $S_CRAWL running "katana crawling…"
-    kcmd=(katana -silent -list "$alive_file" -d 2 -jc -kf all -c 15 -o "$OUTDIR/.katana.txt")
+    kcmd=(katana -silent -list "$alive_file" -d 2 -jc -kf all -c 15
+          -ef png,jpg,jpeg,gif,svg,css,woff,woff2,ttf,eot,ico
+          -f qurl -cos false -o "$OUTDIR/.katana.txt")
     [ "${#KATANA_NET[@]}" -gt 0 ] && kcmd+=("${KATANA_NET[@]}")
     [ "$CRAWL_MAX_TIME" -gt 0 ] 2>/dev/null && have timeout && kcmd=(timeout "${CRAWL_MAX_TIME}s" "${kcmd[@]}")
     "${kcmd[@]}" >/dev/null 2>>"$llm_log" & kpid=$!
@@ -267,18 +269,21 @@ else
   # gf xss-bucket; only if neither yields anything do we fall back to the full active set.
   if has_spec dalfox && have dalfox && [ -s "$targets_active_file" ]; then
     xq="$findings_dir/.xssq.txt"; : > "$xq"
-    grep -oiE 'https?://[^ ]+' "$findings_dir/kxss.txt" 2>/dev/null >> "$xq"   # kxss reflecting URLs (highest signal)
-    grep -iE '^xss\t' "$gf_file" 2>/dev/null | cut -f2 >> "$xq"                 # gf xss-bucket
+    # high-signal: params reflecting dangerous characters (< > " ')
+    grep -iE 'Unfiltered:.*[<>"'\'']' "$findings_dir/kxss.txt" 2>/dev/null | grep -oiE 'https?://[^ ]+' >> "$xq" || true
+    [ -s "$xq" ] || grep -oiE 'https?://[^ ]+' "$findings_dir/kxss.txt" 2>/dev/null >> "$xq"   # fallback if plain URLs
+    grep -iE '^xss\t' "$gf_file" 2>/dev/null | cut -f2 >> "$xq"                                 # gf xss-bucket
     # collapse value-variants (/s?q=1 /s?q=2 -> one) so dalfox tests each endpoint once
     if have qsreplace; then qsreplace FUZZ < "$xq" 2>/dev/null | sort -u | qsreplace 1 2>/dev/null | sort -u -o "$xq"; else sort -u -o "$xq" "$xq"; fi
-    [ -s "$xq" ] || cp "$targets_active_file" "$xq"                             # fallback: whole active set
-    dfx=(dalfox pipe --silence --skip-bav -o "$findings_dir/dalfox.txt"); [ "${#DALFOX_NET[@]}" -gt 0 ] && dfx+=("${DALFOX_NET[@]}")
+    [ -s "$xq" ] || cp "$targets_active_file" "$xq"                                             # fallback: whole active set
+    dfx=(dalfox pipe --silence --skip-bav --worker 10 --waf-evasion --mining-dom -o "$findings_dir/dalfox.txt")
+    [ "${#DALFOX_NET[@]}" -gt 0 ] && dfx+=("${DALFOX_NET[@]}")
     ( head -n "$ACT_MAX_DALFOX" "$xq" | tmo "$DALFOX_MAX_TIME" "${dfx[@]}" >/dev/null 2>>"$llm_log" ) & SPIDS+=($!)
   fi
   # Broad DAST: nuclei -dast across all classes (or ACT_DAST_TAGS)
   if has_spec nuclei-dast && have nuclei && [ -s "$targets_active_file" ]; then
     head -n "$DAST_MAX_URLS" "$targets_active_file" > "$OUTDIR/.dast_targets.txt"
-    dcmd=(nuclei -silent -dast -l "$OUTDIR/.dast_targets.txt" -rate-limit "$NUCLEI_RATELIMIT"
+    dcmd=(nuclei -silent -duc -dast -l "$OUTDIR/.dast_targets.txt" -rate-limit "$NUCLEI_RATELIMIT"
           -timeout "$NUCLEI_TIMEOUT" -retries "$NUCLEI_RETRIES" -mhe "$NUCLEI_MHE" -o "$dast_file")
     [ -n "$ACT_DAST_TAGS" ] && dcmd+=(-tags "$ACT_DAST_TAGS")
     [ "${#NUCLEI_NET[@]}" -gt 0 ] && dcmd+=("${NUCLEI_NET[@]}")
@@ -296,6 +301,7 @@ else
     sq="$findings_dir/.sqliq.txt"; grep -iE '^sqli\t' "$gf_file" 2>/dev/null | cut -f2 | head -n "$ACT_MAX_SQLMAP" > "$sq"
     if [ -s "$sq" ]; then
       ( tmo "$SQLMAP_MAX_TIME" sqlmap -m "$sq" --batch --smart --level=1 --risk=1 --technique=BEU \
+          --threads=2 --timeout=10 --retries=1 --random-agent --flush-session \
           --output-dir="$findings_dir/sqlmap" >/dev/null 2>>"$llm_log"
         grep -rhiE 'parameter .* is vulnerable|is injectable|Type: ' "$findings_dir/sqlmap" 2>/dev/null \
           | sort -u > "$findings_dir/sqlmap.txt" ) & SPIDS+=($!)
@@ -322,9 +328,12 @@ else
   # CORS misconfiguration (Corsy) on the live hosts + juicy URLs (bug class we don't cover elsewhere).
   if [ "$CORS_SCAN" = 1 ] && have corsy; then
     { sort -u "$alive_file" 2>/dev/null; head -n 30 "$targets_active_file" 2>/dev/null; } | sort -u | head -n "$CORS_MAX" > "$OUTDIR/.cors_in.txt"
+    corsy_args=(-i "$OUTDIR/.cors_in.txt" -t 16)
+    [ -n "$AUTH_HEADER" ] && corsy_args+=(-headers "$(echo "$AUTH_HEADER" | paste -sd, -)")
+    [ -n "$AUTH_COOKIE" ] && corsy_args+=(-headers "Cookie: $AUTH_COOKIE")
     # Strip Corsy's ANSI colors, drop its "No misconfigurations found" banner, and keep only
     # lines that are an actual finding (carry a URL or a named misconfig class).
-    [ -s "$OUTDIR/.cors_in.txt" ] && tmo 180 corsy -i "$OUTDIR/.cors_in.txt" 2>/dev/null \
+    [ -s "$OUTDIR/.cors_in.txt" ] && tmo 180 corsy "${corsy_args[@]}" 2>/dev/null \
       | sed -E 's/\x1b\[[0-9;]*m//g' \
       | grep -viE 'no misconfig|not vulnerable|unreachable|could not|timed out|invalid|connection (refused|error)|^[[:space:]]*-?[[:space:]]*$' \
       | grep -iE 'reflect|wildcard|null origin|arbitrary origin|post-domain|pre-domain|trusted|credentials|origin reflected' > "$corsy_file" || true

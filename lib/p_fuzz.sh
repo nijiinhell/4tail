@@ -204,7 +204,8 @@ else
            "$fuzz_dir/.fx_${safe}.jsonl" 2>/dev/null > "$fuzz_dir/${safe}.json" || echo '{"results":[]}' > "$fuzz_dir/${safe}.json"
         rm -f "$fuzz_dir/.fx_${safe}.jsonl" ) & JOB[$!]="$safe"
     else
-      ffuf_args=(-u "$url/FUZZ" -w "$combined" -ac -mc 200,204,301,302,307,401,403,405,500
+      ffuf_args=(-u "$url/FUZZ" -w "$combined" -ac -sf -t "${FFUF_THREADS:-20}"
+                 -mc 200,204,301,302,307,401,403,405,500
                  -of json -o "$fuzz_dir/${safe}.json" -s)
       [ "${#FFUF_NET[@]}" -gt 0 ] && ffuf_args+=("${FFUF_NET[@]}")
       [ -n "$ext_flag" ] && ffuf_args+=(-e "$ext_flag")

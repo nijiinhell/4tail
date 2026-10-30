@@ -48,7 +48,10 @@ SKIP_CDN_FUZZ="${SKIP_CDN_FUZZ:-1}"       # 1 = don't fuzz CDN/WAF edges (cloudf
 EXTENSIONS="${EXTENSIONS:-}"              # explicit ffuf -e list (overrides tech-aware exts)
 MAX_EXTS="${MAX_EXTS:-2}"                 # cap on per-host extensions (each one multiplies total requests)
 FFUF_RATE="${FFUF_RATE:-0}"              # ffuf requests/sec per host (0 = unlimited)
+FFUF_THREADS="${FFUF_THREADS:-20}"        # ffuf thread concurrency per host (default 20, avoids WAF 429 floods)
 FUZZ_PARALLEL="${FUZZ_PARALLEL:-3}"      # fuzz N hosts at once (-p); auto-backoff on WAF blocks
+SUBFINDER_MAX_TIME="${SUBFINDER_MAX_TIME:-10}" # subfinder max overall runtime cap in minutes
+SUBFINDER_TIMEOUT="${SUBFINDER_TIMEOUT:-15}"   # subfinder per-query timeout in seconds
 FETCH_FUZZTXT="${FETCH_FUZZTXT:-0}"      # 1 = download Bo0oM/fuzz.txt if no base list found
 DEDUPE_ORIGINS="${DEDUPE_ORIGINS:-1}"    # 1 = one fuzz target per IP/CNAME + response cluster
 USE_DNSX="${USE_DNSX:-1}"                # 1 = use dnsx (if installed) to resolve + drop wildcards

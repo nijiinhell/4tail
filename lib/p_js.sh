@@ -89,9 +89,9 @@ else
       | sort -u | head -n 4000 > "$js_endpoints_file.tmp" && mv "$js_endpoints_file.tmp" "$js_endpoints_file"
   fi
   if [ -n "$js_dir" ] && [ -n "$(ls -A "$js_dir" 2>/dev/null)" ]; then
-    ST_DETAIL[$S_JS]="trufflehog verifying JS secrets"; render
-    tmo 180 trufflehog --no-update filesystem "$js_dir" --only-verified --json 2>/dev/null \
-      | jq -r '[(.SourceMetadata.Data.Filesystem.file // "js"), (.DetectorName // "secret"), (.Raw // "")] | @tsv' 2>/dev/null \
+    ST_DETAIL[$S_JS]="trufflehog scanning JS secrets"; render
+    tmo 180 trufflehog --no-update filesystem "$js_dir" --json 2>/dev/null \
+      | jq -r '[(.SourceMetadata.Data.Filesystem.file // "js"), (.DetectorName // "secret"), (if .Verified == true then "VERIFIED" else "UNVERIFIED" end), (.Raw // "")] | @tsv' 2>/dev/null \
       | sed -E 's#'"$js_dir"'/##' >> "$js_secrets_file" || true
   fi
   # 2.5) Source maps: a .js.map reconstructs the ORIGINAL (pre-minify) source - full
@@ -147,8 +147,8 @@ else
     if [ "$smaps" -gt 0 ] && [ -n "$(ls -A "$smap_dir" 2>/dev/null)" ]; then
       # secrets out of the reconstructed source (trufflehog verified, else regex fallback)
       if [ "$TRUFFLEHOG_JS" = 1 ] && have trufflehog; then
-        tmo 180 trufflehog --no-update filesystem "$smap_dir" --only-verified --json 2>/dev/null \
-          | jq -r '[("sourcemap:"+(.SourceMetadata.Data.Filesystem.file // "src")), (.DetectorName // "secret"), (.Raw // "")] | @tsv' 2>/dev/null \
+        tmo 180 trufflehog --no-update filesystem "$smap_dir" --json 2>/dev/null \
+          | jq -r '[("sourcemap:"+(.SourceMetadata.Data.Filesystem.file // "src")), (.DetectorName // "secret"), (if .Verified == true then "VERIFIED" else "UNVERIFIED" end), (.Raw // "")] | @tsv' 2>/dev/null \
           | sed -E 's#'"$smap_dir"'/##' >> "$js_secrets_file" || true
       else
         grep -rhaoE "$SECRET_RE" "$smap_dir" 2>/dev/null | sort -u | sed 's#^#sourcemap-src\t#' >> "$js_secrets_file" || true
