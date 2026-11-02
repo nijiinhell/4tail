@@ -151,7 +151,7 @@ idor_check() {
     fi
   done <<< "$cand"
 
-  # Path-based IDOR / BOLA: REST object ids live in the path (/api/Users/1, /rest/basket/42),
+  # Path-based IDOR / BOLA: REST object ids live in the path (/api/v1/users/1, /api/orders/42),
   # not the query string. With identity A, read object N, then try a NEIGHBOUR id - if A can
   # read it too (and the endpoint isn't just answering 200 to every id), that's a BOLA lead.
   local pcand purl pid alt alturl cid ralt calt salt rcc ccc scc

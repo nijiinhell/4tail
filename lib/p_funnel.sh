@@ -112,7 +112,7 @@ else
   [ -s "$targets_active_file" ] || cut -f2 "$OUTDIR/.patterns.tsv" | head -n "$ACT_MAX_JUICY" > "$targets_active_file"
   # Fold in high-signal REST API endpoints (even without query params, e.g. /api/..., /rest/..., /v[0-9]+/, /graphql)
   # as they are prime targets for DAST, auth bypass, IDOR, and injection.
-  grep -iE 'https?://[^ ]+/(api|rest|v[0-9]+|graphql|admin|auth|oauth|users?|products?|account|basket)(/|$)' "$urls_file" 2>/dev/null \
+  grep -iE 'https?://[^ ]+/(api|rest|v[0-9]+|graphql|admin|auth|oauth|users?|accounts?|profiles?|orders?|items?|products?|customers?|billing|settings)(/|$)' "$urls_file" 2>/dev/null \
     | drop_static | sort -u | head -n "$ACT_MAX_JUICY" >> "$targets_active_file" || true
   sort -u -o "$targets_active_file" "$targets_active_file"
   rm -f "$OUTDIR/.patterns_numbered.txt"
@@ -306,11 +306,11 @@ else
   # (e.g. /search -> /search?q=1, /api/users -> /api/users?id=1, /redirect -> /redirect?url=...)
   # so reflection (kxss/dalfox), SQLi (sqlmap), and redirect testing have concrete parameters to probe!
   {
-    grep -iE '/(search|find|query|lookup|filter|suggest)' "$targets_active_file" 2>/dev/null \
+    grep -iE '/(search|find|query|lookup|filter|suggest|autocomplete)' "$targets_active_file" 2>/dev/null \
       | grep -v '\?' | sed -E 's#/?$#?q=1#'
-    grep -iE '/(users?|products?|items?|orders?|account|profile|basket|cart|challenges?)' "$targets_active_file" 2>/dev/null \
+    grep -iE '/(users?|accounts?|profiles?|customers?|members?|teams?|orgs?|orders?|items?|products?|carts?|invoices?|documents?|files?|messages?)' "$targets_active_file" 2>/dev/null \
       | grep -v '\?' | sed -E 's#/?$#?id=1#'
-    grep -iE '/(redirect|redir|goto|forward|out|callback|next)' "$targets_active_file" 2>/dev/null \
+    grep -iE '/(redirect|redir|goto|forward|out|callback|return|next)' "$targets_active_file" 2>/dev/null \
       | grep -v '\?' | sed -E 's#/?$#?url=https://example.com#'
   } >> "$targets_active_file" 2>/dev/null || true
   # Final clean of the set that feeds every slow specialist: drop static assets, then dedupe.
