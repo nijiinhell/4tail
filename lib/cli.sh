@@ -89,6 +89,12 @@ fi
 if [ -z "$AUTH_HEADER" ] && [ -z "$AUTH_COOKIE" ] && [ -n "$AUTH_A" ]; then
   AUTH_HEADER="$AUTH_A"
   [ "$ASSUME_YES" != 1 ] && log "Auth: reusing IDOR identity A as the authenticated scan session"
+elif [ -z "$AUTH_A" ]; then
+  if [ -n "$AUTH_HEADER" ]; then
+    AUTH_A="$(printf '%s' "$AUTH_HEADER" | head -1)"
+  elif [ -n "$AUTH_COOKIE" ]; then
+    AUTH_A="Cookie: $AUTH_COOKIE"
+  fi
 fi
 AUTH_H=()
 [ -n "$AUTH_COOKIE" ] && AUTH_H+=("Cookie: $AUTH_COOKIE")
@@ -108,6 +114,7 @@ NUCLEI_NET=("${_hdr[@]}"); [ -n "$PROXY" ] && NUCLEI_NET+=(-proxy "$PROXY")
 FFUF_NET=("${_hdr[@]}");   [ -n "$PROXY" ] && FFUF_NET+=(-x "$PROXY")
 KATANA_NET=("${_hdr[@]}"); [ -n "$PROXY" ] && KATANA_NET+=(-proxy "$PROXY")
 DALFOX_NET=("${_hdr[@]}"); [ -n "$PROXY" ] && DALFOX_NET+=(--proxy "$PROXY"); DALFOX_NET+=(--user-agent "$DEFAULT_UA")
+SQLMAP_NET=("${_hdr[@]}"); [ -n "$PROXY" ] && SQLMAP_NET+=(--proxy "$PROXY")
 CURL_NET=(--compressed "${_hdr[@]}");   [ -n "$PROXY" ] && CURL_NET+=(-x "$PROXY")
 [ "${#AUTH_H[@]}" -gt 0 ] && [ "$ASSUME_YES" != 1 ] && log "Auth: ${#AUTH_H[@]} header(s) will be sent to active tools"
 [ -n "$PROXY" ] && log "Proxy: routing active tools through $PROXY"

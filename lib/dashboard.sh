@@ -14,6 +14,7 @@ SUP_NOTE=""                              # latest AI-supervisor status line
 LOOT_LINES=()
 declare -A LOOT_SEEN=()
 declare -A LOOT_FP=()
+declare -A LOOT_SEEN_ENTRIES=()
 LOOT_MAX=200
 LOOT_LAST=0
 [ "$LOOT_ROWS" -ge 1 ] 2>/dev/null || LOOT_ROWS=6
@@ -55,7 +56,10 @@ loot_sev_color() {
   esac
 }
 loot_add() {  # sev  src  text   -> push one finding, bounded history
-  LOOT_LINES+=("$1"$'\t'"$2"$'\t'"$3")
+  local entry="$1"$'\t'"$2"$'\t'"$3"
+  [ -n "${LOOT_SEEN_ENTRIES[$entry]:-}" ] && return 0
+  LOOT_SEEN_ENTRIES["$entry"]=1
+  LOOT_LINES+=("$entry")
   local n=${#LOOT_LINES[@]}
   [ "$n" -gt "$LOOT_MAX" ] && LOOT_LINES=("${LOOT_LINES[@]: -$LOOT_MAX}")
 }

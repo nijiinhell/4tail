@@ -124,7 +124,9 @@ $results" > "$aout" 2>>"$llm_log" || true
         [ "$toolcalls" -ge "$AGENT_MAX_TOOLCALLS" ] && continue
         tname="$(printf '%s' "$pline" | sed -E 's/.*TOOL[: ]+//I' | awk '{print tolower($1)}')"
         ttgt="$(printf '%s' "$pline" | grep -oiE 'https?://[^ "'"'"'`|<>]+' | head -1)"
-        [ -n "$ttgt" ] || ttgt="$(printf '%s' "$pline" | grep -oiE '([a-z0-9-]+\.)+[a-z]{2,}' | head -1)"
+        [ -n "$ttgt" ] || ttgt="$(printf '%s' "$pline" | grep -oiE '([a-z0-9-]+\.)+[a-z]{2,}(:[0-9]+)?(/[a-z0-9._~:/?#\[\]@!$&'\''()*+,;=-]*)?' | head -1)"
+        [ -n "$ttgt" ] || ttgt="$(printf '%s' "$pline" | grep -oiE 'localhost(:[0-9]+)?(/[a-z0-9._~:/?#\[\]@!$&'\''()*+,;=-]*)?' | head -1)"
+        [ -n "$ttgt" ] && [[ "$ttgt" != http* ]] && ttgt="${TARGET_SCHEME:-http}://$ttgt"
         textra="$(printf '%s' "$pline" | grep -oiE 'tags=[a-z0-9,._-]+' | head -1)"
         [ -n "$tname" ] && [ -n "$ttgt" ] || continue
         case " $agent_tools " in *" $tname "*) ;; *) continue ;; esac   # only offered tools

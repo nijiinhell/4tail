@@ -41,12 +41,12 @@ agent_tool_run() {   # name  target  extra
           *) ;;  # ignore everything else: escalation (--level/--risk), shells, file R/W, tamper, technique (stays BEU)
         esac
       done
-      raw="$(_cap sqlmap -u "$tgt" --batch --smart --level=1 --risk=1 --technique=BEU --threads=2 --timeout=10 --random-agent --disable-coloring ${sqx[@]+"${sqx[@]}"} 2>/dev/null | tail -c 4000)"
+      raw="$(_cap sqlmap -u "$tgt" --batch --smart --level=1 --risk=1 --technique=BEU --threads=2 --timeout=10 --random-agent --disable-coloring ${sqx[@]+"${sqx[@]}"} ${SQLMAP_NET[@]+"${SQLMAP_NET[@]}"} 2>/dev/null | tail -c 4000)"
       printf '%s' "$raw" | grep -qiE 'is vulnerable|is injectable|Parameter:.*|Type: ' && hit="CONFIRMED sqli"
       res="$(printf '%s' "$raw" | grep -iE 'vulnerable|injectable|Type:|back-end DBMS' | head -3 | tr '\n' ';')" ;;
     dalfox)
       have dalfox || { echo "dalfox: not installed"; return 0; }
-      raw="$(_cap dalfox url "$tgt" --silence --skip-bav --waf-evasion --mining-dom 2>/dev/null | head -c 4000)"
+      raw="$(_cap dalfox url "$tgt" --silence --skip-bav --waf-evasion --mining-dom ${DALFOX_NET[@]+"${DALFOX_NET[@]}"} 2>/dev/null | head -c 4000)"
       printf '%s' "$raw" | grep -qiE '\[POC\]|triggered|\[VULN\]' && hit="CONFIRMED xss"
       res="$(printf '%s' "$raw" | grep -iE 'POC|VULN|reflect' | head -3 | tr '\n' ';')" ;;
     nuclei)
@@ -138,6 +138,9 @@ agent_tool_run() {   # name  target  extra
   res="$(printf '%s' "$res" | sed -E 's/((pass(word|wd)?|secret|api[-_]?key|token|connection[-_ ]?string)[^[:cntrl:]]{0,8}[:=])[^[:cntrl:]"'"'"']{1,}/\1<redacted>/Ig' | head -c 320)"
   if [ -n "$hit" ]; then
     printf '[%s] %s | via %s | %s\n' "${hit%% *}" "$tgt" "$name" "$res" >> "$agent_file"
+    local s_sev="high"
+    case "$hit" in *critical*|*sqli*|*rce*) s_sev="critical" ;; *low*|*info*) s_sev="low" ;; *medium*) s_sev="medium" ;; esac
+    emit_finding agent "agent-tool-${name}" "$s_sev" "$tgt" "Tool $name confirmed: $res"
     printf 'TOOL %s %s => %s | %s' "$name" "$tgt" "$hit" "$res"
   else
     printf 'TOOL %s %s => %s' "$name" "$tgt" "${res:-no notable output}"

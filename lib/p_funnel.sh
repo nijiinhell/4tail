@@ -340,6 +340,7 @@ else
     if [ -s "$sq" ]; then
       ( tmo "$SQLMAP_MAX_TIME" sqlmap -m "$sq" --batch --smart --level=1 --risk=1 --technique=BEU \
           --threads=2 --timeout=10 --retries=1 --random-agent --flush-session \
+          ${SQLMAP_NET[@]+"${SQLMAP_NET[@]}"} \
           --output-dir="$findings_dir/sqlmap" >/dev/null 2>>"$llm_log"
         grep -rhiE 'parameter .* is vulnerable|is injectable|Type: ' "$findings_dir/sqlmap" 2>/dev/null \
           | sort -u > "$findings_dir/sqlmap.txt"

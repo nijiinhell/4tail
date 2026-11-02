@@ -96,8 +96,7 @@ try_403_bypass() {
 propagate_paths() {
   [ "$PROPAGATE" = 1 ] || return 0
   local hosts
-  if have unfurl; then hosts="$(unfurl -u format '%s://%d' < "$alive_file" 2>/dev/null | sort -u | head -n 40)"
-  else hosts="$(awk -F/ 'NF>=3{print $1"//"$3}' "$alive_file" 2>/dev/null | sort -u | head -n 40)"; fi
+  hosts="$(awk -F/ 'NF>=3{print $1"//"$3}' "$alive_file" 2>/dev/null | sort -u | head -n 40)"
   [ "$(printf '%s\n' "$hosts" | grep -c .)" -ge 2 ] || return 0   # pointless with one host
   # Harvest real application paths only: ignore static assets, traversal tokens, and probe artifacts
   local paths; paths="$(awk -F'\t' '$1=="200"{print $3}' "$fuzz_findings_file" 2>/dev/null \

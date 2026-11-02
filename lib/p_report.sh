@@ -262,7 +262,11 @@ if have jq; then
           emit_f content-discovery info ffuf "$u" "$note"
         done
     [ -f "$findings_dir/dalfox.txt" ] && while IFS= read -r l; do [ -n "$l" ] && emit_f xss high dalfox "$(nurl "$l")" "$l"; done < "$findings_dir/dalfox.txt"
-    [ -f "$findings_dir/sqlmap.txt" ] && while IFS= read -r l; do [ -n "$l" ] && emit_f sqli high sqlmap "" "$l"; done < "$findings_dir/sqlmap.txt"
+    [ -f "$findings_dir/sqlmap.txt" ] && while IFS= read -r l; do
+      [ -n "$l" ] || continue
+      _sq_u="$(head -1 "$findings_dir/.sqliq.txt" 2>/dev/null || echo "$domain")"
+      emit_f sqli critical sqlmap "${_sq_u:-$domain}" "$l"
+    done < "$findings_dir/sqlmap.txt"
     [ -f "$js_secrets_file" ] && while IFS=$'\t' read -r u m; do [ -n "$m" ] && emit_f secret medium js-mining "$u" "$m"; done < "$js_secrets_file"
     [ -f "${sourcemap_file:-}" ] && while IFS= read -r l; do [ -n "$l" ] && emit_f source-map medium js-mining "$l" "source map exposed - original source reconstructed from $l"; done < "$sourcemap_file"
     [ -f "${dns_hygiene_file:-}" ] && while IFS= read -r l; do [ -n "$l" ] || continue
@@ -284,7 +288,7 @@ if have jq; then
     [ -f "${corsy_file:-}" ] && while IFS= read -r l; do [ -n "$l" ] && emit_f cors-misconfig medium corsy "$(nurl "$l")" "$l"; done < "$corsy_file"
     [ -f "${takeover_file:-}" ] && while IFS=$'\t' read -r u cn st; do [ -n "$u" ] && emit_f subdomain-takeover high dns "$u" "dangling CNAME $cn ($st)"; done < "$takeover_file"
     true   # force group exit 0: a trailing false [ -f ] test must not (via pipefail) trip the || fallback and clobber jq's output
-  } | jq -s "{target:\"$domain\", generated:\"$(date -u +%FT%TZ)\", blueprint:\"${BLUEPRINT_NAME:-}\", count:length, findings:.}" > "$findings_json" 2>/dev/null
+  } | jq -s "{target:\"$domain\", generated:\"$(date -u +%FT%TZ)\", blueprint:\"${BLUEPRINT_NAME:-}\", count:(unique_by(.type + \"|\" + .url + \"|\" + .detail) | length), findings:(unique_by(.type + \"|\" + .url + \"|\" + .detail))}" > "$findings_json" 2>/dev/null
   [ -s "$findings_json" ] || echo '{}' > "$findings_json"
 
   if [ "$EMIT_SARIF" = 1 ]; then
