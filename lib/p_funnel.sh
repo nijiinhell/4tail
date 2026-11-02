@@ -88,6 +88,10 @@ else
   fi
   # fallback / augment: if AI gave nothing, use all param exemplars (capped)
   [ -s "$targets_active_file" ] || cut -f2 "$OUTDIR/.patterns.tsv" | head -n "$ACT_MAX_JUICY" > "$targets_active_file"
+  # Fold in high-signal REST API endpoints (even without query params, e.g. /api/..., /rest/..., /v[0-9]+/, /graphql)
+  # as they are prime targets for DAST, auth bypass, IDOR, and injection.
+  grep -iE 'https?://[^ ]+/(api|rest|v[0-9]+|graphql|admin|auth|oauth|users?|products?|account|basket)(/|$)' "$urls_file" 2>/dev/null \
+    | drop_static | sort -u | head -n "$ACT_MAX_JUICY" >> "$targets_active_file" || true
   sort -u -o "$targets_active_file" "$targets_active_file"
   rm -f "$OUTDIR/.patterns_numbered.txt"
   active_total="$(nlines "$targets_active_file")"
@@ -238,12 +242,25 @@ else
     set_stage $S_CRAWL running "folding $(nlines "$params_file") discovered params into tests"
     awk -F'\t' 'NF>=2{sep=($1 ~ /\?/)?"&":"?"; print $1 sep $2 "=1"}' "$params_file" >> "$targets_active_file"
     sort -u -o "$targets_active_file" "$targets_active_file"
-  # (D2) else run arjun here on the juicy hosts (also emitting ?param=1, not bare ?param)
+  # (D2) else run arjun here on the juicy endpoints (also emitting ?param=1, not bare ?param)
   elif has_spec arjun && have arjun && [ "${ACT_MAX_ARJUN:-0}" -gt 0 ] 2>/dev/null && [ "$active_total" -gt 0 ]; then
     set_stage $S_CRAWL running "arjun param discovery"
-    awk -F/ '{print $1"//"$3}' "$targets_active_file" | sort -u | head -n "$ACT_MAX_ARJUN" \
-      | while read -r h; do [ -n "$h" ] && tmo "$ARJUN_MAX_TIME" arjun -u "$h" -q -oT /dev/stdout 2>/dev/null \
-          | sed "s#^#${h}/?#; s#\$#=1#" ; done >> "$targets_active_file" 2>/dev/null || true
+    head -n "$ACT_MAX_ARJUN" "$targets_active_file" \
+      | while read -r tgt; do
+          [ -n "$tgt" ] || continue
+          base_tgt="${tgt%%\?*}"
+          sep="?"
+          [[ "$tgt" == *\?* ]] && sep="&"
+          tmo "$ARJUN_MAX_TIME" arjun -u "$tgt" -q -oT /dev/stdout 2>/dev/null \
+            | while read -r p; do
+                if [ -n "$p" ]; then
+                  printf '%s%s%s=1\n' "$base_tgt" "$sep" "$p"
+                  printf '%s\t%s\n' "$base_tgt" "$p" >> "$params_file"
+                fi
+              done
+        done >> "$targets_active_file" 2>/dev/null || true
+    sort -u -o "$targets_active_file" "$targets_active_file"
+    [ -f "$params_file" ] && sort -u -o "$params_file" "$params_file"
   fi
   # Final clean of the set that feeds every slow specialist: drop static assets, then dedupe.
   drop_static < "$targets_active_file" 2>/dev/null | sort -u > "$targets_active_file.tmp" \
@@ -257,6 +274,13 @@ else
       case ",$ACT_FOCUS," in *",$pat,"*|*",rce,"*) ;; *) [ "$pat" != idor ] && continue ;; esac
       gf "$pat" < "$targets_active_file" 2>/dev/null | sed "s/^/${pat}\t/" >> "$gf_file" || true
     done
+  fi
+  # Fallback regex bucketing if gf is not installed or returned no matches:
+  if [ ! -s "$gf_file" ] && [ -s "$targets_active_file" ]; then
+    grep -iE '[?&](id|user|username|email|query|search|q|cat|category|order|sort|page|select|filter|view|item|dir|role|num)=' "$targets_active_file" 2>/dev/null | sed 's/^/sqli\t/' >> "$gf_file" || true
+    grep -iE '[?&](q|query|search|keyword|msg|message|name|comment|title|redirect|url|callback|prompt|input)=' "$targets_active_file" 2>/dev/null | sed 's/^/xss\t/' >> "$gf_file" || true
+    grep -iE '[?&](url|uri|redirect|next|dest|destination|target|go|link|src|return|redir)=' "$targets_active_file" 2>/dev/null | sed 's/^/redirect\t/' >> "$gf_file" || true
+    grep -iE '[?&](url|uri|dest|host|domain|feed|rss|path|load|proxy|api)=' "$targets_active_file" 2>/dev/null | sed 's/^/ssrf\t/' >> "$gf_file" || true
   fi
 
   # (F) Dispatch paired specialists in parallel, each strictly capped.
@@ -283,7 +307,8 @@ else
     [ -s "$xq" ] || cp "$targets_active_file" "$xq"                                             # fallback: whole active set
     dfx=(dalfox pipe --silence --skip-bav --worker 10 --waf-evasion --mining-dom -o "$findings_dir/dalfox.txt")
     [ "${#DALFOX_NET[@]}" -gt 0 ] && dfx+=("${DALFOX_NET[@]}")
-    ( head -n "$ACT_MAX_DALFOX" "$xq" | tmo "$DALFOX_MAX_TIME" "${dfx[@]}" >/dev/null 2>>"$llm_log" ) & SPIDS+=($!)
+    ( head -n "$ACT_MAX_DALFOX" "$xq" | tmo "$DALFOX_MAX_TIME" "${dfx[@]}" >/dev/null 2>>"$llm_log" || \
+      head -n "$ACT_MAX_DALFOX" "$xq" | tmo "$DALFOX_MAX_TIME" dalfox pipe --silence --skip-bav --worker 10 -o "$findings_dir/dalfox.txt" >/dev/null 2>>"$llm_log" ) & SPIDS+=($!)
   fi
   # Broad DAST: nuclei -dast across all classes (or ACT_DAST_TAGS)
   if has_spec nuclei-dast && have nuclei && [ -s "$targets_active_file" ]; then
@@ -303,7 +328,15 @@ else
   fi
   # SQLi confirmation: sqlmap on the gf-sqli URLs ONLY, tightly capped (not discovery)
   if has_spec sqlmap && [ "$SQLMAP_CONFIRM" = 1 ] && have sqlmap && [ "${ACT_MAX_SQLMAP:-0}" -gt 0 ] 2>/dev/null; then
-    sq="$findings_dir/.sqliq.txt"; grep -iE '^sqli\t' "$gf_file" 2>/dev/null | cut -f2 | head -n "$ACT_MAX_SQLMAP" > "$sq"
+    sq="$findings_dir/.sqliq.txt"; : > "$sq"
+    grep -iE '^sqli\t' "$gf_file" 2>/dev/null | cut -f2 | head -n "$ACT_MAX_SQLMAP" > "$sq"
+    if [ ! -s "$sq" ] && [ -s "$targets_active_file" ]; then
+      grep -iE '[?&](id|user|username|email|query|search|q|cat|category|order|sort|page|select|filter|view|item|dir|role|num)=' "$targets_active_file" 2>/dev/null \
+        | head -n "$ACT_MAX_SQLMAP" > "$sq"
+    fi
+    if [ ! -s "$sq" ] && [ -s "$targets_active_file" ]; then
+      grep -E '\?[^=]+=' "$targets_active_file" 2>/dev/null | head -n "$ACT_MAX_SQLMAP" > "$sq"
+    fi
     if [ -s "$sq" ]; then
       ( tmo "$SQLMAP_MAX_TIME" sqlmap -m "$sq" --batch --smart --level=1 --risk=1 --technique=BEU \
           --threads=2 --timeout=10 --retries=1 --random-agent --flush-session \
@@ -311,8 +344,9 @@ else
         grep -rhiE 'parameter .* is vulnerable|is injectable|Type: ' "$findings_dir/sqlmap" 2>/dev/null \
           | sort -u > "$findings_dir/sqlmap.txt"
         if [ -s "$findings_dir/sqlmap.txt" ]; then
+          local_target="$(head -1 "$sq" 2>/dev/null || echo "$domain")"
           while IFS= read -r _sq_line; do
-            emit_finding dast sqli critical "$sq" "SQL injection confirmed: $_sq_line"
+            emit_finding dast sqli critical "$local_target" "SQL injection confirmed: $_sq_line"
           done < "$findings_dir/sqlmap.txt"
         fi ) & SPIDS+=($!)
     fi
@@ -326,6 +360,31 @@ else
   done
   for sp in "${SPIDS[@]:-}"; do [ -n "$sp" ] && wait "$sp" 2>/dev/null || true; done
   rm -f "$OUTDIR/.dast_targets.txt" "$findings_dir/.xssq.txt" "$findings_dir/.sqliq.txt"
+
+  # Canonical findings emission for active specialists
+  if [ -s "$dast_file" ]; then
+    while IFS= read -r _dst_l; do
+      [ -n "$_dst_l" ] || continue
+      _d_id="$(printf '%s' "$_dst_l" | grep -oE '^\[[^]]+\]' | head -1 | tr -d '[]')"
+      _d_sev="$(printf '%s' "$_dst_l" | grep -oiE '\[(critical|high|medium|low|info)\]' | head -1 | tr -d '[]' | tr 'A-Z' 'a-z')"
+      _d_url="$(printf '%s' "$_dst_l" | grep -oE 'https?://[^ ]+' | head -1)"
+      emit_finding dast "${_d_id:-dast-finding}" "${_d_sev:-medium}" "${_d_url:-$domain}" "$_dst_l"
+    done < "$dast_file"
+  fi
+  if [ -s "$findings_dir/dalfox.txt" ]; then
+    while IFS= read -r _df_l; do
+      [ -n "$_df_l" ] || continue
+      _df_u="$(printf '%s' "$_df_l" | grep -oiE 'https?://[^ ]+' | head -1)"
+      emit_finding dast xss high "${_df_u:-$domain}" "Dalfox XSS confirmed: $_df_l"
+    done < "$findings_dir/dalfox.txt"
+  fi
+  if [ -s "$findings_dir/kxss.txt" ]; then
+    grep -iE 'Unfiltered:.*[<>"'\'']' "$findings_dir/kxss.txt" 2>/dev/null | while IFS= read -r _kx_l; do
+      [ -n "$_kx_l" ] || continue
+      _kx_u="$(printf '%s' "$_kx_l" | grep -oiE 'https?://[^ ]+' | head -1)"
+      emit_finding kxss xss-reflection low "${_kx_u:-$domain}" "Reflected unfiltered characters: $_kx_l"
+    done
+  fi
 
   # (G) Correlation / exploitation passes that connect findings into verdicts.
   : > "$bypass_file"; : > "$prop_file"; : > "$idor_file"; : > "$corsy_file"

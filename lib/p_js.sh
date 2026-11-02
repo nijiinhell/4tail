@@ -165,13 +165,25 @@ else
   fi
   if [ -s "$js_secrets_file" ]; then
     # High-precision noise suppression:
-    # 1. Drop syntax highlighter keyword lists, long space-separated words, and common code constants
-    # 2. Drop asset paths, media/font extensions, placeholder/dummy values, and JS framework keywords
-    grep -vE '([a-zA-Z]+[[:space:]]+){3,}' "$js_secrets_file" 2>/dev/null \
-      | grep -ivE '(true|false|null|undefined|application/json|text/html|void 0|this\.|window\.|process\.env|document\.|console\.log|export (default|const)|import \{|class [a-zA-Z])' \
-      | grep -ivE '/(api|v[0-9]+|assets|static|images|chunks|packs)/|\.(png|jpe?g|gif|svg|css|woff2?|ttf|eot|ico|map)' \
-      | grep -ivE '(placeholder|dummy|example|sample|changeme|default_value|your[-_]?key|xxxx+|123456)' \
-      | awk -F'\t' '{ k=($NF); if(!seen[k]++) print }' > "$js_secrets_file.tmp" && mv "$js_secrets_file.tmp" "$js_secrets_file"
+    # Match exclusively against the candidate secret value ($NF) so the source URL
+    # in column 1 (e.g. /assets/main.js, /static/bundle.js) is never falsely filtered.
+    awk -F'\t' 'NF>=2 {
+      val = $NF
+      if (length(val) < 8 || length(val) > 400) next
+      # Drop prose / multi-word sentences
+      if (val ~ /([a-zA-Z]+[[:space:]]+){3,}/) next
+      lval = tolower(val)
+      # Drop JS language keywords and runtime constructs
+      if (lval ~ /^(true|false|null|undefined|void 0)$/) next
+      if (lval ~ /(application\/json|text\/html|process\.env|console\.log|export (default|const)|import \{|class [a-za-z])/) next
+      if (lval ~ /^(this\.|window\.|document\.)/) next
+      # Drop static asset paths / file extensions if captured as candidate values
+      if (lval ~ /\.(png|jpe?g|gif|svg|css|woff2?|ttf|eot|ico|map)([?#]|$)/) next
+      if (lval ~ /^\/?(assets|static|images|chunks|packs)\//) next
+      # Drop placeholder strings
+      if (lval ~ /(placeholder|dummy|example|sample|changeme|default_value|your[-_]?key|xxxx+|123456)/) next
+      if (!seen[val]++) print
+    }' "$js_secrets_file" > "$js_secrets_file.tmp" && mv "$js_secrets_file.tmp" "$js_secrets_file"
 
     # Emit canonical findings into findings.jsonl
     while IFS=$'\t' read -r j_src j_det j_ver j_val; do

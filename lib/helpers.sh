@@ -188,22 +188,40 @@ idor_check() {
 verify_findings() {
   [ "$VERIFY" = 1 ] || return 0
   : > "$verified_file"
-  local u r1 r2 rc s1 z1 s2 z2 sc zc cu
-  { [ -f "${agent_file:-}" ]  && grep -oiE 'https?://[^ |]+' "$agent_file"
-    [ -f "${bypass_file:-}" ] && grep -oiE 'https?://[^ |]+' "$bypass_file"
-    [ -f "${idor_file:-}" ]   && grep -oiE 'https?://[^ |]+' "$idor_file"
-    [ -f "${dast_file:-}" ]   && grep -oiE 'https?://[^ |]+' "$dast_file"
-    [ -f "${corsy_file:-}" ]  && grep -oiE 'https?://[^ |]+' "$corsy_file"
-  } 2>/dev/null | sort -u | head -n 60 | while IFS= read -r u; do
-    [ -n "$u" ] || continue
-    r1="$(curl -s -o /dev/null -w '%{http_code} %{size_download}' -L --max-time 12 ${CURL_NET[@]+"${CURL_NET[@]}"} "$u" 2>/dev/null || echo '000 0')"
-    r2="$(curl -s -o /dev/null -w '%{http_code} %{size_download}' -L --max-time 12 ${CURL_NET[@]+"${CURL_NET[@]}"} "$u" 2>/dev/null || echo '000 0')"
+  local v_m v_u v_b r1 r2 rc s1 z1 s2 z2 sc zc cu c_post c_ctl
+  { if [ -s "${agent_file:-}" ]; then
+      sed -nE 's/.*\[CONFIRMED\][[:space:]]+POST[[:space:]]+(https?:\/\/[^ ]+)[[:space:]]+\(body:[[:space:]]*(.*)\)[[:space:]]*\|.*/POST\t\1\t\2/p' "$agent_file" 2>/dev/null
+      grep -oiE 'https?://[^ |]+' "$agent_file" 2>/dev/null | sed 's/^/GET\t/'
+    fi
+    [ -s "${bypass_file:-}" ] && grep -oiE 'https?://[^ |]+' "$bypass_file" 2>/dev/null | sed 's/^/GET\t/'
+    [ -s "${idor_file:-}" ]   && grep -oiE 'https?://[^ |]+' "$idor_file" 2>/dev/null | sed 's/^/GET\t/'
+    [ -s "${dast_file:-}" ]   && grep -oiE 'https?://[^ |]+' "$dast_file" 2>/dev/null | sed 's/^/GET\t/'
+    [ -s "${corsy_file:-}" ]  && grep -oiE 'https?://[^ |]+' "$corsy_file" 2>/dev/null | sed 's/^/GET\t/'
+  } | awk -F'\t' '!seen[$2]++' | head -n 60 | while IFS=$'\t' read -r v_m v_u v_b; do
+    [ -n "$v_u" ] || continue
+    v_m="${v_m:-GET}"
+    if [ "$v_m" = "POST" ]; then
+      c_post=(-X POST)
+      c_ctl=(-X POST)
+      case "$v_b" in
+        "{"*) c_post+=(-H "Content-Type: application/json" -d "$v_b")
+              c_ctl+=(-H "Content-Type: application/json" -d "{\"email\":\"ctl_${RANDOM}@invalid.test\",\"password\":\"ctl_${RANDOM}\"}") ;;
+        *)    c_post+=(-d "$v_b")
+              c_ctl+=(-d "email=ctl_${RANDOM}%40invalid.test&password=ctl_${RANDOM}") ;;
+      esac
+      r1="$(curl -s -o /dev/null -w '%{http_code} %{size_download}' -L --max-time 12 ${CURL_NET[@]+"${CURL_NET[@]}"} "${c_post[@]}" "$v_u" 2>/dev/null || echo '000 0')"
+      r2="$(curl -s -o /dev/null -w '%{http_code} %{size_download}' -L --max-time 12 ${CURL_NET[@]+"${CURL_NET[@]}"} "${c_post[@]}" "$v_u" 2>/dev/null || echo '000 0')"
+      rc="$(curl -s -o /dev/null -w '%{http_code} %{size_download}' -L --max-time 12 ${CURL_NET[@]+"${CURL_NET[@]}"} "${c_ctl[@]}" "$v_u" 2>/dev/null || echo '000 0')"
+    else
+      r1="$(curl -s -o /dev/null -w '%{http_code} %{size_download}' -L --max-time 12 ${CURL_NET[@]+"${CURL_NET[@]}"} "$v_u" 2>/dev/null || echo '000 0')"
+      r2="$(curl -s -o /dev/null -w '%{http_code} %{size_download}' -L --max-time 12 ${CURL_NET[@]+"${CURL_NET[@]}"} "$v_u" 2>/dev/null || echo '000 0')"
+      cu="$(printf '%s' "$v_u" | sed -E "s#(\?.*)?\$#/4tailctl${RANDOM}&#")"
+      rc="$(curl -s -o /dev/null -w '%{http_code} %{size_download}' -L --max-time 12 ${CURL_NET[@]+"${CURL_NET[@]}"} "$cu" 2>/dev/null || echo '000 0')"
+    fi
     s1="${r1%% *}"; z1="${r1##* }"; s2="${r2%% *}"; z2="${r2##* }"
-    cu="$(printf '%s' "$u" | sed -E "s#(\?.*)?\$#/4tailctl${RANDOM}&#")"
-    rc="$(curl -s -o /dev/null -w '%{http_code} %{size_download}' -L --max-time 12 ${CURL_NET[@]+"${CURL_NET[@]}"} "$cu" 2>/dev/null || echo '000 0')"
     sc="${rc%% *}"; zc="${rc##* }"
     if [ "$s1" = "$s2" ] && _near "$z1" "$z2" && [ "$s1" != 000 ] && { [ "$s1" != "$sc" ] || ! _near "$z1" "$zc"; }; then
-      printf 'VERIFIED %s [%s, %sB] (bogus control -> %s/%sB, differs)\n' "$u" "$s1" "$z1" "$sc" "$zc" >> "$verified_file"
+      printf 'VERIFIED %s %s [%s, %sB] (bogus control -> %s/%sB, differs)\n' "$v_m" "$v_u" "$s1" "$z1" "$sc" "$zc" >> "$verified_file"
     fi
   done
 }
