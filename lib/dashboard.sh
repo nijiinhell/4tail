@@ -56,9 +56,14 @@ loot_sev_color() {
   esac
 }
 loot_add() {  # sev  src  text   -> push one finding, bounded history
-  local entry="$1"$'\t'"$2"$'\t'"$3"
-  [ -n "${LOOT_SEEN_ENTRIES[$entry]:-}" ] && return 0
-  LOOT_SEEN_ENTRIES["$entry"]=1
+  local sev="$1" src="$2" text="$3"
+  # Deduplicate by normalized text content so the same finding formatted slightly
+  # differently across stages (e.g. agent vs cors vs tool-cors) is only displayed once.
+  local norm_key
+  norm_key="$(printf '%s' "$text" | sed -E 's/\[[^]]+\]//g; s/via [a-z0-9_-]+//g; s/Tool [a-z0-9_-]+ confirmed://g' | tr -s '[:space:]' ' ' | tr -dc '[:alnum:]/' | tr 'A-Z' 'a-z')"
+  [ -n "$norm_key" ] && [ -n "${LOOT_SEEN_ENTRIES[$norm_key]:-}" ] && return 0
+  [ -n "$norm_key" ] && LOOT_SEEN_ENTRIES["$norm_key"]=1
+  local entry="$sev"$'\t'"$src"$'\t'"$text"
   LOOT_LINES+=("$entry")
   local n=${#LOOT_LINES[@]}
   [ "$n" -gt "$LOOT_MAX" ] && LOOT_LINES=("${LOOT_LINES[@]: -$LOOT_MAX}")
@@ -123,23 +128,29 @@ loot_refresh() {
   [ "$LOOT_FEED" = 1 ] || return 0
   [ $((SECONDS - LOOT_LAST)) -lt 1 ] && return 0
   LOOT_LAST=$SECONDS
-  [ -n "${findings_jsonl:-}" ] && loot_scan_jsonl "$findings_jsonl"
-  loot_scan "${fuzz_findings_file:-}"      ffuf    ffuf
-  loot_scan "${dast_file:-}"               dast    nuclei
-  loot_scan "${nuclei_file:-}"             nuclei  nuclei
-  loot_scan "${findings_dir:-}/dalfox.txt" dalfox  dalfox
-  loot_scan "${findings_dir:-}/kxss.txt"   kxss    kxss
-  loot_scan "${findings_dir:-}/sqlmap.txt" sqlmap  sqlmap
-  loot_scan "${findings_dir:-}/redirect.txt" redirect redirect
-  loot_scan "${findings_dir:-}/host_header.txt" host_header host_header
-  loot_scan "${js_secrets_file:-}"         js      secret
-  loot_scan "${api_specs_file:-}"          api     apispec
-  loot_scan "${oast_hits_file:-}"          oast    sqlmap
-  loot_scan "${agent_file:-}"              agent   sqlmap
-  loot_scan "${bypass_file:-}"             bypass  sqlmap
-  loot_scan "${idor_file:-}"               idor    sqlmap
-  loot_scan "${corsy_file:-}"              cors    secret
-  loot_scan "${takeover_file:-}"           takeover sqlmap
+  if [ -n "${findings_jsonl:-}" ] && [ -s "$findings_jsonl" ]; then
+    # Primary unified stream: everything emitted to findings.jsonl plus ffuf content-discovery
+    loot_scan_jsonl "$findings_jsonl"
+    loot_scan "${fuzz_findings_file:-}" ffuf ffuf
+  else
+    # Fallback when JSONL findings log is empty or unavailable
+    loot_scan "${fuzz_findings_file:-}"      ffuf    ffuf
+    loot_scan "${dast_file:-}"               dast    nuclei
+    loot_scan "${nuclei_file:-}"             nuclei  nuclei
+    loot_scan "${findings_dir:-}/dalfox.txt" dalfox  dalfox
+    loot_scan "${findings_dir:-}/kxss.txt"   kxss    kxss
+    loot_scan "${findings_dir:-}/sqlmap.txt" sqlmap  sqlmap
+    loot_scan "${findings_dir:-}/redirect.txt" redirect redirect
+    loot_scan "${findings_dir:-}/host_header.txt" host_header host_header
+    loot_scan "${js_secrets_file:-}"         js      secret
+    loot_scan "${api_specs_file:-}"          api     apispec
+    loot_scan "${oast_hits_file:-}"          oast    sqlmap
+    loot_scan "${agent_file:-}"              agent   sqlmap
+    loot_scan "${bypass_file:-}"             bypass  sqlmap
+    loot_scan "${idor_file:-}"               idor    sqlmap
+    loot_scan "${corsy_file:-}"              cors    secret
+    loot_scan "${takeover_file:-}"           takeover sqlmap
+  fi
 }
 
 # _draw_panel: emit the panel body at the current cursor position (no positioning).

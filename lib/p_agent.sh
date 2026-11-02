@@ -89,13 +89,22 @@ Three kinds of action:
   TOOL <name> <url> | tags=...               -> run a real tool. ONLY these are installed: ${agent_tools:-none}. Use them to CONFIRM, e.g. sqlmap on a SQLi-looking param (it always runs capped at --level=1 --risk=1; higher levels are ignored), dalfox on a reflecting param, nuclei <url> tags=iis,cve on a fingerprinted host, git-dumper on an exposed /.git, nuclei-dast to fuzz a param URL. Prefer a TOOL to prove a lead over guessing.
 Ideas: confirmed/possible LFI (Templatize.asp?item=) -> read ../web.config, ../global.asa, ../../../windows/win.ini (if it holds a connection string / machineKey, 4tail saves the raw file for the human - you just confirm the read with a regex like connectionString); empty/small 200 endpoints -> add params ?id=1&debug=1; redirect params -> //example.org/ and watch Location; exposed /.git -> git-dumper.
 For the MINED API ENDPOINTS (SPA /rest + /api) go further than GET: (a) PATH-IDOR/BOLA - a numeric path segment like /api/Users/1 or /rest/basket/3 is an object id, so GET the neighbour (/2, /4) and compare; a readable neighbour you should not own is a lead; (b) AUTH/SQLi - POST a JSON body to a login/authentication endpoint with a single-quote injected into the email/username field and look for a SQL error or an unexpected auth success; (c) MASS ASSIGNMENT - POST/register with an extra JSON field such as role set to admin, or isAdmin true, and check whether it sticks. Use the POST action for (b) and (c); a body that starts with a brace is sent as application/json.
+CRITICAL WORKFLOW RULES:
+- Systematically test distinct bug categories across rounds. DO NOT stop early after confirming just one finding (e.g. CORS).
+- Priority 1: Auth & Login Bypasses. Search MINED API ENDPOINTS for login/auth routes (e.g. /rest/user/login, /api/login, /auth/login, /login). Send a POST probe with classic SQLi auth bypass bodies:
+    {"email":"' or 1=1--","password":"x"}
+    or username=%27+or+1%3D1--&password=x
+  Success regex: token|authentication|success|200.
+- Priority 2: API Object IDOR / BOLA. For numeric API routes (e.g. /api/Users/1, /rest/basket/1), GET neighbour ids (2, 3) and check if data returns.
+- Priority 3: Tools & Injections. Run tools (sqlmap, dalfox, cors) on juicy candidates, or probe search/query parameters with ' or 1=1--.
+- Set 'DECISION: CONTINUE' until you have systematically tested these categories across your rounds.
 All URLs MUST be on the target scope *.$domain. Respond in EXACTLY this structure, nothing else:
 NOTES:
 <2-6 short lines: updated hypotheses + status>
 ACTIONS:
 <one GET, POST or TOOL line each>
 DECISION: CONTINUE
-(use 'DECISION: STOP' when leads are exhausted or everything promising is already confirmed)" \
+(use 'DECISION: STOP' only when all categories above are thoroughly tested)" \
 "SITUATION:
 $situation
 
@@ -209,7 +218,15 @@ $results" > "$aout" 2>>"$llm_log" || true
     done <<< "$probes"
     [ -n "$results" ] || break
     # The AI chases a hot lead across rounds, but stops itself when exhausted.
-    if [ "$decision" = STOP ]; then SUP_NOTE="agent: stopping (leads exhausted)"; break; fi
+    # Prevent premature exit on round 1 or 2 when major categories (auth/API/injection) remain unprobed.
+    if [ "$decision" = STOP ]; then
+      if [ "$round" -ge 4 ] || [ "$round" -ge "$AGENT_ROUNDS" ]; then
+        SUP_NOTE="agent: stopping (leads exhausted)"
+        break
+      else
+        results="$results"$'\n'"[SYSTEM NOTE] Premature STOP declined (round $round/$AGENT_ROUNDS). Probe remaining key categories: test login/auth endpoints with SQLi auth bypass (POST), numeric API endpoints for IDOR, or search parameters before stopping."
+      fi
+    fi
   done
   # Persist the agent's final reasoning for the report/transcript.
   { echo "=== final hypotheses ==="; printf '%s\n' "$agent_notes"; } >> "$agent_log"

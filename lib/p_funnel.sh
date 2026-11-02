@@ -302,6 +302,17 @@ else
     sort -u -o "$targets_active_file" "$targets_active_file"
     [ -f "$params_file" ] && sort -u -o "$params_file" "$params_file"
   fi
+  # Seed common high-yield query parameters on REST endpoints that lack query strings
+  # (e.g. /search -> /search?q=1, /api/users -> /api/users?id=1, /redirect -> /redirect?url=...)
+  # so reflection (kxss/dalfox), SQLi (sqlmap), and redirect testing have concrete parameters to probe!
+  {
+    grep -iE '/(search|find|query|lookup|filter|suggest)' "$targets_active_file" 2>/dev/null \
+      | grep -v '\?' | sed -E 's#/?$#?q=1#'
+    grep -iE '/(users?|products?|items?|orders?|account|profile|basket|cart|challenges?)' "$targets_active_file" 2>/dev/null \
+      | grep -v '\?' | sed -E 's#/?$#?id=1#'
+    grep -iE '/(redirect|redir|goto|forward|out|callback|next)' "$targets_active_file" 2>/dev/null \
+      | grep -v '\?' | sed -E 's#/?$#?url=https://example.com#'
+  } >> "$targets_active_file" 2>/dev/null || true
   # Final clean of the set that feeds every slow specialist: drop static assets, then dedupe.
   drop_static < "$targets_active_file" 2>/dev/null | sort -u > "$targets_active_file.tmp" \
     && mv "$targets_active_file.tmp" "$targets_active_file"
@@ -444,15 +455,20 @@ else
     corsy_args=(-i "$OUTDIR/.cors_in.txt" -t 16)
     [ -n "$AUTH_HEADER" ] && corsy_args+=(-headers "$(echo "$AUTH_HEADER" | paste -sd, -)")
     [ -n "$AUTH_COOKIE" ] && corsy_args+=(-headers "Cookie: $AUTH_COOKIE")
-    # Strip Corsy's ANSI colors, drop its "No misconfigurations found" banner, and keep only
-    # lines that are an actual finding (carry a URL or a named misconfig class).
+    # Strip Corsy's ANSI colors, capture the target URL with its misconfiguration class,
+    # and deduplicate findings per endpoint.
     [ -s "$OUTDIR/.cors_in.txt" ] && tmo 180 corsy "${corsy_args[@]}" 2>/dev/null \
       | sed -E 's/\x1b\[[0-9;]*m//g' \
-      | grep -viE 'no misconfig|not vulnerable|unreachable|could not|timed out|invalid|connection (refused|error)|^[[:space:]]*-?[[:space:]]*$' \
-      | grep -iE 'reflect|wildcard|null origin|arbitrary origin|post-domain|pre-domain|trusted|credentials|origin reflected' > "$corsy_file" || true
+      | awk '/Target:[[:space:]]*(https?:\/\/[^ ]+)/{match($0, /https?:\/\/[^ ]+/); cur_u=substr($0, RSTART, RLENGTH)}
+             /Class:[[:space:]]*/{
+               sub(/^[[:space:]]*-?[[:space:]]*/, "");
+               if (cur_u) print cur_u "\t" $0;
+               else print $0;
+             }' | awk '!seen[$0]++' > "$corsy_file" || true
     if [ -s "$corsy_file" ]; then
-      while IFS= read -r _cors_l; do
-        emit_finding cors cors-misconfig medium "$domain" "$_cors_l"
+      while IFS=$'\t' read -r _cors_u _cors_l; do
+        [ -n "$_cors_l" ] || { _cors_l="$_cors_u"; _cors_u="$domain"; }
+        emit_finding cors cors-misconfig medium "$_cors_u" "$_cors_l"
       done < "$corsy_file"
     fi
     rm -f "$OUTDIR/.cors_in.txt"

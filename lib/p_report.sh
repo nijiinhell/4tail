@@ -233,41 +233,13 @@ if have jq; then
   nurl() { printf '%s' "$1" | grep -oE 'https?://[^ ]+' | head -1; }
   {
     if [ -s "${findings_jsonl:-}" ]; then
+      # Primary structured store: all findings emitted via emit_finding
       jq -c '. | {type:.type, severity:(.severity // "info"), source:(.stage // "hit"), url:(.target // ""), detail:.evidence, poc:(.poc // "")}' "$findings_jsonl" 2>/dev/null
-    fi
-    [ -f "$nuclei_file" ] && while IFS= read -r l; do [ -n "$l" ] && emit_f nuclei "$(nsev "$l")" nuclei "$(nurl "$l")" "$l"; done < "$nuclei_file"
-    [ -f "$dast_file" ]   && while IFS= read -r l; do [ -n "$l" ] && emit_f dast "$(nsev "$l")" nuclei-dast "$(nurl "$l")" "$l"; done < "$dast_file"
-    # Group ffuf hits by response fingerprint (status,length) - never by URL string -
-    # so case-variants (db.asp/DB.asp on IIS) and WAF noise (32 identical 403/312
-    # traversal blocks) collapse to one representative with a count.
-    [ -f "$fuzz_findings_file" ] && awk -F'\t' 'NF>=3{
-        st=$1; len=$2; u=$3
-        if (st ~ /^(301|302|307|308)$/ && len < 400) {
-          match(u, /^https?:\/\/[^\/]+/);
-          h = substr(u, RSTART, RLENGTH);
-          k = st "\tredirect\t" h;
-        } else {
-          k = st "\t" len;
-        }
-        c[k]++; if (!(k in r)) r[k]=u;
-      }
-      END{
-        for (k in c) {
-          if (k ~ /\tredirect\t/) {
-            split(k, p, "\t");
-            printf "%s\tredirect\t%s\t%d\n", p[1], r[k], c[k];
-          } else {
-            split(k, p, "\t");
-            printf "%s\t%s\t%s\t%d\n", p[1], p[2], r[k], c[k];
-          }
-        }
-      }' "$fuzz_findings_file" \
-      | while IFS=$'\t' read -r st len u c; do
-          [ -n "$u" ] || continue
-          note="status=$st length=$len"; [ "${c:-1}" -gt 1 ] && note="$note (×$c identical responses)"
-          emit_f content-discovery info ffuf "$u" "$note"
-        done
-    [ -f "$findings_dir/dalfox.txt" ] && while IFS= read -r l; do [ -n "$l" ] && emit_f xss high dalfox "$(nurl "$l")" "$l"; done < "$findings_dir/dalfox.txt"
+    else
+      # Legacy fallback when findings.jsonl is not available
+      [ -f "$nuclei_file" ] && while IFS= read -r l; do [ -n "$l" ] && emit_f nuclei "$(nsev "$l")" nuclei "$(nurl "$l")" "$l"; done < "$nuclei_file"
+      [ -f "$dast_file" ]   && while IFS= read -r l; do [ -n "$l" ] && emit_f dast "$(nsev "$l")" nuclei-dast "$(nurl "$l")" "$l"; done < "$dast_file"
+      [ -f "$findings_dir/dalfox.txt" ] && while IFS= read -r l; do [ -n "$l" ] && emit_f xss high dalfox "$(nurl "$l")" "$l"; done < "$findings_dir/dalfox.txt"
     [ -f "$findings_dir/sqlmap.txt" ] && while IFS= read -r l; do
       [ -n "$l" ] || continue
       _sq_u="$(head -1 "$findings_dir/.sqliq.txt" 2>/dev/null || echo "$domain")"
@@ -295,8 +267,49 @@ if have jq; then
     [ -f "${prop_file:-}" ] && while IFS=$'\t' read -r c u; do [ -n "$u" ] && emit_f content-discovery info cross-host "$u" "status=$c (found on a sibling host)"; done < "$prop_file"
     [ -f "${corsy_file:-}" ] && while IFS= read -r l; do [ -n "$l" ] && emit_f cors-misconfig medium corsy "$(nurl "$l")" "$l"; done < "$corsy_file"
     [ -f "${takeover_file:-}" ] && while IFS=$'\t' read -r u cn st; do [ -n "$u" ] && emit_f subdomain-takeover high dns "$u" "dangling CNAME $cn ($st)"; done < "$takeover_file"
+    fi
+    # Group ffuf hits by response fingerprint (status,length) - never by URL string -
+    # so case-variants (db.asp/DB.asp on IIS) and WAF noise (32 identical 403/312
+    # traversal blocks) collapse to one representative with a count.
+    [ -f "$fuzz_findings_file" ] && awk -F'\t' 'NF>=3{
+        st=$1; len=$2; u=$3
+        if (st ~ /^(301|302|307|308)$/ && len < 400) {
+          match(u, /^https?:\/\/[^\/]+/);
+          h = substr(u, RSTART, RLENGTH);
+          k = st "\tredirect\t" h;
+        } else {
+          k = st "\t" len;
+        }
+        c[k]++; if (!(k in r)) r[k]=u;
+      }
+      END{
+        for (k in c) {
+          if (k ~ /\tredirect\t/) {
+            split(k, p, "\t");
+            printf "%s\tredirect\t%s\t%d\n", p[1], r[k], c[k];
+          } else {
+            printf "%s\t%s\t%s\t%d\n", p[1], p[2], r[k], c[k];
+          }
+        }
+      }' "$fuzz_findings_file" \
+      | while IFS=$'\t' read -r st len u c; do
+          [ -n "$u" ] || continue
+          note="status=$st length=$len"; [ "${c:-1}" -gt 1 ] && note="$note (x$c identical responses)"
+          emit_f content-discovery info ffuf "$u" "$note"
+        done
     true   # force group exit 0: a trailing false [ -f ] test must not (via pipefail) trip the || fallback and clobber jq's output
-  } | jq -s "{target:\"$domain\", generated:\"$(date -u +%FT%TZ)\", blueprint:\"${BLUEPRINT_NAME:-}\", count:(unique_by(.type + \"|\" + .url + \"|\" + .detail) | length), findings:(unique_by(.type + \"|\" + .url + \"|\" + .detail))}" > "$findings_json" 2>/dev/null
+  } | jq -s '
+    unique_by(
+      ((.url // "") | sub("/+$"; "") | ascii_downcase) + "|" +
+      ((.detail // "") | gsub("\\[[^\\]]+\\]"; "") | gsub("^Tool [a-z0-9_-]+ confirmed: "; "") | gsub("via [a-z0-9_-]+"; "") | gsub("[[:space:]]+"; " ") | sub("^ "; "") | sub(" $"; "") | ascii_downcase)
+    ) as $uniq |
+    {
+      target: "'"$domain"'",
+      generated: "'"$(date -u +%FT%TZ)"'",
+      blueprint: "'"${BLUEPRINT_NAME:-}"'",
+      count: ($uniq | length),
+      findings: $uniq
+    }' > "$findings_json" 2>/dev/null
   [ -s "$findings_json" ] || echo '{}' > "$findings_json"
 
   if [ "$EMIT_SARIF" = 1 ]; then

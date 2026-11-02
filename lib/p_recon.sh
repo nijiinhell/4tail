@@ -176,9 +176,15 @@ if [ "$SEC_HEADERS" = 1 ]; then
       case "$u" in https://*) printf '%s' "$cl" | grep -q 'secure' || cf="$cf Secure" ;; esac
       printf '%s' "$cl" | grep -q 'httponly' || cf="$cf HttpOnly"
       printf '%s' "$cl" | grep -q 'samesite' || cf="$cf SameSite"
-      [ -n "$cf" ] && echo "[cookie] $u cookie '$cn' missing:$cf" >> "$sec_headers_file"
+      if [ -n "$cf" ]; then
+        echo "[cookie] $u cookie '$cn' missing:$cf" >> "$sec_headers_file"
+        emit_finding security-headers weak-cookie low "$u" "Cookie '$cn' missing:$cf"
+      fi
     done
-    [ -n "$miss" ] && echo "[headers] $u missing:$miss" >> "$sec_headers_file"
+    if [ -n "$miss" ]; then
+      echo "[headers] $u missing:$miss" >> "$sec_headers_file"
+      emit_finding security-headers missing-headers low "$u" "Missing security headers:$miss"
+    fi
   done
 fi
 
