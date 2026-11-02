@@ -159,7 +159,8 @@ else
       # If the endpoint returned Swagger-UI HTML wrapper instead of raw JSON/YAML,
       # extract the underlying spec URL and fetch the actual schema for AI analysis.
       if printf '%s' "$body" | grep -qiE '<(!doctype|html|head|body)'; then
-        spec_url_rel="$(printf '%s' "$body" | grep -oiE '["'"'"'](/?[a-zA-Z0-9_./-]+\.(json|yaml|yml))' | head -1 | tr -d '"'"'"')"
+        _spec_re='[^[:space:]"'\''<>]+[.](json|yaml|yml)'
+        spec_url_rel="$(printf '%s' "$body" | grep -oiE "$_spec_re" | head -1)"
         if [ -n "$spec_url_rel" ]; then
           case "$spec_url_rel" in
             http://*|https://*) resolved_spec="$spec_url_rel" ;;
@@ -167,7 +168,7 @@ else
             *) resolved_spec="${spec%/*}/$spec_url_rel" ;;
           esac
           json_body="$(curl -s -L --max-time 15 ${CURL_NET[@]+"${CURL_NET[@]}"} "$resolved_spec" 2>/dev/null | head -c 60000)"
-          if [ -n "$json_body" ] && printf '%s' "$json_body" | grep -qiE '("openapi"|"swagger"|"paths")'; then
+          if [ -n "$json_body" ] && printf '%s' "$json_body" | grep -qiE 'openapi|swagger|"paths"'; then
             body="$json_body"
             spec="$resolved_spec"
             printf '%s\n' "$resolved_spec" >> "$api_specs_file"
