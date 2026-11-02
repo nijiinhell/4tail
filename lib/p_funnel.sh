@@ -38,7 +38,7 @@ else
     set_stage $S_CRAWL running "katana crawling…"
     kcmd=(katana -silent -list "$alive_file" -d 2 -jc -kf all -c 15
           -ef png,jpg,jpeg,gif,svg,css,woff,woff2,ttf,eot,ico
-          -f qurl -cos false -o "$OUTDIR/.katana.txt")
+          -cos false -o "$OUTDIR/.katana.txt")
     [ "${#KATANA_NET[@]}" -gt 0 ] && kcmd+=("${KATANA_NET[@]}")
     [ "$CRAWL_MAX_TIME" -gt 0 ] 2>/dev/null && have timeout && kcmd=(timeout "${CRAWL_MAX_TIME}s" "${kcmd[@]}")
     "${kcmd[@]}" >/dev/null 2>>"$llm_log" & kpid=$!
@@ -49,6 +49,28 @@ else
     wait "$kpid" 2>/dev/null || true
     [ -f "$OUTDIR/.katana.txt" ] && cat "$OUTDIR/.katana.txt" >> "$urls_file" && rm -f "$OUTDIR/.katana.txt"
   fi
+  # Unlinked paths from robots.txt and sitemap.xml on each live host
+  while IFS= read -r h; do
+    [ -n "$h" ] || continue
+    base="${h%/}"
+    # 1. robots.txt (uncovers /ftp, /admin, /private, etc.)
+    r_body="$(curl -s -L --max-time 8 ${CURL_NET[@]+"${CURL_NET[@]}"} "$base/robots.txt" 2>/dev/null | head -c 20000)"
+    if [ -n "$r_body" ] && printf '%s' "$r_body" | grep -qiE '^(User-agent|Disallow|Allow):'; then
+      printf '%s\n' "$r_body" | grep -iE '^(Disallow|Allow):' | awk '{print $2}' | while IFS= read -r r_path; do
+        [ -n "$r_path" ] && [ "$r_path" != "/" ] || continue
+        r_url="$base${r_path}"
+        printf '%s\n' "$r_url" >> "$urls_file"
+        if printf '%s' "$r_path" | grep -qiE '/(admin|backup|secret|private|internal|conf|config|ftp|hidden|dump|db|api|key)'; then
+          emit_finding recon sensitive-robots-path medium "$r_url" "Sensitive path disclosed in robots.txt: $r_path" "curl -i '$r_url'"
+        fi
+      done
+    fi
+    # 2. sitemap.xml
+    s_body="$(curl -s -L --max-time 8 ${CURL_NET[@]+"${CURL_NET[@]}"} "$base/sitemap.xml" 2>/dev/null | head -c 50000)"
+    if [ -n "$s_body" ] && printf '%s' "$s_body" | grep -qiE '<loc>'; then
+      printf '%s\n' "$s_body" | grep -oiE '<loc>[^<]+</loc>' | sed -E 's#</?loc>##g' >> "$urls_file" || true
+    fi
+  done < <(head -n 20 "$alive_file" 2>/dev/null)
   # fold in endpoints mined from source maps + JS bundles (SPA API surface); scoped+deduped below
   [ -s "${smap_endpoints_file:-/dev/null}" ] && cat "$smap_endpoints_file" >> "$urls_file"
   [ -s "${js_endpoints_file:-/dev/null}" ] && cat "$js_endpoints_file" >> "$urls_file"
@@ -134,6 +156,24 @@ else
       body="$(curl -s -L --max-time 15 ${CURL_NET[@]+"${CURL_NET[@]}"} "$spec" 2>/dev/null \
                | head -c 60000)"
       [ -n "$body" ] || continue
+      # If the endpoint returned Swagger-UI HTML wrapper instead of raw JSON/YAML,
+      # extract the underlying spec URL and fetch the actual schema for AI analysis.
+      if printf '%s' "$body" | grep -qiE '<(!doctype|html|head|body)'; then
+        spec_url_rel="$(printf '%s' "$body" | grep -oiE '["'"'"'](/?[a-zA-Z0-9_./-]+\.(json|yaml|yml))' | head -1 | tr -d '"'"'"')"
+        if [ -n "$spec_url_rel" ]; then
+          case "$spec_url_rel" in
+            http://*|https://*) resolved_spec="$spec_url_rel" ;;
+            /*) resolved_spec="${spec%%://*}/$(echo "$spec" | awk -F/ '{print $3}')$spec_url_rel" ;;
+            *) resolved_spec="${spec%/*}/$spec_url_rel" ;;
+          esac
+          json_body="$(curl -s -L --max-time 15 ${CURL_NET[@]+"${CURL_NET[@]}"} "$resolved_spec" 2>/dev/null | head -c 60000)"
+          if [ -n "$json_body" ] && printf '%s' "$json_body" | grep -qiE '("openapi"|"swagger"|"paths")'; then
+            body="$json_body"
+            spec="$resolved_spec"
+            printf '%s\n' "$resolved_spec" >> "$api_specs_file"
+          fi
+        fi
+      fi
       spec_n=$((spec_n+1))
       set_stage $S_CRAWL running "AI building API tests from spec $spec_n/$API_MAX_SPECS"
       if [ "$AI_ENABLED" = 1 ] && budget_ok; then
@@ -389,10 +429,13 @@ else
 
   # (G) Correlation / exploitation passes that connect findings into verdicts.
   : > "$bypass_file"; : > "$prop_file"; : > "$idor_file"; : > "$corsy_file"
-  set_stage $S_CRAWL running "403 bypass · path propagation · authz diff · CORS"
+  : > "$findings_dir/redirect.txt"; : > "$findings_dir/host_header.txt"
+  set_stage $S_CRAWL running "403 bypass · redirect · cache · authz diff · CORS"
   awk -F'\t' '$1==401||$1==403' "$fuzz_findings_file" 2>/dev/null \
     | grep -viE 'google\.com|%2e%2e|\\\.\\\.|etc.{0,3}passwd' \
     | awk -F'\t' '!seen[$1"\t"$2]++' | try_403_bypass; render
+  redirect_check; render
+  cache_poison_check; render
   propagate_paths; render
   idor_check; render
   # CORS misconfiguration (Corsy) on the live hosts + juicy URLs (bug class we don't cover elsewhere).
@@ -416,6 +459,6 @@ else
   fi; render
 
   touch "$OUTDIR/.done_crawl"
-  set_stage $S_CRAWL done "$url_total urls -> $active_total active | dast:$(nlines "$dast_file") dalfox:$(nlines "$findings_dir/dalfox.txt") kxss:$(nlines "$findings_dir/kxss.txt") sqlmap:$(nlines "$findings_dir/sqlmap.txt") bypass:$(nlines "$bypass_file") prop:$(nlines "$prop_file") idor:$(nlines "$idor_file")"
+  set_stage $S_CRAWL done "$url_total urls -> $active_total active | dast:$(nlines "$dast_file") dalfox:$(nlines "$findings_dir/dalfox.txt") kxss:$(nlines "$findings_dir/kxss.txt") sqlmap:$(nlines "$findings_dir/sqlmap.txt") bypass:$(nlines "$bypass_file") redirect:$(nlines "$findings_dir/redirect.txt") prop:$(nlines "$prop_file") idor:$(nlines "$idor_file")"
 fi
 

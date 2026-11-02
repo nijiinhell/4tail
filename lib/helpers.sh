@@ -180,6 +180,46 @@ idor_check() {
   done <<< "$pcand"
 }
 
+# In-band Open Redirect testing: inject redirect payloads into candidate parameters
+# and confirm via 3xx response carrying an external Location header.
+redirect_check() {
+  local cand; cand="$( { grep -iE '^(redirect|ssrf)\t' "$gf_file" 2>/dev/null | cut -f2
+      grep -iE '[?&](url|uri|redirect|redir|next|dest|destination|return|returnurl|return_url|returnto|returl|callback|continue|out|link|target|to|forward|ref|data|reference)=' "$targets_active_file" 2>/dev/null
+    } | sort -u | head -n 30 )"
+  [ -n "$cand" ] || return 0
+  local u inj loc pfx
+  while IFS= read -r u; do
+    [ -n "$u" ] || continue
+    for pfx in "https://example.com" "//example.com"; do
+      inj="$(printf '%s' "$u" | sed -E "s#([?&](url|uri|redirect|redir|next|dest|destination|return|returnurl|return_url|returnto|returl|callback|continue|out|link|target|to|forward|ref|data|reference)=)[^&]*#\1${pfx}#Ig")"
+      [ "$inj" != "$u" ] || continue
+      loc="$(curl -s -D - -o /dev/null --max-time 6 ${CURL_NET[@]+"${CURL_NET[@]}"} "$inj" 2>/dev/null \
+            | grep -iE '^[Ll]ocation:' | tr -d '\r' | head -1 | sed -E 's/^[Ll]ocation:[[:space:]]*//')"
+      [ -n "$loc" ] || continue
+      if printf '%s' "$loc" | grep -qiE '(^https?://([a-z0-9._-]+\.)?example\.com|^//example\.com)'; then
+        printf '[OPEN-REDIRECT] %s -> %s\n' "$inj" "$loc" >> "$findings_dir/redirect.txt"
+        emit_finding redirect open-redirect medium "$inj" "Open redirect confirmed: 3xx Location header points to $loc" "curl -i '$inj'"
+        break
+      fi
+    done
+  done <<< "$cand"
+}
+
+# In-band Host Header Injection / Unkeyed header reflection check
+cache_poison_check() {
+  local h_test="evil-${RANDOM}.com"
+  sort -u "$alive_file" 2>/dev/null | head -n 15 | while IFS= read -r u; do
+    [ -n "$u" ] || continue
+    local hresp; hresp="$(curl -s -D - -o /dev/null --max-time 8 ${CURL_NET[@]+"${CURL_NET[@]}"} \
+      -H "X-Forwarded-Host: $h_test" -H "X-Host: $h_test" "$u" 2>/dev/null | head -c 4000)"
+    if printf '%s' "$hresp" | grep -qi "$h_test"; then
+      local ref_line; ref_line="$(printf '%s' "$hresp" | grep -i "$h_test" | head -1 | tr -d '\r')"
+      printf '[HOST-HEADER-REFLECTION] %s | reflected: %s\n' "$u" "$ref_line" >> "$findings_dir/host_header.txt"
+      emit_finding injection host-header-reflection medium "$u" "Host header injection: $ref_line" "curl -i -H 'X-Forwarded-Host: $h_test' '$u'"
+    fi
+  done
+}
+
 # Verification pass (anti-false-positive, per 2026 AI-pentest research): re-test each
 # CONFIRMED finding and require it to be (a) stable across two fetches and (b) DIFFERENT
 # from a bogus-sibling control - which weeds out soft-404 / catch-all pages that answer
@@ -193,6 +233,7 @@ verify_findings() {
       grep -oiE 'https?://[^ |]+' "$agent_file" 2>/dev/null | sed 's/^/GET\t/'
     fi
     [ -s "${bypass_file:-}" ] && grep -oiE 'https?://[^ |]+' "$bypass_file" 2>/dev/null | sed 's/^/GET\t/'
+    [ -s "${findings_dir:-}/redirect.txt" ] && grep -oiE 'https?://[^ |]+' "$findings_dir/redirect.txt" 2>/dev/null | sed 's/^/GET\t/'
     [ -s "${idor_file:-}" ]   && grep -oiE 'https?://[^ |]+' "$idor_file" 2>/dev/null | sed 's/^/GET\t/'
     [ -s "${dast_file:-}" ]   && grep -oiE 'https?://[^ |]+' "$dast_file" 2>/dev/null | sed 's/^/GET\t/'
     [ -s "${corsy_file:-}" ]  && grep -oiE 'https?://[^ |]+' "$corsy_file" 2>/dev/null | sed 's/^/GET\t/'

@@ -58,6 +58,9 @@ else
       [ -s "${sourcemap_file:-/dev/null}" ] && { echo "SOURCE MAPS RECOVERED (.js.map -> original source leaked; reconstructed source mined for secrets/endpoints above):"; head -10 "$sourcemap_file"; }
       [ -s "${api_specs_file:-/dev/null}" ] && { echo "EXPOSED API SPECS (fetch + inspect):"; head -10 "$api_specs_file"; }
       [ -s "${gql_schema_file:-/dev/null}" ] && { echo "GRAPHQL INTROSPECTION OPEN (full schema readable - map authz/IDOR per field):"; head -60 "$gql_schema_file"; }
+      [ -s "$findings_dir/sqlmap.txt" ] && { echo "CONFIRMED SQL INJECTIONS (sqlmap):"; head -10 "$findings_dir/sqlmap.txt"; }
+      [ -s "$findings_dir/redirect.txt" ] && { echo "CONFIRMED OPEN REDIRECTS (Location reflection):"; head -10 "$findings_dir/redirect.txt"; }
+      [ -s "$findings_dir/host_header.txt" ] && { echo "HOST HEADER / CACHE POISONING REFLECTIONS:"; head -10 "$findings_dir/host_header.txt"; }
       [ -s "${bypass_file:-/dev/null}" ] && { echo "ACCESS-CONTROL BYPASSES (403->200):"; head -10 "$bypass_file"; }
       [ -s "${idor_file:-/dev/null}" ] && { echo "IDOR / AUTHZ CANDIDATES:"; head -10 "$idor_file"; }
       [ -s "$findings_dir/kxss.txt" ] && { echo "REFLECTED PARAMS (kxss):"; head -15 "$findings_dir/kxss.txt"; }

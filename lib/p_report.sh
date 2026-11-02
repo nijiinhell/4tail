@@ -65,7 +65,7 @@ $(head -c 2000 "${verified_file:-/dev/null}" 2>/dev/null)" >"$poc_out" 2>>"$llm_
 fi
 
 # Step 6: AI triage  (analyses nuclei + content-discovery + JS + crawl/DAST)
-have_extra=0; { [ -s "$js_secrets_file" ] || [ -s "$params_file" ] || [ -s "$fuzz_findings_file" ] || [ -s "$dast_file" ] || [ -s "$gf_file" ] || [ -s "$findings_dir/dalfox.txt" ] || [ -s "$findings_dir/sqlmap.txt" ] || [ -s "$agent_file" ] || [ -s "${bypass_file:-/dev/null}" ] || [ -s "${idor_file:-/dev/null}" ] || [ -s "${corsy_file:-/dev/null}" ] || [ -s "${verified_file:-/dev/null}" ]; } && have_extra=1
+have_extra=0; { [ -s "$js_secrets_file" ] || [ -s "$params_file" ] || [ -s "$fuzz_findings_file" ] || [ -s "$dast_file" ] || [ -s "$gf_file" ] || [ -s "$findings_dir/dalfox.txt" ] || [ -s "$findings_dir/sqlmap.txt" ] || [ -s "$agent_file" ] || [ -s "${bypass_file:-/dev/null}" ] || [ -s "${idor_file:-/dev/null}" ] || [ -s "${corsy_file:-/dev/null}" ] || [ -s "${verified_file:-/dev/null}" ] || [ -s "$findings_dir/redirect.txt" ] || [ -s "$findings_dir/host_header.txt" ]; } && have_extra=1
 if [ "$AI_ENABLED" = "1" ] && { [ "$find_count" -gt 0 ] || [ "$have_extra" = 1 ]; } && ! budget_ok; then
   { echo "## Findings (budget reached, no AI triage)"; echo '```'; cat "$nuclei_file" 2>/dev/null
     [ -s "$js_secrets_file" ] && { echo; echo "# JS secret candidates:"; cat "$js_secrets_file"; }; echo '```'; } >> "$report_file"
@@ -156,6 +156,12 @@ $(head -c 4000 "$agent_file" 2>/dev/null)
 
 === access-control bypasses (403/401 -> 2xx; CONFIRMED, rank high) ===
 $(head -c 2000 "${bypass_file:-/dev/null}" 2>/dev/null)
+
+=== confirmed open redirects (3xx Location external target) ===
+$(head -c 2000 "$findings_dir/redirect.txt" 2>/dev/null)
+
+=== host header reflection / cache poisoning ===
+$(head -c 2000 "$findings_dir/host_header.txt" 2>/dev/null)
 
 === IDOR / broken-authz candidates (A/B/anon diff; verify object ownership) ===
 $(head -c 2000 "${idor_file:-/dev/null}" 2>/dev/null)
@@ -283,6 +289,8 @@ if have jq; then
     [ -f "${oast_hits_file:-}" ] && while IFS= read -r l; do [ -n "$l" ] && emit_f blind-ssrf-redirect high oast "$(nurl "$l")" "$l"; done < "$oast_hits_file"
     [ -f "${agent_file:-}" ] && while IFS= read -r l; do [ -n "$l" ] && emit_f agent-confirmed "$(agent_sev "$l")" agent "$(nurl "$l")" "$l"; done < "$agent_file"
     [ -f "${bypass_file:-}" ] && while IFS= read -r l; do [ -n "$l" ] && emit_f access-control-bypass high bypass "$(nurl "$l")" "$l"; done < "$bypass_file"
+    [ -f "$findings_dir/redirect.txt" ] && while IFS= read -r l; do [ -n "$l" ] && emit_f open-redirect medium redirect "$(nurl "$l")" "$l"; done < "$findings_dir/redirect.txt"
+    [ -f "$findings_dir/host_header.txt" ] && while IFS= read -r l; do [ -n "$l" ] && emit_f host-header-reflection medium host-header "$(nurl "$l")" "$l"; done < "$findings_dir/host_header.txt"
     [ -f "${idor_file:-}" ] && while IFS= read -r l; do [ -n "$l" ] && emit_f idor-authz high idor "$(nurl "$l")" "$l"; done < "$idor_file"
     [ -f "${prop_file:-}" ] && while IFS=$'\t' read -r c u; do [ -n "$u" ] && emit_f content-discovery info cross-host "$u" "status=$c (found on a sibling host)"; done < "$prop_file"
     [ -f "${corsy_file:-}" ] && while IFS= read -r l; do [ -n "$l" ] && emit_f cors-misconfig medium corsy "$(nurl "$l")" "$l"; done < "$corsy_file"
@@ -500,7 +508,7 @@ if [ "$CRAWL" = 1 ]; then
   tally="$tally  $(cov dalfox dalfox "$(has_spec dalfox && echo 1 || echo 0)" "$(nlines "$findings_dir/dalfox.txt")")"
   tally="$tally  $(cov kxss kxss "$(has_spec kxss && echo 1 || echo 0)" "$(nlines "$findings_dir/kxss.txt")")"
   tally="$tally  $(cov sqlmap sqlmap "$({ has_spec sqlmap && [ "$SQLMAP_CONFIRM" = 1 ] && [ "${ACT_MAX_SQLMAP:-0}" -gt 0 ] 2>/dev/null; } && echo 1 || echo 0)" "$(nlines "$findings_dir/sqlmap.txt")")"
-  tally="$tally  bypass:$(nlines "${bypass_file:-/dev/null}")  $(cov idor "" "$([ -n "$AUTH_A" ] && echo 1 || echo 0)" "$(nlines "${idor_file:-/dev/null}")")  $(cov cors corsy "$([ "$CORS_SCAN" = 1 ] && echo 1 || echo 0)" "$(nlines "${corsy_file:-/dev/null}")")"
+  tally="$tally  bypass:$(nlines "${bypass_file:-/dev/null}")  redirect:$(nlines "$findings_dir/redirect.txt")  $(cov idor "" "$([ -n "$AUTH_A" ] && echo 1 || echo 0)" "$(nlines "${idor_file:-/dev/null}")")  $(cov cors corsy "$([ "$CORS_SCAN" = 1 ] && echo 1 || echo 0)" "$(nlines "${corsy_file:-/dev/null}")")"
 fi
 [ "$OAST" = 1 ] && tally="$tally  $(cov oast interactsh-client 1 "$(nlines "${oast_hits_file:-/dev/null}")")"
 [ "$AGENT" = 1 ] && tally="$tally  agent:$(nlines "${agent_file:-/dev/null}")"

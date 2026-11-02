@@ -87,6 +87,8 @@ loot_scan() {  # file  src  mode
       kxss)    sev=low;    txt="$(printf '%s' "$l" | sed -E 's/ Unfiltered.*//')" ;;
       dalfox)  sev=high;   txt="$(printf '%s' "$l" | grep -oE 'https?://[^ ]+' | head -1)"; [ -n "$txt" ] || txt="$l" ;;
       sqlmap)  sev=high;   txt="$l" ;;
+      redirect) sev=medium; txt="$l" ;;
+      host_header) sev=medium; txt="$l" ;;
       secret)  sev=medium; txt="$(printf '%s' "$l" | tr '\t' ' ')" ;;
       apispec) sev=info;   txt="spec: $l" ;;
       *)       sev=info;   txt="$l" ;;
@@ -128,6 +130,8 @@ loot_refresh() {
   loot_scan "${findings_dir:-}/dalfox.txt" dalfox  dalfox
   loot_scan "${findings_dir:-}/kxss.txt"   kxss    kxss
   loot_scan "${findings_dir:-}/sqlmap.txt" sqlmap  sqlmap
+  loot_scan "${findings_dir:-}/redirect.txt" redirect redirect
+  loot_scan "${findings_dir:-}/host_header.txt" host_header host_header
   loot_scan "${js_secrets_file:-}"         js      secret
   loot_scan "${api_specs_file:-}"          api     apispec
   loot_scan "${oast_hits_file:-}"          oast    sqlmap
